@@ -44,8 +44,9 @@ It is off by default. Typing that changes the open note is logged and can be und
 ## Install
 
 1. Install [Herdr](https://herdr.dev) (0.8 or newer).
-2. Download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/AgriciDaniel/obsidian-herdr/releases/latest) into `<your vault>/.obsidian/plugins/herdr-obs/`. Or add `AgriciDaniel/obsidian-herdr` in [BRAT](https://github.com/TfTHacker/obsidian42-brat).
-3. Turn on **Herdr Mission Control** in Settings, Community plugins.
+2. In Obsidian, open Settings, Community plugins, Browse, and search for **Herdr Mission Control**. Click Install, then Enable.
+
+Prefer to install by hand? Download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/AgriciDaniel/obsidian-herdr/releases/latest) into `<your vault>/.obsidian/plugins/herdr-obs/`, or add `AgriciDaniel/obsidian-herdr` in [BRAT](https://github.com/TfTHacker/obsidian42-brat) for early builds.
 
 Needs Obsidian desktop 1.14.4 or newer.
 
@@ -56,7 +57,7 @@ Needs Obsidian desktop 1.14.4 or newer.
 3. Start an agent: `claude`, `codex`, `hermes`, `agy`, `opencode` or any other.
 4. Ask it to work on a note. Every pane already has the `obs-herdr` tool, and `obs-herdr --skill` tells the agent how to use it.
 
-Want to look around first? Open the [`demo-vault`](demo-vault) folder as a vault and copy the three plugin files into its `.obsidian/plugins/herdr-obs/`.
+Want to look around first? Open the [`demo-vault`](demo-vault) folder as a vault and install the plugin there.
 
 ## Screenshots
 
@@ -85,7 +86,7 @@ The plugin keeps a private runtime folder at `~/.cache/obs-herdr/` (your temp fo
 
 ## Status
 
-Tested on Linux with Herdr 0.8.2 and four agents running at once. UI control was tested live in Obsidian 1.15.0 on Linux (Flatpak, Wayland). macOS and Windows are not tested yet. Reports are welcome in [Issues](https://github.com/AgriciDaniel/obsidian-herdr/issues).
+Tested on Linux with Herdr 0.8.2 and four agents running at once. UI control was tested live in Obsidian 1.15.0 on Linux (Flatpak, Wayland). macOS and Windows are not tested yet. Reports are welcome in [Issues](https://github.com/AgriciDaniel/obsidian-herdr/issues); see [CONTRIBUTING](CONTRIBUTING.md) for what to include.
 
 <details>
 <summary><b>For developers</b></summary>

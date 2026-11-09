@@ -1,9 +1,9 @@
 {
   "id": "herdr-obs",
   "name": "Herdr Mission Control",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "minAppVersion": "1.14.4",
-  "description": "Run Herdr persistent agent workspaces and interactive PTY terminals inside your vault while letting coding agents inspect, edit, and navigate notes safely over a local Vault Control Bridge.",
+  "description": "Run Claude Code, Codex and other coding agents in real terminals inside your vault. Agents edit notes safely, and every edit can be undone.",
   "author": "Daniel Agrici",
   "authorUrl": "https://github.com/AgriciDaniel",
   "isDesktopOnly": true
