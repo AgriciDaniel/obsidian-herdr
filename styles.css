@@ -270,19 +270,23 @@
 }
 
 .herdr-terminal-host .xterm-underline-2 {
-  text-decoration: double underline;
+  text-decoration-line: underline;
+  text-decoration-style: double;
 }
 
 .herdr-terminal-host .xterm-underline-3 {
-  text-decoration: wavy underline;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
 }
 
 .herdr-terminal-host .xterm-underline-4 {
-  text-decoration: dotted underline;
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
 }
 
 .herdr-terminal-host .xterm-underline-5 {
-  text-decoration: dashed underline;
+  text-decoration-line: underline;
+  text-decoration-style: dashed;
 }
 
 .herdr-terminal-host .xterm-overline {
@@ -290,23 +294,27 @@
 }
 
 .herdr-terminal-host .xterm-overline.xterm-underline-1 {
-  text-decoration: overline underline;
+  text-decoration-line: overline underline;
 }
 
 .herdr-terminal-host .xterm-overline.xterm-underline-2 {
-  text-decoration: overline double underline;
+  text-decoration-line: overline underline;
+  text-decoration-style: double;
 }
 
 .herdr-terminal-host .xterm-overline.xterm-underline-3 {
-  text-decoration: overline wavy underline;
+  text-decoration-line: overline underline;
+  text-decoration-style: wavy;
 }
 
 .herdr-terminal-host .xterm-overline.xterm-underline-4 {
-  text-decoration: overline dotted underline;
+  text-decoration-line: overline underline;
+  text-decoration-style: dotted;
 }
 
 .herdr-terminal-host .xterm-overline.xterm-underline-5 {
-  text-decoration: overline dashed underline;
+  text-decoration-line: overline underline;
+  text-decoration-style: dashed;
 }
 
 .herdr-terminal-host .xterm-strikethrough {
