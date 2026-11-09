@@ -77,7 +77,20 @@ export class SpawnAgentModal extends Modal {
           .addOption("cursor", "Cursor CLI")
           .addOption("copilot", "GitHub Copilot CLI")
           .addOption("grok", "Grok")
+          .addOption("hermes", "Hermes Agent")
+          .addOption("amp", "Amp")
+          .addOption("droid", "Factory Droid")
+          .addOption("kimi", "Kimi CLI")
+          .addOption("kiro", "Kiro CLI")
+          .addOption("qwen", "Qwen Code")
+          .addOption("devin", "Devin")
+          .addOption("cline", "Cline")
+          .addOption("kilo", "Kilo Code")
+          .addOption("mastracode", "Mastra Code")
+          .addOption("qodercli", "Qoder CLI")
           .addOption("pi", "Pi")
+          .addOption("omp", "Oh My Pi")
+          .addOption("maki", "Maki")
           .setValue(this.agentKind)
           .onChange((val) => {
             this.agentKind = val;
@@ -106,7 +119,7 @@ export class SpawnAgentModal extends Modal {
     new Setting(contentEl)
       .setName("Attach live vault MCP tools")
       .setDesc(
-        "Auto-register the 16-tool vault stdio MCP server when launching Codex or Claude Code."
+        "Auto-register the 24-tool vault stdio MCP server when launching Codex or Claude Code."
       )
       .addToggle((tog) =>
         tog.setValue(this.attachVaultMcp).onChange((val) => {

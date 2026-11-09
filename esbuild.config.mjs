@@ -17,6 +17,9 @@ const result = await build({
   sourcemap: false,
   minify: true,
   metafile: true,
+  banner: {
+    js: "/*! Herdr for Obsidian. MIT License, Copyright (c) 2026 Daniel Agrici. Includes the UI control module (src/control), Copyright 2026 Daniel Agrici, licensed under the Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0). NOTICE: https://github.com/AgriciDaniel/obsidian-herdr/blob/main/NOTICE */",
+  },
   external: [
     "obsidian",
     "electron",

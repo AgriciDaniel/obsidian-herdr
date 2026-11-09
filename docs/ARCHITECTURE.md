@@ -19,9 +19,14 @@
   - `theme-palette.ts`: Resolves live Obsidian dark/light CSS variables into an `ITheme` palette for `@xterm/xterm`.
   - `link-provider.ts`: Custom `ILinkProvider` resolving `[[WikiLinks]]`, `obsidian://` URIs, and `path/to/note.md:line:col` inside terminal lines.
 - `src/bridge/`:
-  - `vault-ops.ts`: `VaultOpsService` implementing 21 permission-gated Vault, FileManager, MetadataCache, Workspace, Canvas, Editor, and Command RPC methods with reversible pre-mutation snapshots.
+  - `vault-ops.ts`: `VaultOpsService` implementing 29 permission-gated (21 vault plus 8 `ui.*`) Vault, FileManager, MetadataCache, Workspace, Canvas, Editor, and Command RPC methods with reversible pre-mutation snapshots.
   - `vault-bridge-server.ts`: Mode-`0600` local NDJSON socket server verifying per-session 256-bit bearer tokens with `crypto.timingSafeEqual`.
   - `runtime-kit.ts`: Provisions `~/.cache/obs-herdr/<12-hex>/` (`0700`) with `connection.json` (`0600`), dual-engine `obs-herdr` (`obs-herdr-core.mjs` for Node.js + `obs-herdr-core.py` for Flatpak/Python 3 environments), JSON-RPC 2.0 `obs-herdr mcp` stdio server, and `herdr-plugin.toml` (`id = "obsidian.vault"`).
+- `src/control/` (Apache-2.0, see `src/control/LICENSE` and `NOTICE`; ported from Obsidian Control Center):
+  - `ui-control.ts`: `UiControlService` with `screenshot`, `inspect`, `waitFor`, `click`, `type`, `pressKey`, `scroll`, and `drag`. Uses Electron `webContents.capturePage()`, `sendInputEvent()`, and `insertText()` from inside the renderer, so it needs no official CLI or remote debugging port. Targets must match exactly one visible, enabled, uncovered element; password fields are refused; input calls are serialized and always release pressed buttons and keys.
+  - `keys.ts`: `buildKeyPress()` maps named keys, letters, digits, and `Mod`/`Ctrl`/`Alt`/`Shift`/`Meta` to Electron input (`Mod` is Cmd on macOS, Ctrl elsewhere).
+  - `electron-host.ts`: `getObsidianWebContents()` reads `electron.remote.getCurrentWebContents()` and returns `null` when the host lacks it, so UI tools fail with `ui_unavailable` instead of breaking the plugin.
+  - Bridge gating (`src/bridge/vault-ops.ts`): `ui.screenshot`, `ui.inspect`, `ui.wait_for` need any bridge tier plus `allowUiControl`; `ui.click`, `ui.type`, `ui.press_key`, `ui.scroll`, `ui.drag` need `full` plus `allowUiControl`. Input that changes the active Markdown editor records a `modified` snapshot so Mission Control Undo restores it.
 - `src/services/herdr-coordinator.ts`: Central state coordinator uniting `HerdrCliClient`, `HerdrSocketClient`, `VaultBridgeServer`, `VaultOpsService`, debounced snapshot refreshes, and agent transition notices.
 - `src/ui/`:
   - `terminal-view.ts`: `HerdrTerminalView` (`ItemView`) managing `@xterm/xterm` v6, `FitAddon`, `SearchAddon`, `WebLinksAddon`, `ResizeObserver`, visibility guards, drag-and-drop vault paths, and `PtySession` disposal on `onClose()`.

@@ -18,6 +18,7 @@ Recorded on `2026-11-09` on `Linux 7.2.7-200.fc44.x86_64` (Aurora Kinoite), Node
 | Physical iOS/Android | Not applicable (by design) | `manifest.json` sets `"isDesktopOnly": true` because local PTY spawning, Unix domain sockets, and `herdr` CLI execution require desktop OS capabilities; mobile platforms are not advertised |
 | Native macOS & Windows physical hardware | Unverified | Cross-platform paths, PowerShell quoting, Windows named pipes, and non-Python pipe fallback are implemented in code and unit-tested where portable, but have not been executed on physical macOS or Windows machines |
 | Security and privacy | Verified (local code + runtime tests) | `0` `fetch`/`requestUrl`/external WebSocket calls; mode-`0700` runtime dir + mode-`0600` socket/connection/MCP config files; 256-bit random token checked with `crypto.timingSafeEqual`; invalid token, `read-only` write attempts, `..` traversal, NUL bytes, absolute paths, `Vault#configDir`, `.git`, and `.env*` blocked in tests |
+| UI control module (`src/control`, Apache-2.0) | Verified (Linux desktop) | Unit + bridge + CLI + MCP tests (`3` new tests) and a live run in Wayland desktop Flatpak Obsidian `1.15.0` through the real `obs-herdr` CLI and both MCP engines; see section 4 |
 | Directory acceptance | Unverified | Requires owner approval, public GitHub release `0.1.0`, and manual human review by the Obsidian team in `obsidianmd/obsidian-releases` |
 
 ## Exact command outputs
@@ -99,16 +100,55 @@ Defects found and fixed:
 
 Final run (`npm run check && npm run build && npm run lint && npm test`): exit `0`, `7/7` tests across `4` suites in `2254.83` ms, `main.js` `743,492` bytes. This remains a single Linux desktop result; macOS and Windows are still unverified.
 
+### 4. UI control module (2026-11-09, ported from Obsidian Control Center into `src/control`)
+
+Feasibility probe before the port, run inside the live Obsidian `1.15.0` renderer (Electron `43.8.3`, Chrome `150.0.7871.250`) in the Herdr Demo Vault: `electron.remote.getCurrentWebContents()` present; `capturePage()` returned a non-empty `1920x1080` PNG (`182,446` bytes); `sendInputEvent` mouse and key events on a temporary overlay arrived as trusted DOM events (`mousedown`, `mouseup`, `click`, `keydown`, `input`, `keyup`, all `isTrusted: true`) while the window did not have focus; `insertText` inserted Unicode; the overlay was removed and focus restored.
+
+Gates on the final source:
+
+```text
+$ npm run check   -> tsc --noEmit, exit 0
+$ npm run build   -> exit 0, main.js 767,667 bytes (2 MiB budget), "electron" external, 0 raw HTML sinks, 0 em/en dashes
+$ npm run lint    -> eslint src --max-warnings=0, exit 0, 0 warnings
+$ npm test        -> exit 0
+✔ UI control: keys, Electron input, permission gating, CLI, and MCP images (206.021556ms)
+✔ Domain: OSC stream observer, path guard, shell quoting, and settings migration (2.546984ms)
+✔ Terminal: Live POSIX PtySession with resize over control FD (175.963258ms)
+✔ Vault Control Bridge: Authenticated socket, permission tiers, obs-herdr CLI, undo, and stdio MCP (490.894168ms)
+✔ Live Herdr 0.8.2 Daemon Integration (isolated config & session) (1140.569157ms)
+ℹ tests 10 | suites 5 | pass 10 | fail 0 | duration_ms 2072.916479
+```
+
+Live desktop run (Wayland, Flatpak Obsidian `1.15.0`, Herdr Demo Vault, built `main.js` installed and hot-reloaded, `allowUiControl` and `full` set in memory only, no `data.json` written), all through the generated `obs-herdr` CLI:
+
+| Check | Result |
+|---|---|
+| `vault info` | `uiControl.available: true` from the bundled plugin; `enabled: false` by default |
+| `ui screenshot --max-width 1280` | `1280x682` PNG of the real window, `cssPixelsPerImagePixel` `1.466` for a `1876x1000` viewport |
+| `ui inspect` | `52` visible controls with labels, selectors, and CSS bounds |
+| `ui click` (editor of a scratch note), `ui key Mod+End`, `ui key Enter`, `ui type` with `ünïcödé ✓ 🐑` | Text typed and saved to disk by Obsidian; `ui wait` found it in `1` ms |
+| Audit and Undo | `ui.type` and `ui.press_key Enter` recorded with caller `obs-herdr-cli` and `modified` snapshots; `undoMutation` restored the note exactly |
+| `ui key Mod+P`, `ui key Escape` | Command palette `.prompt` count `1`, then `0` |
+| `ui scroll --dy 400` then `--dy -400` | Editor `scrollTop` `2203` to `2603` to `2203` (positive scrolls down) |
+| `ui drag` on the right sidebar resize handle | Width `200` to `301` and back to `200` |
+| `obs-herdr mcp` (Node) and `obs-herdr-core.py mcp` (Python) | `24` tools; `obsidian_screenshot` returned `image/png` content (`83,440` bytes, valid PNG signature) plus JSON text |
+| Refusals | Ambiguous selector `ui_target_ambiguous` (`162` matches); `ui.click` under `read-write` `permission_denied`; screenshot with the setting off `ui_control_disabled` |
+| Final bundle smoke | SHA-256 of installed `main.js` equals the repo build; screenshot `1876x1000` with the setting on; setting returned to off |
+
+Cleanup: scratch note trashed and removed from the demo vault trash, test screenshots deleted, demo vault back on default settings. Not verified: macOS, Windows, HiDPI scaling, Obsidian zoom other than `1`, pop-out windows, and native dialogs.
+
 ## Exact dependency and artifact SHA-256 hashes
 
 | File | Bytes | SHA-256 |
 |---|---:|---|
-| `main.js` | `743492` | `388eb5994d1bcd5ba614752cd59e1d71d94962796f48c64b7bc01df960c3683e` |
+| `main.js` | `767667` | `bede248ffd1548b9f0d4388e2a5558030c30b8a87e5f20122dcbc13958e6cff1` |
 | `manifest.json` | `404` | `24c85f42902a7d886e5f6e04b9d700752a5883e73f851ee9131c318dfbee9149` |
 | `styles.css` | `19993` | `c03211dd7dd3df1cb03f578205f2805ad66dbb67d886907ab8bb48d484ac3387` |
 | `versions.json` | `24` | `10e610588c8dfa10061be2f25ab5d38bd91179cb1a31cbee7d58e35e357ecded` |
-| `package.json` | `1133` | `204fcb1ccc90ce182cae828e2a4b3de7fd7a1f46f67475ccb919ae6077379a90` |
+| `package.json` | `1148` | `373ad9d362323b896dabfb2f0d4ced97c76159057886061639d39dc9de5e7f58` |
 | `package-lock.json` | `191923` | `ac58c393ac362328702e9c97b5d4b4c99ea930f41319ac43ff8202bcae6ade20` |
 | `LICENSE` | `1070` | `fe617d451da04ca0ed4ccbcc054574429712fa3e99fcea05d205b2c6a6573f13` |
-| `THIRD_PARTY_NOTICES.md` | `1588` | `de2bd754530faf0393ecdef057092087b9e39a8807cc23cc9587b626cffc3644` |
-| `README.md` | `7489` | `fcc90d74bd0e246157930e1dd9cd631c06142da2d97ecdd80aff4c6af9e31e5b` |
+| `src/control/LICENSE` | `11358` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
+| `NOTICE` | `697` | `2da6936fb0e557bb5a919962e85b902a0707e7f8a98081d1f277e4e753323919` |
+| `THIRD_PARTY_NOTICES.md` | `1752` | `b9a795457258171354ba15ac8e9a6a78458b9d2ebb755c5612828d1a2286d65c` |
+| `README.md` | `7162` | `a18cef7f974c7690af49ab98dc50fb85873f639c961a862a9be952a25a065308` |

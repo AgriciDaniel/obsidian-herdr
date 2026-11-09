@@ -281,6 +281,14 @@ export class HerdrSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: "Let agents see and operate Obsidian",
+            desc: "Agents can take screenshots of this window and inspect it. With Full permission they can also click, type, press keys, scroll, and drag. Screenshots can show any open note.",
+            control: {
+              type: "toggle",
+              key: "allowUiControl",
+            },
+          },
+          {
             name: "Notify when an agent becomes blocked",
             desc: "Show a notice when an agent stops for approval or a user answer.",
             control: {

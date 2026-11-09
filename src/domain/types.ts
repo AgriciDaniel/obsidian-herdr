@@ -297,6 +297,7 @@ export interface HerdrPluginSettings {
   vaultBridgeEnabled: boolean;
   vaultPermissionMode: VaultPermissionMode;
   allowHiddenConfigReads: boolean;
+  allowUiControl: boolean;
   defaultAgentKind: string;
   showOfflinePreviewWhenStopped: boolean;
 }
@@ -340,6 +341,7 @@ export const DEFAULT_SETTINGS: HerdrPluginSettings = {
   vaultBridgeEnabled: true,
   vaultPermissionMode: "read-write",
   allowHiddenConfigReads: false,
+  allowUiControl: false,
   defaultAgentKind: "claude",
   showOfflinePreviewWhenStopped: true,
 };
@@ -425,6 +427,10 @@ export function migrateSettings(raw: unknown): HerdrPluginSettings {
       typeof src.allowHiddenConfigReads === "boolean"
         ? src.allowHiddenConfigReads
         : DEFAULT_SETTINGS.allowHiddenConfigReads,
+    allowUiControl:
+      typeof src.allowUiControl === "boolean"
+        ? src.allowUiControl
+        : DEFAULT_SETTINGS.allowUiControl,
     defaultAgentKind:
       typeof src.defaultAgentKind === "string" && src.defaultAgentKind.trim()
         ? src.defaultAgentKind.trim()

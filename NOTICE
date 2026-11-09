@@ -1,0 +1,15 @@
+Herdr for Obsidian
+Copyright 2026 Daniel Agrici (https://github.com/AgriciDaniel)
+
+UI control module (src/control/)
+
+The UI control module lets coding agents see and operate the Obsidian window:
+screenshots, interface inspection, and click, type, key, scroll and drag input.
+It is derived from Obsidian Control Center, created by Daniel Agrici, and is
+licensed under the Apache License, Version 2.0. See src/control/LICENSE or
+https://www.apache.org/licenses/LICENSE-2.0
+
+If you redistribute this module, or a work based on it, keep this NOTICE file
+(or its text) with your distribution, as the Apache License requires.
+
+The rest of this repository is licensed under the MIT License. See LICENSE.

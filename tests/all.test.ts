@@ -30,6 +30,7 @@ import { parseObsidianUriTarget } from "../src/terminal/link-provider";
 import { PtySession } from "../src/terminal/pty-host";
 import { resolveTerminalFontFamily } from "../src/terminal/theme-palette";
 import { createMockObsidianApp } from "./obsidian-mock";
+import "./ui-control.test";
 
 const execFileAsync = promisify(execFile);
 
@@ -462,7 +463,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(mcpResponses.length, 3);
       const toolsList = (mcpResponses[1].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(toolsList.length, 16, "Node MCP server should expose all 16 tools");
+      assert.equal(toolsList.length, 24, "Node MCP server should expose all 24 tools");
       assert.ok(toolsList.some((t) => t.name === "obsidian_read_note"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_patch_frontmatter"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_backlinks"));
@@ -544,7 +545,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(pyMcpResponses.length, 2);
       const pyTools = (pyMcpResponses[0].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(pyTools.length, 16, "Python MCP server must expose all 16 tools");
+      assert.equal(pyTools.length, 24, "Python MCP server must expose all 24 tools");
       const pyBacklinkCall = (
         pyMcpResponses[1].result as { content: Array<{ text: string }> }
       ).content[0].text;

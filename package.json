@@ -2,7 +2,7 @@
   "name": "herdr",
   "version": "0.1.0",
   "private": true,
-  "license": "MIT",
+  "license": "MIT AND Apache-2.0",
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",

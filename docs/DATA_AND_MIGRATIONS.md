@@ -4,8 +4,9 @@
 
 | Data | Location | Schema/version | Sensitivity | Lifetime and recovery |
 |---|---|---|---|---|
-| User settings | `<Vault>/.obsidian/plugins/herdr/data.json` | `HerdrPluginSettings` (`schemaVersion: 1`) | Low (paths, session slug, UI preferences; zero secrets) | Persisted via `Plugin.saveData()`; validated and recovered via `migrateSettings()` |
+| User settings | `<Vault>/.obsidian/plugins/herdr/data.json` | `HerdrPluginSettings` (`schemaVersion: 1`) | Low (paths, session slug, UI preferences; zero secrets) | Persisted via `Plugin.saveData()`; validated and recovered via `migrateSettings()`. `allowUiControl` (added after 0.1.0) is additive: missing or non-boolean values become `false`, so `schemaVersion` stays `1` |
 | Runtime bridge kit | `~/.cache/obs-herdr/<12-hex-vault-hash>/` (or OS fallback dir, mode `0700`) | Ephemeral runtime files (`b.sock`, `connection.json`, `bin/obs-herdr`, `herdr-plugin/herdr-plugin.toml`) | Ephemeral 256-bit bearer token in mode-`0600` `connection.json` | Recreated on plugin load with a fresh random token; socket unlinked on plugin unload |
+| UI control screenshots | `<runtime dir>/screenshots/` (CLI `obs-herdr ui screenshot`; MCP returns the PNG inline and writes nothing) | PNG files, mode `0600` in a mode `0700` folder | High (can show any open note) | Created only on request while `allowUiControl` is on; never deleted automatically, remove by hand |
 | Credentials | None | N/A | N/A | Zero API keys or account credentials stored anywhere |
 | Network payloads | None | N/A | N/A | Zero external HTTP/HTTPS/WebSocket requests |
 | Vault note mutations | User vault Markdown (`.md`) and Canvas (`.canvas`) files | User vault content | High (user notes) | Gated by permission tier (`off`, `read-only`, `read-write`, `full`); executed via `Vault.process` and `FileManager`; reversible via in-memory `VaultAuditEntry.snapshot` (`undoMutation`) and Obsidian File Recovery / system trash |

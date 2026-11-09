@@ -280,8 +280,33 @@ const SHARED_SKILL_TEXT = [
   "  obs-herdr command list [--query <q>]",
   "  obs-herdr command run <command-id>",
   "  obs-herdr rpc <method> ['{json-params}']",
-  "  obs-herdr mcp   # Run JSON-RPC 2.0 MCP server over stdio (16 tools)",
+  "  obs-herdr mcp   # Run JSON-RPC 2.0 MCP server over stdio (24 tools)",
+  "",
+  "## See and operate the Obsidian window",
+  "",
+  "Needs 'Let agents see and operate Obsidian' in Herdr settings. Clicking, typing, keys, scrolling, and dragging also need the Full permission tier. Check `obs-herdr vault info` (uiControl) first.",
+  "",
+  "  obs-herdr ui screenshot [--out <file.png>] [--max-width <px>]   # saves a PNG and prints its path",
+  "  obs-herdr ui inspect [--selector <css>] [--text <t>] [--limit <n>]",
+  "  obs-herdr ui wait <text> [--selector <css>] [--timeout <ms>]",
+  "  obs-herdr ui click (--selector <css> | --x <n> --y <n>) [--button left|right|middle] [--count <n>]",
+  "  obs-herdr ui type [<text> | --stdin] [--selector <css>]",
+  "  obs-herdr ui key <Key|Mod+Key>   # e.g. Enter, Escape, Mod+P, Mod+Shift+F",
+  "  obs-herdr ui scroll (--selector <css> | --x <n> --y <n>) [--dy <n>] [--dx <n>]   # positive dy scrolls down",
+  "  obs-herdr ui drag (--from-selector <css> | --from-x <n> --from-y <n>) (--to-selector <css> | --to-x <n> --to-y <n>) [--steps <n>]",
+  "",
+  "Tips: coordinates are CSS pixels from `ui inspect`. A selector must match exactly one visible, uncovered element. Input only reports that it was dispatched, so confirm the effect with `ui wait`, `ui inspect`, or a screenshot. Prefer `note` commands for editing note text; use UI control for things only the interface can do. Typing that changes the active note is logged and can be undone in Mission Control.",
 ].join("\n");
+
+const UI_TARGET_SCHEMA = {
+  type: "object",
+  description: "Either {selector} or {x, y} in CSS pixels.",
+  properties: {
+    selector: { type: "string" },
+    x: { type: "number" },
+    y: { type: "number" },
+  },
+};
 
 const SHARED_MCP_TOOLS = [
   {
@@ -483,6 +508,120 @@ const SHARED_MCP_TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     rpc: "editor.insert_at_cursor",
   },
+  {
+    name: "obsidian_screenshot",
+    description:
+      "Capture the Obsidian window as a PNG image. Needs UI control enabled in Herdr settings. Use cssPixelsPerImagePixel to map image pixels to CSS pixels for other UI tools.",
+    inputSchema: {
+      type: "object",
+      properties: { maxWidth: { type: "number", description: "Downscale to this width in pixels (320 or more)." } },
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    rpc: "ui.screenshot",
+  },
+  {
+    name: "obsidian_inspect",
+    description:
+      "List visible interface elements with labels, text, CSS selectors, and CSS pixel bounds. Optional selector and text filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string" },
+        text: { type: "string" },
+        limit: { type: "number" },
+      },
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    rpc: "ui.inspect",
+  },
+  {
+    name: "obsidian_wait_for",
+    description: "Wait until text is visible in the Obsidian window (optionally inside a selector). Timeout up to 20000 ms.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string" },
+        selector: { type: "string" },
+        timeoutMs: { type: "number" },
+      },
+      required: ["text"],
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    rpc: "ui.wait_for",
+  },
+  {
+    name: "obsidian_click",
+    description:
+      "Click in the Obsidian window. Target is {selector} matching exactly one visible element, or {x, y} in CSS pixels. Needs UI control and Full permission.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: UI_TARGET_SCHEMA,
+        button: { type: "string", enum: ["left", "right", "middle"] },
+        count: { type: "number" },
+      },
+      required: ["target"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    rpc: "ui.click",
+  },
+  {
+    name: "obsidian_type",
+    description:
+      "Type text into the focused editable field, or click a target first. Password fields are refused. Needs UI control and Full permission.",
+    inputSchema: {
+      type: "object",
+      properties: { text: { type: "string" }, target: UI_TARGET_SCHEMA },
+      required: ["text"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    rpc: "ui.type",
+  },
+  {
+    name: "obsidian_press_key",
+    description:
+      "Press one key with optional modifiers (Mod is Cmd on macOS, Ctrl elsewhere). Keys: letters, digits, Enter, Tab, Escape, Backspace, Delete, Arrow keys, Home, End, PageUp, PageDown, Space.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string" },
+        modifiers: { type: "array", items: { type: "string" } },
+      },
+      required: ["key"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    rpc: "ui.press_key",
+  },
+  {
+    name: "obsidian_scroll",
+    description: "Scroll at a target. Positive deltaY scrolls down, positive deltaX scrolls right.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: UI_TARGET_SCHEMA,
+        deltaX: { type: "number" },
+        deltaY: { type: "number" },
+      },
+      required: ["target"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    rpc: "ui.scroll",
+  },
+  {
+    name: "obsidian_drag",
+    description: "Drag with the left mouse button from one target to another, for example to resize panels or move items.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from: UI_TARGET_SCHEMA,
+        to: UI_TARGET_SCHEMA,
+        steps: { type: "number" },
+      },
+      required: ["from", "to"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    rpc: "ui.drag",
+  },
 ];
 
 function buildObsHerdrCoreMjs(defaultConnFile: string): string {
@@ -490,6 +629,7 @@ function buildObsHerdrCoreMjs(defaultConnFile: string): string {
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
+import * as path from "node:path";
 import * as readline from "node:readline";
 
 const DEFAULT_CONN_FILE = ${JSON.stringify(defaultConnFile)};
@@ -584,6 +724,39 @@ function parseFlags(args) {
 
 const MCP_TOOLS = ${JSON.stringify(SHARED_MCP_TOOLS)};
 
+function toMcpContent(out) {
+  if (out && typeof out === "object" && out.image && typeof out.image.data === "string") {
+    const { image, ...rest } = out;
+    return [
+      { type: "image", data: image.data, mimeType: image.mimeType || "image/png" },
+      { type: "text", text: JSON.stringify(rest, null, 2) },
+    ];
+  }
+  return [{ type: "text", text: JSON.stringify(out, null, 2) }];
+}
+
+function uiTarget(flags, prefix) {
+  const sel = flags[prefix + "selector"];
+  if (sel) return { selector: sel };
+  if (flags[prefix + "x"] !== undefined && flags[prefix + "y"] !== undefined) {
+    return { x: Number(flags[prefix + "x"]), y: Number(flags[prefix + "y"]) };
+  }
+  return undefined;
+}
+
+function saveScreenshot(shot, outFlag) {
+  const connFile = process.env.OBSIDIAN_HERDR_CONNECTION_FILE || DEFAULT_CONN_FILE;
+  let outPath = outFlag;
+  if (!outPath) {
+    const dir = path.join(path.dirname(connFile), "screenshots");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    outPath = path.join(dir, "obsidian-" + new Date().toISOString().replace(/[:.]/g, "-") + ".png");
+  }
+  fs.writeFileSync(outPath, Buffer.from(shot.image.data, "base64"), { mode: 0o600 });
+  const { image, ...rest } = shot;
+  return { path: path.resolve(outPath), ...rest };
+}
+
 async function runMcpServer() {
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
   for await (const rawLine of rl) {
@@ -601,7 +774,7 @@ async function runMcpServer() {
         const tool = MCP_TOOLS.find((t) => t.name === msg.params?.name);
         if (!tool) throw new Error("Unknown tool: " + msg.params?.name);
         const out = await callBridge(tool.rpc, msg.params?.arguments || {});
-        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] } }) + "\\n");
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: toMcpContent(out) } }) + "\\n");
       } else {
         process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n");
       }
@@ -701,6 +874,24 @@ async function main() {
     result = await callBridge("commands.list", { query: flags.query || pos[0] || "" });
   } else if (group === "command" && sub === "run") {
     result = await callBridge("commands.execute", { commandId: pos[0] });
+  } else if (group === "ui" && sub === "screenshot") {
+    const shot = await callBridge("ui.screenshot", { maxWidth: flags["max-width"] ? Number(flags["max-width"]) : undefined });
+    result = saveScreenshot(shot, flags.out);
+  } else if (group === "ui" && sub === "inspect") {
+    result = await callBridge("ui.inspect", { selector: flags.selector, text: flags.text, limit: flags.limit ? Number(flags.limit) : undefined });
+  } else if (group === "ui" && sub === "wait") {
+    result = await callBridge("ui.wait_for", { text: pos.join(" "), selector: flags.selector, timeoutMs: flags.timeout ? Number(flags.timeout) : undefined });
+  } else if (group === "ui" && sub === "click") {
+    result = await callBridge("ui.click", { target: uiTarget(flags, ""), button: flags.button, count: flags.count ? Number(flags.count) : undefined });
+  } else if (group === "ui" && sub === "type") {
+    result = await callBridge("ui.type", { text: flags.stdin ? readStdin() : pos.join(" "), target: uiTarget(flags, "") });
+  } else if (group === "ui" && sub === "key") {
+    const parts = String(pos[0] || "").split("+").filter(Boolean);
+    result = await callBridge("ui.press_key", { key: parts.pop() || "", modifiers: parts });
+  } else if (group === "ui" && sub === "scroll") {
+    result = await callBridge("ui.scroll", { target: uiTarget(flags, ""), deltaX: flags.dx ? Number(flags.dx) : 0, deltaY: flags.dy ? Number(flags.dy) : 0 });
+  } else if (group === "ui" && sub === "drag") {
+    result = await callBridge("ui.drag", { from: uiTarget(flags, "from-"), to: uiTarget(flags, "to-"), steps: flags.steps ? Number(flags.steps) : undefined });
   } else if (group === "rpc") {
     result = await callBridge(sub, pos[0] ? JSON.parse(pos[0]) : {});
   } else {
@@ -825,6 +1016,37 @@ def run_plugin_action(action):
         call_bridge("workspace.open_note", {"path": note_path})
         subprocess.run([herdr_bin, "notification", "show", "Saved pane to vault", "--body", note_path], check=True)
 
+def to_mcp_content(res):
+    if isinstance(res, dict) and isinstance(res.get("image"), dict) and isinstance(res["image"].get("data"), str):
+        rest = {k: v for k, v in res.items() if k != "image"}
+        return [
+            {"type": "image", "data": res["image"]["data"], "mimeType": res["image"].get("mimeType") or "image/png"},
+            {"type": "text", "text": json.dumps(rest, indent=2)},
+        ]
+    return [{"type": "text", "text": json.dumps(res, indent=2)}]
+
+def ui_target(flags, prefix):
+    if flags.get(prefix + "selector"):
+        return {"selector": flags[prefix + "selector"]}
+    if (prefix + "x") in flags and (prefix + "y") in flags:
+        return {"x": float(flags[prefix + "x"]), "y": float(flags[prefix + "y"])}
+    return None
+
+def save_screenshot(shot, out_flag):
+    import base64
+    conn_file = os.environ.get("OBSIDIAN_HERDR_CONNECTION_FILE") or DEFAULT_CONN_FILE
+    out_path = out_flag
+    if not out_path:
+        shot_dir = os.path.join(os.path.dirname(conn_file), "screenshots")
+        os.makedirs(shot_dir, mode=0o700, exist_ok=True)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%f")
+        out_path = os.path.join(shot_dir, f"obsidian-{stamp}.png")
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(base64.b64decode(shot["image"]["data"]))
+    rest = {k: v for k, v in shot.items() if k != "image"}
+    return {"path": os.path.abspath(out_path), **rest}
+
 def run_mcp():
     rpc_by_name = {t["name"]: t["rpc"] for t in MCP_TOOLS}
     public_tools = [{k: v for k, v in t.items() if k != "rpc"} for t in MCP_TOOLS]
@@ -851,7 +1073,7 @@ def run_mcp():
                 if name not in rpc_by_name:
                     raise RuntimeError(f"Unknown tool: {name}")
                 res = call_bridge(rpc_by_name[name], params.get("arguments") or {})
-                out = {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}
+                out = {"content": to_mcp_content(res)}
             else:
                 out = {}
             sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": out}) + "\\n")
@@ -929,6 +1151,26 @@ def main():
         res = call_bridge("commands.list", {"query": flags.get("query") or (pos[0] if pos else "")})
     elif group == "command" and sub == "run":
         res = call_bridge("commands.execute", {"commandId": pos[0]})
+    elif group == "ui" and sub == "screenshot":
+        shot = call_bridge("ui.screenshot", {"maxWidth": float(flags["max-width"]) if "max-width" in flags else None})
+        res = save_screenshot(shot, flags.get("out"))
+    elif group == "ui" and sub == "inspect":
+        res = call_bridge("ui.inspect", {"selector": flags.get("selector"), "text": flags.get("text"), "limit": int(flags["limit"]) if "limit" in flags else None})
+    elif group == "ui" and sub == "wait":
+        res = call_bridge("ui.wait_for", {"text": " ".join(pos), "selector": flags.get("selector"), "timeoutMs": int(flags["timeout"]) if "timeout" in flags else None})
+    elif group == "ui" and sub == "click":
+        res = call_bridge("ui.click", {"target": ui_target(flags, ""), "button": flags.get("button"), "count": int(flags["count"]) if "count" in flags else None})
+    elif group == "ui" and sub == "type":
+        text_val = sys.stdin.read() if flags.get("stdin") else " ".join(pos)
+        res = call_bridge("ui.type", {"text": text_val, "target": ui_target(flags, "")})
+    elif group == "ui" and sub == "key":
+        parts = [p for p in (pos[0] if pos else "").split("+") if p]
+        key = parts.pop() if parts else ""
+        res = call_bridge("ui.press_key", {"key": key, "modifiers": parts})
+    elif group == "ui" and sub == "scroll":
+        res = call_bridge("ui.scroll", {"target": ui_target(flags, ""), "deltaX": float(flags.get("dx", 0)), "deltaY": float(flags.get("dy", 0))})
+    elif group == "ui" and sub == "drag":
+        res = call_bridge("ui.drag", {"from": ui_target(flags, "from-"), "to": ui_target(flags, "to-"), "steps": int(flags["steps"]) if "steps" in flags else None})
     elif group == "rpc":
         res = call_bridge(sub, json.loads(pos[0]) if pos else {})
     else:

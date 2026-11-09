@@ -10,6 +10,8 @@ import {
 } from "../bridge/runtime-kit";
 import { VaultBridgeServer } from "../bridge/vault-bridge-server";
 import { VaultOpsService } from "../bridge/vault-ops";
+import { getObsidianWebContents } from "../control/electron-host";
+import { UiControlService } from "../control/ui-control";
 import { buildOfflinePreviewSnapshot } from "../domain/demo-fixture";
 import { deriveVaultSessionSlug } from "../domain/shell-quote";
 import type {
@@ -90,6 +92,8 @@ export class HerdrCoordinator {
           ? this.getSettings().vaultPermissionMode
           : "off",
       getAllowHiddenReads: () => this.getSettings().allowHiddenConfigReads,
+      uiControl: new UiControlService({ win: window, getWebContents: getObsidianWebContents }),
+      getAllowUiControl: () => this.getSettings().allowUiControl,
     });
 
     const vaultKey =

@@ -7,6 +7,7 @@ import {
   TFolder,
   normalizePath,
 } from "obsidian";
+import { UiControlError, type UiControlService } from "../control/ui-control";
 import { guardVaultRelativePath, VaultPathGuardError } from "../domain/path-guard";
 import type {
   VaultAuditEntry,
@@ -63,6 +64,18 @@ const WRITE_METHODS = new Set<string>([
 
 const FULL_METHODS = new Set<string>(["commands.execute"]);
 
+/** Seeing the window: any bridge tier, plus the separate UI control setting. */
+const UI_OBSERVE_METHODS = new Set<string>(["ui.screenshot", "ui.inspect", "ui.wait_for"]);
+
+/** Operating the window can do anything a person can, so it needs Full plus the UI control setting. */
+const UI_INPUT_METHODS = new Set<string>([
+  "ui.click",
+  "ui.type",
+  "ui.press_key",
+  "ui.scroll",
+  "ui.drag",
+]);
+
 const BLOCKED_COMMAND_SUBSTRINGS = [
   "app:delete-vault",
   "plugin",
@@ -101,6 +114,8 @@ export class VaultOpsService {
   private readonly app: App;
   private readonly getPermissionMode: () => VaultPermissionMode;
   private readonly getAllowHiddenReads: () => boolean;
+  private readonly uiControl: UiControlService | null;
+  private readonly getAllowUiControl: () => boolean;
   private readonly auditEntries: VaultAuditEntry[] = [];
   private readonly auditListeners = new Set<() => void>();
   private auditSeq = 0;
@@ -109,10 +124,14 @@ export class VaultOpsService {
     app: App;
     getPermissionMode: () => VaultPermissionMode;
     getAllowHiddenReads: () => boolean;
+    uiControl?: UiControlService | null;
+    getAllowUiControl?: () => boolean;
   }) {
     this.app = options.app;
     this.getPermissionMode = options.getPermissionMode;
     this.getAllowHiddenReads = options.getAllowHiddenReads;
+    this.uiControl = options.uiControl ?? null;
+    this.getAllowUiControl = options.getAllowUiControl ?? (() => false);
   }
 
   onAuditUpdated(listener: () => void): () => void {
@@ -152,6 +171,20 @@ export class VaultOpsService {
           ? params.commandId
           : undefined;
 
+    const isUiMethod = UI_OBSERVE_METHODS.has(method) || UI_INPUT_METHODS.has(method);
+    if (isUiMethod && mode !== "off" && !this.getAllowUiControl()) {
+      this.recordAudit({
+        method,
+        caller,
+        allowed: false,
+        summary: `Denied '${method}': UI control is turned off.`,
+      });
+      throw new BridgeRpcError(
+        "ui_control_disabled",
+        "UI control is off. Turn on 'Let agents see and operate Obsidian' in Herdr settings."
+      );
+    }
+
     if (!this.isMethodPermitted(method, mode)) {
       this.recordAudit({
         method,
@@ -182,6 +215,15 @@ export class VaultOpsService {
       }
       if (err instanceof BridgeRpcError) {
         throw err;
+      }
+      if (err instanceof UiControlError) {
+        this.recordAudit({
+          method,
+          caller,
+          allowed: false,
+          summary: `UI action failed: ${err.message}`,
+        });
+        throw new BridgeRpcError(err.code, err.message);
       }
       throw new BridgeRpcError(
         "execution_error",
@@ -252,7 +294,72 @@ export class VaultOpsService {
     if (FULL_METHODS.has(method)) {
       return mode === "full";
     }
+    if (UI_OBSERVE_METHODS.has(method)) {
+      return true;
+    }
+    if (UI_INPUT_METHODS.has(method)) {
+      return mode === "full";
+    }
     return false;
+  }
+
+  private async executeUiMethod(
+    method: string,
+    params: Record<string, unknown>,
+    caller: string
+  ): Promise<unknown> {
+    const ui = this.uiControl;
+    if (!ui) {
+      throw new BridgeRpcError("ui_unavailable", "UI control is not available in this host.");
+    }
+    if (method === "ui.screenshot") {
+      const shot = await ui.screenshot(params);
+      this.recordAudit({ method, caller, allowed: true, summary: "Captured a screenshot of the Obsidian window." });
+      return shot;
+    }
+    if (method === "ui.inspect") {
+      return ui.inspect(params);
+    }
+    if (method === "ui.wait_for") {
+      return ui.waitFor(params);
+    }
+
+    // Input can change the active note, so keep its text for one-click Undo when it does.
+    const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const notePath = mdView?.file?.path;
+    const before = mdView && notePath ? mdView.editor.getValue() : null;
+
+    let result: unknown;
+    let summary: string;
+    if (method === "ui.click") {
+      result = await ui.click(params);
+      summary = "Clicked in the Obsidian window.";
+    } else if (method === "ui.type") {
+      result = await ui.type(params);
+      summary = `Typed ${asStr(params.text).length} characters in the Obsidian window.`;
+    } else if (method === "ui.press_key") {
+      result = await ui.pressKey(params);
+      const mods = Array.isArray(params.modifiers) ? params.modifiers.map(String) : [];
+      summary = `Pressed ${[...mods, asStr(params.key)].join("+")} in the Obsidian window.`;
+    } else if (method === "ui.scroll") {
+      result = await ui.scroll(params);
+      summary = "Scrolled in the Obsidian window.";
+    } else {
+      result = await ui.drag(params);
+      summary = "Dragged in the Obsidian window.";
+    }
+
+    const changed =
+      before !== null && mdView !== null && mdView.file?.path === notePath && mdView.editor.getValue() !== before;
+    this.recordAudit({
+      method,
+      caller,
+      targetPath: changed ? notePath : undefined,
+      allowed: true,
+      summary: changed ? `${summary} Changed '${notePath}'.` : summary,
+      snapshot: changed && notePath && before !== null ? { kind: "modified", path: notePath, previousContent: before } : undefined,
+    });
+    return result;
   }
 
   private safePath(raw: unknown, isWrite: boolean): string {
@@ -286,6 +393,9 @@ export class VaultOpsService {
     params: Record<string, unknown>,
     caller: string
   ): Promise<unknown> {
+    if (method.startsWith("ui.")) {
+      return this.executeUiMethod(method, params, caller);
+    }
     switch (method) {
       case "bridge.ping":
         return {
@@ -315,6 +425,12 @@ export class VaultOpsService {
           totalFileCount: allFiles.length,
           activeNote: activeFile ? activeFile.path : null,
           permissionMode: this.getPermissionMode(),
+          uiControl: {
+            enabled: this.getAllowUiControl(),
+            available: this.uiControl?.isAvailable() ?? false,
+            canObserve: this.getAllowUiControl() && this.getPermissionMode() !== "off",
+            canOperate: this.getAllowUiControl() && this.getPermissionMode() === "full",
+          },
         };
       }
 

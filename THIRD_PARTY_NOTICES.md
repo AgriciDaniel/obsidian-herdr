@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-This plugin (`herdr`) is licensed under the MIT License (see `LICENSE`).
+This plugin (`herdr`) is licensed under the MIT License (see `LICENSE`), except the UI control module in `src/control/`, which is licensed under the Apache License 2.0 (see `src/control/LICENSE` and `NOTICE`). Both are by Daniel Agrici.
 
 ## Bundled runtime dependencies (`main.js`)
 
