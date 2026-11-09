@@ -21,4 +21,6 @@ jobs:
       - name: Create release with plugin assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          cp src/control/LICENSE LICENSE-Apache-2.0.txt
+          gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css LICENSE LICENSE-Apache-2.0.txt NOTICE --title "$GITHUB_REF_NAME" --generate-notes

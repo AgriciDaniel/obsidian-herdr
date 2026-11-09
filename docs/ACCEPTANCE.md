@@ -1,6 +1,6 @@
 # Acceptance Record
 
-Recorded on `2026-11-09` on `Linux 7.2.7-200.fc44.x86_64` (Aurora Kinoite), Node.js `v24.22.1`, npm `11.21.1`, TypeScript `5.8.3`, ESLint `v10.14.0` (`eslint-plugin-obsidianmd@0.4.2`), `herdr 0.8.2` (protocol `20`), `codex-cli 0.167.0`, and Flatpak Obsidian `1.15.0` (Electron host `1.14.5`).
+Recorded on `2026-11-09` (release `0.2.0`) on `Linux 7.2.7-200.fc44.x86_64` (Aurora Kinoite), Node.js `v24.22.1`, npm `11.21.1`, TypeScript `5.8.3`, ESLint `v10.14.0` (`eslint-plugin-obsidianmd@0.4.2`), `herdr 0.8.2` (protocol `20`), `codex-cli 0.167.0`, and Flatpak Obsidian `1.15.0` (Electron host `1.14.5`).
 
 ## Evidence summary matrix
 
@@ -138,15 +138,14 @@ Live desktop run (Wayland, Flatpak Obsidian `1.15.0`, Herdr Demo Vault, built `m
 Cleanup: scratch note trashed and removed from the demo vault trash, test screenshots deleted, demo vault back on default settings. Not verified: macOS, Windows, HiDPI scaling, Obsidian zoom other than `1`, pop-out windows, and native dialogs.
 
 ## Exact dependency and artifact SHA-256 hashes
-
 | File | Bytes | SHA-256 |
 |---|---:|---|
 | `main.js` | `767667` | `bede248ffd1548b9f0d4388e2a5558030c30b8a87e5f20122dcbc13958e6cff1` |
-| `manifest.json` | `404` | `24c85f42902a7d886e5f6e04b9d700752a5883e73f851ee9131c318dfbee9149` |
+| `manifest.json` | `404` | `56ca321ad6f89b0ff90e851c8b9e7b801ee7fbb33b0fce4d3f6d2ab7487214e6` |
 | `styles.css` | `19993` | `c03211dd7dd3df1cb03f578205f2805ad66dbb67d886907ab8bb48d484ac3387` |
-| `versions.json` | `24` | `10e610588c8dfa10061be2f25ab5d38bd91179cb1a31cbee7d58e35e357ecded` |
-| `package.json` | `1148` | `373ad9d362323b896dabfb2f0d4ced97c76159057886061639d39dc9de5e7f58` |
-| `package-lock.json` | `191923` | `ac58c393ac362328702e9c97b5d4b4c99ea930f41319ac43ff8202bcae6ade20` |
+| `versions.json` | `45` | `ca324faefba6fbffcd9d622e46d2c07f3fd2740ff1140dce026a087c34a62937` |
+| `package.json` | `1148` | `7f5d5ebc1a69c541206d19cf78eebc56012a22aed150776f474680ac8d1f7bbd` |
+| `package-lock.json` | `191923` | `7b37af04a258548b249052bd035d86afa6e95e1ddd37f3f4347e5378aa41323c` |
 | `LICENSE` | `1070` | `fe617d451da04ca0ed4ccbcc054574429712fa3e99fcea05d205b2c6a6573f13` |
 | `src/control/LICENSE` | `11358` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `NOTICE` | `697` | `2da6936fb0e557bb5a919962e85b902a0707e7f8a98081d1f277e4e753323919` |
