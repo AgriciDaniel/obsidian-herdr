@@ -1,0 +1,22 @@
+node_modules/
+main.js
+main.js.map
+*.tsbuildinfo
+.env
+.env.*
+.directory
+.DS_Store
+
+# Local development vault state (this folder doubles as a test vault)
+/.obsidian/
+/.trash/
+demo-vault/.obsidian/plugins/
+demo-vault/.obsidian/workspace*.json
+demo-vault/.trash/
+
+# Internal build-process records (kept locally, not published)
+AGENTS.md
+CREATOR_RECEIPT.json
+creator-brief.json
+docs/SESSION_HANDOFF.md
+docs/CHANGE_REQUEST.md

@@ -1,0 +1,10 @@
+{
+  "id": "herdr",
+  "name": "Herdr",
+  "version": "0.1.0",
+  "minAppVersion": "1.14.4",
+  "description": "Run Herdr persistent agent workspaces and interactive PTY terminals inside your vault while letting coding agents inspect, edit, and navigate notes safely over a local Vault Control Bridge.",
+  "author": "Daniel Agrici",
+  "authorUrl": "https://github.com/AgriciDaniel",
+  "isDesktopOnly": true
+}

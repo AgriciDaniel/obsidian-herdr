@@ -1,0 +1,3 @@
+- [ ] Final README pass
+- [ ] Tag v0.1.0
+- [ ] Post launch thread

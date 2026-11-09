@@ -1,0 +1,975 @@
+/* Herdr for Obsidian - Theme-native styles using Obsidian CSS custom properties */
+
+.herdr-root {
+  color: var(--text-normal);
+  font-family: var(--font-interface);
+  box-sizing: border-box;
+}
+
+.herdr-root *,
+.herdr-root *::before,
+.herdr-root *::after {
+  box-sizing: border-box;
+}
+
+.herdr-is-hidden {
+  display: none;
+}
+
+/* Status bar */
+.status-bar-item.herdr-statusbar-item {
+  gap: var(--size-4-1, 4px);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-bar-item.herdr-statusbar-item.is-blocked {
+  color: var(--color-orange);
+  font-weight: 600;
+}
+
+/* Embedded Terminal Pane */
+.workspace-leaf-content .view-content.herdr-terminal-pane {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  container-type: inline-size;
+  container-name: herdr-term;
+  background-color: var(--background-primary);
+}
+
+.herdr-terminal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.herdr-toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.herdr-profile-select {
+  max-width: 220px;
+  font-size: var(--font-ui-small);
+}
+
+.herdr-cwd-chip {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: 2px 7px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.herdr-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: var(--radius-s);
+}
+
+.herdr-terminal-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary-alt);
+  flex-shrink: 0;
+}
+
+.herdr-terminal-search.herdr-is-hidden {
+  display: none;
+}
+
+.herdr-search-input {
+  flex: 1 1 auto;
+  min-width: 140px;
+  font-size: var(--font-ui-small);
+}
+
+.herdr-terminal-exit-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: var(--font-ui-small);
+  background-color: var(--background-secondary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.herdr-terminal-exit-banner.herdr-is-hidden {
+  display: none;
+}
+
+.herdr-terminal-host {
+  flex: 1 1 auto;
+  min-height: 120px;
+  width: 100%;
+  padding: 6px 8px;
+  overflow: hidden;
+  position: relative;
+  background-color: var(--background-primary);
+}
+
+/* Structural xterm.js v6 layout rules (adapted cleanly without !important or hardcoded hex) */
+.herdr-terminal-host .xterm {
+  cursor: text;
+  position: relative;
+  height: 100%;
+  width: 100%;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.herdr-terminal-host .xterm.focus,
+.herdr-terminal-host .xterm:focus {
+  outline: none;
+}
+
+.herdr-terminal-host .xterm .xterm-helpers {
+  position: absolute;
+  top: 0;
+  z-index: 5;
+}
+
+.herdr-terminal-host .xterm .xterm-helper-textarea {
+  padding: 0;
+  border: 0;
+  margin: 0;
+  position: absolute;
+  opacity: 0;
+  left: -9999em;
+  top: 0;
+  width: 0;
+  height: 0;
+  z-index: -5;
+  white-space: nowrap;
+  overflow: hidden;
+  resize: none;
+}
+
+.herdr-terminal-host .xterm .composition-view {
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  display: none;
+  position: absolute;
+  white-space: nowrap;
+  z-index: 1;
+}
+
+.herdr-terminal-host .xterm .composition-view.active {
+  display: block;
+}
+
+.herdr-terminal-host .xterm .xterm-viewport {
+  background-color: var(--background-primary);
+  overflow-y: scroll;
+  cursor: default;
+  position: absolute;
+  right: 0;
+  left: 0;
+  top: 0;
+  bottom: 0;
+}
+
+.herdr-terminal-host .xterm .xterm-screen {
+  position: relative;
+}
+
+.herdr-terminal-host .xterm .xterm-screen canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+.herdr-terminal-host .xterm-char-measure-element {
+  display: inline-block;
+  visibility: hidden;
+  position: absolute;
+  top: 0;
+  left: -9999em;
+  line-height: normal;
+}
+
+.herdr-terminal-host .xterm.enable-mouse-events {
+  cursor: default;
+}
+
+.herdr-terminal-host .xterm.xterm-cursor-pointer,
+.herdr-terminal-host .xterm .xterm-cursor-pointer {
+  cursor: pointer;
+}
+
+.herdr-terminal-host .xterm.column-select.focus {
+  cursor: crosshair;
+}
+
+.herdr-terminal-host .xterm .xterm-accessibility:not(.debug),
+.herdr-terminal-host .xterm .xterm-message {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  z-index: 10;
+  color: transparent;
+  pointer-events: none;
+}
+
+.herdr-terminal-host .xterm .xterm-accessibility-tree:not(.debug) *::selection {
+  color: transparent;
+}
+
+.herdr-terminal-host .xterm .xterm-accessibility-tree {
+  font-family: var(--font-monospace);
+  user-select: text;
+  white-space: pre;
+}
+
+.herdr-terminal-host .xterm .xterm-accessibility-tree > div {
+  transform-origin: left;
+  width: fit-content;
+}
+
+.herdr-terminal-host .xterm .live-region {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.herdr-terminal-host .xterm .xterm-dim {
+  opacity: 1;
+}
+
+.herdr-terminal-host .xterm-underline-1 {
+  text-decoration: underline;
+}
+
+.herdr-terminal-host .xterm-underline-2 {
+  text-decoration: double underline;
+}
+
+.herdr-terminal-host .xterm-underline-3 {
+  text-decoration: wavy underline;
+}
+
+.herdr-terminal-host .xterm-underline-4 {
+  text-decoration: dotted underline;
+}
+
+.herdr-terminal-host .xterm-underline-5 {
+  text-decoration: dashed underline;
+}
+
+.herdr-terminal-host .xterm-overline {
+  text-decoration: overline;
+}
+
+.herdr-terminal-host .xterm-overline.xterm-underline-1 {
+  text-decoration: overline underline;
+}
+
+.herdr-terminal-host .xterm-overline.xterm-underline-2 {
+  text-decoration: overline double underline;
+}
+
+.herdr-terminal-host .xterm-overline.xterm-underline-3 {
+  text-decoration: overline wavy underline;
+}
+
+.herdr-terminal-host .xterm-overline.xterm-underline-4 {
+  text-decoration: overline dotted underline;
+}
+
+.herdr-terminal-host .xterm-overline.xterm-underline-5 {
+  text-decoration: overline dashed underline;
+}
+
+.herdr-terminal-host .xterm-strikethrough {
+  text-decoration: line-through;
+}
+
+.herdr-terminal-host .xterm-screen .xterm-decoration-container .xterm-decoration {
+  z-index: 6;
+  position: absolute;
+}
+
+.herdr-terminal-host .xterm-screen .xterm-decoration-container .xterm-decoration.xterm-decoration-top-layer {
+  z-index: 7;
+}
+
+.herdr-terminal-host .xterm-decoration-overview-ruler {
+  z-index: 8;
+  position: absolute;
+  top: 0;
+  right: 0;
+  pointer-events: none;
+}
+
+.herdr-terminal-host .xterm-decoration-top {
+  z-index: 2;
+  position: relative;
+}
+
+.herdr-terminal-host .xterm .xterm-scrollable-element > .scrollbar {
+  cursor: default;
+}
+
+.herdr-terminal-host .xterm .xterm-scrollable-element > .scrollbar > .scra {
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.herdr-terminal-host .xterm .xterm-scrollable-element > .visible {
+  opacity: 1;
+  background: transparent;
+  transition: opacity 100ms linear;
+  z-index: 11;
+}
+
+.herdr-terminal-host .xterm .xterm-scrollable-element > .invisible {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.herdr-terminal-host .xterm .xterm-scrollable-element > .invisible.fade {
+  transition: opacity 800ms linear;
+}
+
+.herdr-terminal-host .xterm .xterm-scrollable-element > .shadow {
+  position: absolute;
+  display: none;
+}
+
+/* Mission Control Dashboard */
+.workspace-leaf-content .view-content.herdr-dashboard-pane {
+  padding: 0;
+  overflow-y: auto;
+  container-type: inline-size;
+  container-name: herdr-pane;
+  background-color: var(--background-primary);
+}
+
+.herdr-dashboard-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.herdr-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.herdr-topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.herdr-brand-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-m);
+  background-color: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--interactive-accent);
+  flex-shrink: 0;
+}
+
+.herdr-topbar-title {
+  font-size: var(--font-ui-medium);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.herdr-topbar-subtitle {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.herdr-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* KPI Strip */
+.herdr-kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(125px, 1fr));
+  gap: 8px;
+}
+
+.herdr-kpi-card {
+  background-color: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.herdr-kpi-card.herdr-tone-working {
+  border-left: 3px solid var(--color-blue);
+}
+
+.herdr-kpi-card.herdr-tone-blocked {
+  border-left: 3px solid var(--color-orange);
+}
+
+.herdr-kpi-card.herdr-tone-done {
+  border-left: 3px solid var(--color-green);
+}
+
+.herdr-kpi-label {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.herdr-kpi-value {
+  font-size: var(--font-ui-medium);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Navigation Tabs */
+.herdr-tab-nav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.herdr-root button.herdr-nav-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  box-shadow: none;
+  border-radius: var(--radius-s);
+  padding: 5px 10px;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  cursor: pointer;
+  height: auto;
+}
+
+.herdr-root button.herdr-nav-tab:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+}
+
+.herdr-root button.herdr-nav-tab.is-active {
+  color: var(--text-normal);
+  font-weight: 600;
+  background-color: var(--background-secondary);
+  border-color: var(--background-modifier-border);
+}
+
+.herdr-preview-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-radius: var(--radius-m);
+  background-color: var(--background-secondary);
+  border: 1px dashed var(--background-modifier-border);
+  font-size: var(--font-ui-small);
+}
+
+.herdr-preview-text {
+  color: var(--text-muted);
+  flex: 1 1 220px;
+}
+
+.herdr-tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Cards & Grids */
+.herdr-agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 10px;
+}
+
+@container herdr-pane (max-width: 420px) {
+  .herdr-agent-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .herdr-kpi-strip {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.herdr-agent-card,
+.herdr-section-card,
+.herdr-empty-card,
+.herdr-bases-card,
+.herdr-embed-card {
+  background-color: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.herdr-border-working {
+  border-left: 3px solid var(--color-blue);
+}
+
+.herdr-border-blocked {
+  border-left: 3px solid var(--color-orange);
+}
+
+.herdr-border-done {
+  border-left: 3px solid var(--color-green);
+}
+
+.herdr-border-idle {
+  border-left: 3px solid var(--background-modifier-border);
+}
+
+.herdr-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.herdr-card-title-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.herdr-card-title {
+  font-weight: 600;
+  font-size: var(--font-ui-small);
+}
+
+.herdr-agent-subtitle {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.herdr-agent-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  overflow-wrap: anywhere;
+}
+
+/* Status Pills & Badges */
+.herdr-status-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  text-transform: lowercase;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  color: var(--text-muted);
+}
+
+.herdr-status-working {
+  color: var(--color-blue);
+  border-color: var(--color-blue);
+}
+
+.herdr-status-blocked {
+  color: var(--color-orange);
+  border-color: var(--color-orange);
+}
+
+.herdr-status-done {
+  color: var(--color-green);
+  border-color: var(--color-green);
+}
+
+.herdr-mono-badge {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  padding: 1px 6px;
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+/* Blocked Approval Bar & Prompt Row */
+.herdr-blocked-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  border: 1px solid var(--color-orange);
+}
+
+.herdr-blocked-label {
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  color: var(--color-orange);
+}
+
+.herdr-prompt-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.herdr-prompt-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--font-ui-small);
+}
+
+.herdr-action-row,
+.herdr-section-toolbar,
+.herdr-permission-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.herdr-root button.herdr-btn-compact {
+  font-size: var(--font-ui-smaller);
+  padding: 4px 9px;
+  height: auto;
+  min-height: 26px;
+}
+
+.herdr-terminal-tail {
+  margin: 0;
+  padding: 10px;
+  max-height: 260px;
+  overflow: auto;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Topology Map */
+.herdr-workspace-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.herdr-root button.herdr-ws-chip {
+  font-size: var(--font-ui-smaller);
+  padding: 4px 10px;
+  height: auto;
+}
+
+.herdr-root button.herdr-ws-chip.is-selected {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+  font-weight: 600;
+}
+
+.herdr-worktree-chip {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  padding: 6px 10px;
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.herdr-layout-map {
+  position: relative;
+  width: 100%;
+  height: 150px;
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  overflow: hidden;
+}
+
+.herdr-root button.herdr-layout-cell {
+  position: absolute;
+  left: var(--herdr-rect-left, 0%);
+  top: var(--herdr-rect-top, 0%);
+  width: var(--herdr-rect-width, 100%);
+  height: var(--herdr-rect-height, 100%);
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 0;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary-alt);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 4px;
+  white-space: normal;
+  text-align: left;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.herdr-root button.herdr-layout-cell.is-focused {
+  background-color: var(--background-primary);
+  box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+
+.herdr-cell-title {
+  font-size: var(--font-ui-smaller);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.herdr-pane-list,
+.herdr-audit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.herdr-pane-row,
+.herdr-audit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+}
+
+.herdr-audit-row.is-denied {
+  border-left: 3px solid var(--color-red);
+}
+
+.herdr-audit-row.is-allowed {
+  border-left: 3px solid var(--color-green);
+}
+
+.herdr-pane-info,
+.herdr-audit-main,
+.herdr-pane-controls,
+.herdr-audit-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* Key-value diagnostics & integrations */
+.herdr-kv-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.herdr-kv-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+}
+
+.herdr-kv-key {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.herdr-kv-val {
+  font-family: var(--font-monospace);
+  word-break: break-all;
+}
+
+.herdr-integration-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 6px;
+}
+
+.herdr-integration-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+}
+
+.herdr-muted-copy {
+  margin: 0;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.herdr-field-label {
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+}
+
+/* Bases Board & Markdown Codeblock Embed */
+.herdr-bases-board {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+}
+
+.herdr-bases-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.herdr-bases-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px;
+}
+
+.herdr-root button.herdr-note-link-btn {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  height: auto;
+  font-weight: 600;
+  color: var(--text-accent);
+  cursor: pointer;
+  text-align: left;
+}
+
+.herdr-root button.herdr-note-link-btn:hover {
+  text-decoration: underline;
+}
+
+.herdr-embed-card {
+  margin: 8px 0;
+}
+
+.herdr-embed-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.herdr-embed-agent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+}
+
+@container herdr-term (max-width: 640px) {
+  .herdr-cwd-chip {
+    display: none;
+  }
+}
+
+.herdr-pane-info {
+  min-width: 0;
+}
+
+.herdr-pane-info .herdr-muted-copy {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.herdr-modal .setting-item.herdr-modal-stacked-setting {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.herdr-modal .setting-item.herdr-modal-stacked-setting .setting-item-control {
+  width: 100%;
+}
+
+.herdr-modal .setting-item.herdr-modal-stacked-setting textarea {
+  width: 100%;
+  min-height: 76px;
+}

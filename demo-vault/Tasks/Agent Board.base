@@ -1,0 +1,14 @@
+filters:
+  and:
+    - file.inFolder("Tasks")
+    - file.ext == "md"
+views:
+  - type: herdr-agent-board
+    name: Agent board
+  - type: table
+    name: Table
+    order:
+      - file.name
+      - status
+      - agent
+      - priority
