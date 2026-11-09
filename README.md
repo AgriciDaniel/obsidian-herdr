@@ -44,8 +44,8 @@ It is off by default. Typing that changes the open note is logged and can be und
 ## Install
 
 1. Install [Herdr](https://herdr.dev) (0.8 or newer).
-2. Download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/AgriciDaniel/obsidian-herdr/releases/latest) into `<your vault>/.obsidian/plugins/herdr/`. Or add `AgriciDaniel/obsidian-herdr` in [BRAT](https://github.com/TfTHacker/obsidian42-brat).
-3. Turn on **Herdr** in Settings, Community plugins.
+2. Download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/AgriciDaniel/obsidian-herdr/releases/latest) into `<your vault>/.obsidian/plugins/herdr-obs/`. Or add `AgriciDaniel/obsidian-herdr` in [BRAT](https://github.com/TfTHacker/obsidian42-brat).
+3. Turn on **Herdr Mission Control** in Settings, Community plugins.
 
 Needs Obsidian desktop 1.14.4 or newer.
 
@@ -56,7 +56,7 @@ Needs Obsidian desktop 1.14.4 or newer.
 3. Start an agent: `claude`, `codex`, `hermes`, `agy`, `opencode` or any other.
 4. Ask it to work on a note. Every pane already has the `obs-herdr` tool, and `obs-herdr --skill` tells the agent how to use it.
 
-Want to look around first? Open the [`demo-vault`](demo-vault) folder as a vault and copy the three plugin files into its `.obsidian/plugins/herdr/`.
+Want to look around first? Open the [`demo-vault`](demo-vault) folder as a vault and copy the three plugin files into its `.obsidian/plugins/herdr-obs/`.
 
 ## Screenshots
 
@@ -70,6 +70,18 @@ Want to look around first? Open the [`demo-vault`](demo-vault) folder as a vault
 - You choose what agents may do: Read-only, Read-write or Full. Turn it off any time.
 - The settings folder, `.git` and `.env` files are always off limits.
 - Screenshots stay on your machine in a private folder. Like note text, anything an agent reads or sees goes to that agent's provider, so leave UI control off for windows you would not share.
+
+### Network use
+
+None. The plugin makes no internet requests. It talks to Herdr and to your agents only through local sockets on this computer.
+
+### Requires an external program
+
+It needs [Herdr](https://herdr.dev), which you install yourself. The plugin starts Herdr and your shell as local processes, which is why it is desktop only.
+
+### Files outside the vault
+
+The plugin keeps a private runtime folder at `~/.cache/obs-herdr/` (your temp folder on Windows). It holds the bridge socket, the `obs-herdr` command for agents, its connection details, and UI control screenshots. Delete the folder at any time; it is recreated when needed.
 
 ## Status
 

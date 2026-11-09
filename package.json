@@ -1,6 +1,6 @@
 {
-  "name": "herdr",
-  "version": "0.2.0",
+  "name": "herdr-obs",
+  "version": "0.2.1",
   "private": true,
   "license": "MIT AND Apache-2.0",
   "type": "module",
