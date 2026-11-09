@@ -45,7 +45,7 @@ Want to look around first? Open the [`demo-vault`](demo-vault) folder as a vault
 
 | Audit log with Undo | Agent task board | Agent buttons in a note |
 | --- | --- | --- |
-| ![Audit log](assets/screenshots/bridge-audit.png) | ![Task board](assets/screenshots/task-board.png) | ![Note with a herdr block](assets/screenshots/codeblock.png) |
+| ![Audit log with Undo buttons](assets/screenshots/audit-log.png) | ![Herdr task board in a Base](assets/screenshots/task-board.png) | ![Note with a herdr block and live agents](assets/screenshots/agent-note.png) |
 
 ## Privacy
 
