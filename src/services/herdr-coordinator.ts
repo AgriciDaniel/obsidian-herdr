@@ -28,7 +28,7 @@ import type {
   TerminalProfile,
   WorktreeRecord,
 } from "../domain/types";
-import { HerdrCliClient } from "../herdr/cli-client";
+import { buildHostNormalizedEnv, HerdrCliClient } from "../herdr/cli-client";
 import { HerdrSocketClient } from "../herdr/socket-client";
 import { resolveDefaultShell } from "../terminal/pty-host";
 
@@ -36,6 +36,8 @@ export interface CoordinatorState {
   binaryPath: string | null;
   activeSessionName: string;
   socketPath: string;
+  connectionPath: string;
+  socketTransport: string;
   serverRunning: boolean;
   socketSubscribed: boolean;
   usingOfflinePreview: boolean;
@@ -152,7 +154,7 @@ export class HerdrCoordinator {
   getBridgeEnv(): Record<string, string> {
     const token = this.bridgeServer?.getAuthToken() || "";
     if (!token || !this.bridgeServer?.isRunning()) {
-      return {};
+      return process.platform === "win32" ? { PATH: buildHostNormalizedEnv(process.env).PATH || "" } : {};
     }
     return buildBridgeEnvForPanes({
       kit: this.runtimeKit,
@@ -269,6 +271,8 @@ export class HerdrCoordinator {
       binaryPath: this.cli.getBinaryPath(),
       activeSessionName: this.getActiveSessionName(),
       socketPath: this.socket.getSocketPath(),
+      connectionPath: this.socket.getConnectionPath(),
+      socketTransport: process.platform === "win32" ? "Windows named pipe" : "Unix domain socket",
       serverRunning,
       socketSubscribed: this.socket.isSubscribed(),
       usingOfflinePreview,

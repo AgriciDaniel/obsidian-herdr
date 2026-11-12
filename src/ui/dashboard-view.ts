@@ -1113,6 +1113,8 @@ export class HerdrDashboardView extends ItemView {
     );
     this.addKvRow(kv, "Target session", state.activeSessionName);
     this.addKvRow(kv, "Herdr socket", state.socketPath);
+    this.addKvRow(kv, "IPC transport", state.socketTransport);
+    this.addKvRow(kv, "Connection endpoint", state.connectionPath);
     this.addKvRow(
       kv,
       "Event stream subscription",

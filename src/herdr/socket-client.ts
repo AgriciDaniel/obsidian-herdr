@@ -15,6 +15,37 @@ import type {
   WorktreeRecord,
 } from "../domain/types";
 
+/**
+ * Herdr 0.9.5 uses interprocess 2.4.4 GenericNamespaced on Windows:
+ * the namespace prefix is prepended to the exact logical socket path.
+ * The on-disk .sock file is only a server identity marker, not a socket.
+ * Do not normalize slashes/case or read the marker as an endpoint.
+ */
+export function resolveHerdrSocketEndpoint(
+  socketPath: string,
+  platform: NodeJS.Platform = process.platform
+): string {
+  if (!socketPath || platform !== "win32" || /^\\\\[.?]\\pipe\\/i.test(socketPath)) {
+    return socketPath;
+  }
+  return "\\\\.\\pipe\\" + socketPath;
+}
+
+export function isHerdrSocketPresent(
+  socketPath: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (!socketPath) return false;
+  if (platform === "win32" && /^\\\\[.?]\\pipe\\/i.test(socketPath)) return true;
+  try {
+    const stat = fs.statSync(socketPath);
+    // Presence is a discovery hint only; successful RPC establishes liveness.
+    return platform === "win32" ? stat.isFile() : stat.isSocket();
+  } catch {
+    return false;
+  }
+}
+
 export interface HerdrRpcErrorBody {
   code?: string;
   message?: string;
@@ -96,19 +127,12 @@ export class HerdrSocketClient {
     return this.connected;
   }
 
+  getConnectionPath(): string {
+    return resolveHerdrSocketEndpoint(this.socketPath);
+  }
+
   isSocketPresent(): boolean {
-    if (!this.socketPath) {
-      return false;
-    }
-    if (process.platform === "win32" && this.socketPath.startsWith("\\\\.\\pipe\\")) {
-      return true;
-    }
-    try {
-      const stat = fs.statSync(this.socketPath);
-      return stat.isSocket();
-    } catch {
-      return false;
-    }
+    return isHerdrSocketPresent(this.socketPath);
   }
 
   onEvent(listener: (ev: HerdrEventNotification) => void): () => void {
@@ -146,7 +170,7 @@ export class HerdrSocketClient {
       let settled = false;
       let buffer = "";
 
-      const socket = net.createConnection({ path: this.socketPath });
+      const socket = net.createConnection({ path: this.getConnectionPath() });
       const timer = window.setTimeout(() => {
         if (!settled) {
           settled = true;
@@ -223,7 +247,7 @@ export class HerdrSocketClient {
         finish(
           new HerdrSocketError(
             err.code || "socket_error",
-            `Could not connect to Herdr socket (${this.socketPath}): ${err.message}`
+            `Could not connect to Herdr endpoint (${this.getConnectionPath()}): ${err.message}`
           )
         );
       });
@@ -648,7 +672,7 @@ export class HerdrSocketClient {
       return;
     }
 
-    const sock = net.createConnection({ path: this.socketPath });
+    const sock = net.createConnection({ path: this.getConnectionPath() });
     this.subSocket = sock;
     this.subBuffer = "";
 
