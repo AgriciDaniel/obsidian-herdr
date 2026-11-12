@@ -61,13 +61,16 @@ function isExecutableFile(target: string): boolean {
 }
 
 export function resolveExecutableOnNormalizedPath(name: string): string | null {
-  const exeName = process.platform === "win32" && !name.endsWith(".exe") ? `${name}.exe` : name;
+  // npm installs Windows command shims, not just .exe files.
+  const names = process.platform === "win32" && !path.extname(name)
+    ? [".exe", ".com", ".cmd", ".bat"].map(ext => name + ext)
+    : [name];
   const norm = buildHostNormalizedEnv(process.env);
   const dirs = (norm.PATH || "").split(path.delimiter).filter(Boolean);
   for (const dir of dirs) {
-    const candidate = path.join(dir, exeName);
-    if (isExecutableFile(candidate)) {
-      return candidate;
+    for (const executable of names) {
+      const candidate = path.join(dir, executable);
+      if (isExecutableFile(candidate)) return candidate;
     }
   }
   return null;
@@ -112,6 +115,37 @@ export function buildHostNormalizedEnv(
     ...baseEnv,
     ...overrides,
   };
+
+  if (process.platform === "win32") {
+    // Windows environment keys are case insensitive. Emit one PATH key for Node.
+    const pathKey = Object.keys(overrides).find(key => key.toUpperCase() === "PATH")
+      ?? Object.keys(baseEnv).find(key => key.toUpperCase() === "PATH");
+    const parts = (pathKey ? merged[pathKey] || "" : "").split(path.delimiter).filter(Boolean);
+    const home = os.homedir();
+    const candidates = [
+      path.join(merged.APPDATA || path.join(home, "AppData", "Roaming"), "npm"),
+      path.join(home, ".local", "bin"),
+      path.join(home, ".cargo", "bin"),
+      path.join(home, ".bun", "bin"),
+      ...(merged.ProgramFiles ? [path.join(merged.ProgramFiles, "nodejs")] : []),
+    ];
+    for (const dir of candidates) {
+      try {
+        if (
+          fs.statSync(dir).isDirectory() &&
+          !parts.some(p => p.toLowerCase() === dir.toLowerCase())
+        ) {
+          parts.push(dir);
+        }
+      } catch {
+        // Optional installation directory.
+      }
+    }
+    for (const key of Object.keys(merged)) {
+      if (key.toUpperCase() === "PATH") delete merged[key];
+    }
+    merged.PATH = parts.join(path.delimiter);
+  }
 
   if (process.platform !== "win32") {
     const home = os.homedir();

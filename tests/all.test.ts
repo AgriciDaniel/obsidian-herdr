@@ -31,6 +31,8 @@ import { PtySession } from "../src/terminal/pty-host";
 import { resolveTerminalFontFamily } from "../src/terminal/theme-palette";
 import { createMockObsidianApp } from "./obsidian-mock";
 import "./ui-control.test";
+import "./socket-transport.test";
+import "./windows-cli.test";
 
 const execFileAsync = promisify(execFile);
 
