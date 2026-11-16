@@ -201,6 +201,29 @@ interface ActiveMutationRun {
   abortedAfterNoteSwitch: boolean;
 }
 
+interface CapturedUserEvent {
+  type: "keydown" | "keypress" | "beforeinput";
+  key?: string;
+  code?: string;
+  keyCode?: number;
+  charCode?: number;
+  which?: number;
+  data?: string | null;
+  inputType?: string;
+  shiftKey?: boolean;
+  ctrlKey?: boolean;
+  altKey?: boolean;
+  metaKey?: boolean;
+  repeat?: boolean;
+}
+
+interface FocusShieldSession {
+  userElement: HTMLElement | null;
+  activeCount: number;
+  captured: CapturedUserEvent[];
+  detach: (() => void) | null;
+}
+
 interface ResolvedUiTarget {
   point: { x: number; y: number };
   element?: Element | null;
@@ -355,6 +378,12 @@ export class UiControlService {
   private readonly getAllowUiInProtectedAreas: () => boolean;
   private queue: Promise<unknown> = Promise.resolve();
   private activeMutationRun: ActiveMutationRun | null = null;
+  private activeShield: FocusShieldSession | null = null;
+  private agentKeyDepth = 0;
+  private agentKeyMatch: string | null = null;
+  private agentInsertTextChunk: string | null = null;
+  private deferredUserInputs: CapturedUserEvent[] = [];
+  private replayingUserInput = false;
 
   constructor(options: {
     win: Window;
@@ -393,14 +422,15 @@ export class UiControlService {
     return { ...result, durationMs: Math.max(0, Date.now() - startedAt) };
   }
 
-  /** Serializes a UI action and computes outer durationMs and focus after restoration settles. */
+  /** Serializes a UI action, wrapping focus-borrowing actions in a continuous focus/input shield. */
   private executeUiAction<T extends Record<string, unknown>>(
     task: () => Promise<T>,
-    includeFocus = false
+    includeFocus = false,
+    borrowFocus = true
   ): Promise<T & { durationMs: number }> {
     return this.serialize(() =>
       this.timedAsync(async () => {
-        const result = await this.withFocusRestore(task);
+        const result = borrowFocus ? await this.withFocusRestore(task) : await task();
         if (!includeFocus) {
           return result;
         }
@@ -639,7 +669,7 @@ export class UiControlService {
     }
     const settleMs = this.actionDelayMs(100, 10);
     if (settleMs > 0) {
-      await this.sleep(settleMs);
+      await this.runWithUserInputShield(() => this.sleep(settleMs));
     }
     return { dispatched: true, point, button, count, focus: this.focusState() };
   }
@@ -675,7 +705,8 @@ export class UiControlService {
 
   type(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
     this.validateTypeParams(params);
-    return this.executeUiAction(() => this.typeNow(params, caller), true);
+    const borrowFocus = !(params.target !== undefined && this.isAnchorTargetObject(params.target));
+    return this.executeUiAction(() => this.typeNow(params, caller), true, borrowFocus);
   }
 
   private validateTypeParams(params: Record<string, unknown>): string {
@@ -692,25 +723,11 @@ export class UiControlService {
     return text;
   }
 
-  private assertTypingOwnershipIntact(
+  private assertEditorHostOwnershipIntact(
     ownership: EditorTypingOwnership,
-    insertedChars: number,
-    totalChars: number
+    progress: string,
+    liveFocusEl: Element | null
   ): void {
-    const progress =
-      insertedChars > 0
-        ? `Typing stopped after inserting ${insertedChars} of ${totalChars} characters`
-        : "Typing aborted before inserting any characters";
-    const current = this.win.document.activeElement ?? null;
-    if (!this.isProtectedAreasAllowed()) {
-      const protectedArea = this.detectProtectedArea(current);
-      if (protectedArea) {
-        throw new UiControlError(
-          "ui_protected_area",
-          `${progress}: focus moved into ${protectedArea}. Ask the user to operate protected controls manually, or enable allowUiInProtectedAreas in Herdr settings if explicitly authorized.`
-        );
-      }
-    }
     if (ownership.containerEl?.isConnected === false) {
       this.markMutationAbortedAfterNoteSwitch();
       throw new UiControlError(
@@ -737,7 +754,9 @@ export class UiControlService {
           (ownership.leaf?.view && "file" in ownership.leaf.view)
       );
       const domCtx =
-        (current && current.isConnected !== false ? this.resolveElementLeafContext(current) : null) ??
+        (liveFocusEl && liveFocusEl.isConnected !== false
+          ? this.resolveElementLeafContext(liveFocusEl)
+          : null) ??
         (ownership.containerEl ? this.resolveElementLeafContext(ownership.containerEl) : null);
       const domPath = domCtx?.notePath !== undefined ? (domCtx.notePath ?? null) : undefined;
       const viewSwitched = hasLiveViewFile && viewPath !== ownership.notePath;
@@ -751,6 +770,63 @@ export class UiControlService {
         );
       }
     }
+    if (ownership.cm) {
+      const liveViewCm = this.extractCodeMirrorView(
+        ownership.view?.editor?.cm ?? ownership.leaf?.view?.editor?.cm
+      );
+      const liveFocusedCm = liveFocusEl ? this.findFocusedCodeMirrorView(liveFocusEl) : null;
+      const liveCm = liveViewCm ?? liveFocusedCm;
+      if (liveCm && liveCm !== ownership.cm) {
+        this.markMutationAbortedAfterNoteSwitch();
+        throw new UiControlError(
+          "ui_target_changed",
+          `${progress}: target editor instance changed.`
+        );
+      }
+    }
+  }
+
+  private assertAnchoredOwnershipIntact(
+    ownership: EditorTypingOwnership,
+    insertedChars: number,
+    totalChars: number
+  ): void {
+    const progress =
+      insertedChars > 0
+        ? `Typing stopped after inserting ${insertedChars} of ${totalChars} characters`
+        : "Typing aborted before inserting any characters";
+    if (!this.isProtectedAreasAllowed()) {
+      const area = this.detectProtectedArea(ownership.containerEl);
+      if (area) {
+        throw new UiControlError(
+          "ui_protected_area",
+          `${progress}: target moved into ${area}.`
+        );
+      }
+    }
+    this.assertEditorHostOwnershipIntact(ownership, progress, null);
+  }
+
+  private assertTypingOwnershipIntact(
+    ownership: EditorTypingOwnership,
+    insertedChars: number,
+    totalChars: number
+  ): void {
+    const progress =
+      insertedChars > 0
+        ? `Typing stopped after inserting ${insertedChars} of ${totalChars} characters`
+        : "Typing aborted before inserting any characters";
+    const current = this.win.document.activeElement ?? null;
+    if (!this.isProtectedAreasAllowed()) {
+      const protectedArea = this.detectProtectedArea(current);
+      if (protectedArea) {
+        throw new UiControlError(
+          "ui_protected_area",
+          `${progress}: focus moved into ${protectedArea}. Ask the user to operate protected controls manually, or enable allowUiInProtectedAreas in Herdr settings if explicitly authorized.`
+        );
+      }
+    }
+    this.assertEditorHostOwnershipIntact(ownership, progress, current);
     if (ownership.expectedActive) {
       const stillOwned =
         current !== null &&
@@ -759,20 +835,6 @@ export class UiControlService {
         throw new UiControlError(
           "ui_not_editable",
           `${progress}: focus moved away from the intended editable target.`
-        );
-      }
-    }
-    if (ownership.cm) {
-      const liveViewCm = this.extractCodeMirrorView(
-        ownership.view?.editor?.cm ?? ownership.leaf?.view?.editor?.cm
-      );
-      const liveFocusedCm = current ? this.findFocusedCodeMirrorView(current) : null;
-      const liveCm = liveViewCm ?? liveFocusedCm;
-      if (liveCm && liveCm !== ownership.cm) {
-        this.markMutationAbortedAfterNoteSwitch();
-        throw new UiControlError(
-          "ui_target_changed",
-          `${progress}: target editor instance changed.`
         );
       }
     }
@@ -788,6 +850,120 @@ export class UiControlService {
         "ui_not_editable",
         `${progress}: active target is no longer editable.`
       );
+    }
+  }
+
+  private async dispatchAgentInsertText(wc: WebContentsLike, chunk: string): Promise<void> {
+    const prevChunk = this.agentInsertTextChunk;
+    this.agentInsertTextChunk = chunk;
+    try {
+      await wc.insertText(chunk);
+    } finally {
+      this.agentInsertTextChunk = prevChunk;
+    }
+  }
+
+  private dispatchAgentKeyInput(wc: WebContentsLike, event: Record<string, unknown>): void {
+    const keyCode = typeof event.keyCode === "string" ? event.keyCode : null;
+    const prevMatch = this.agentKeyMatch;
+    this.agentKeyMatch = keyCode;
+    this.agentKeyDepth += 1;
+    try {
+      wc.sendInputEvent(event);
+    } finally {
+      this.agentKeyMatch = prevMatch;
+      this.agentKeyDepth = Math.max(0, this.agentKeyDepth - 1);
+    }
+  }
+
+  /**
+   * Streams anchored edits directly into CodeMirror via view.dispatch transactions so
+   * neither DOM focus nor any external user selection ever leaves its current control.
+   */
+  private async dispatchCmChunks(
+    cm: CodeMirrorViewLike,
+    text: string,
+    initialPos: number,
+    caller: string,
+    params: Record<string, unknown>,
+    ownership: EditorTypingOwnership,
+    docHint: {
+      notePath?: string | null;
+      paneId?: string | null;
+      containerEl?: Element | null;
+    }
+  ): Promise<number> {
+    this.assertAnchoredOwnershipIntact(ownership, 0, text.length);
+    let cursorPos = initialPos;
+    const buildCtx = (pos: number): DocumentCursorContext | undefined =>
+      this.buildDocContext({
+        cm,
+        notePath: docHint.notePath,
+        paneId: docHint.paneId,
+        containerEl: docHint.containerEl,
+        pos,
+      });
+
+    await this.ensureCaretInView(cm, cursorPos);
+    let lastDocCtx = buildCtx(cursorPos);
+    const startPt = this.resolveCaretOrFocusPoint(cm, cursorPos);
+    this.showCursor(caller, "type", startPt.x, startPt.y, undefined, params, lastDocCtx);
+
+    const applyChunkAndSync = async (chunk: string, delayMs: number): Promise<void> => {
+      const docLen = cm.state?.doc?.length;
+      const from = typeof docLen === "number" ? Math.max(0, Math.min(cursorPos, docLen)) : cursorPos;
+      if (chunk) {
+        cm.dispatch?.({
+          changes: { from, insert: chunk },
+        });
+        this.recordMutationInsert(from, chunk);
+      }
+      cursorPos = from + chunk.length;
+      if (delayMs > 0) {
+        await this.sleep(delayMs);
+      }
+      await this.ensureCaretInView(cm, cursorPos);
+      lastDocCtx = buildCtx(cursorPos) ?? lastDocCtx;
+      const nextPt = this.resolveCaretOrFocusPoint(cm, cursorPos);
+      this.showCursor(caller, "type", nextPt.x, nextPt.y, undefined, params, lastDocCtx);
+      if (chunk) {
+        this.notifyOverlayNoteUpdated(lastDocCtx?.notePath, {
+          from,
+          to: from,
+          insertLength: chunk.length,
+        });
+      }
+    };
+
+    try {
+      if (this.typingSpeed() === "fast") {
+        this.assertAnchoredOwnershipIntact(ownership, 0, text.length);
+        await applyChunkAndSync(text, 0);
+        return cursorPos;
+      }
+
+      const chunks = splitTypingChunks(text);
+      if (chunks.length <= 1) {
+        this.assertAnchoredOwnershipIntact(ownership, 0, text.length);
+        await applyChunkAndSync(text, 80);
+        return cursorPos;
+      }
+
+      const budgetMs = Math.min(
+        2200,
+        Math.max(120, Math.round((text.length / 100) * TYPING_BUDGET_PER_100_CHARS_MS))
+      );
+      const delayMs = Math.min(55, Math.max(12, Math.floor(budgetMs / chunks.length)));
+      let insertedChars = 0;
+      for (const chunk of chunks) {
+        this.assertAnchoredOwnershipIntact(ownership, insertedChars, text.length);
+        await applyChunkAndSync(chunk, delayMs);
+        insertedChars += chunk.length;
+      }
+      return cursorPos;
+    } finally {
+      const finalCtx = buildCtx(cursorPos) ?? lastDocCtx;
+      this.cursorOverlay?.finishTyping?.(caller, finalCtx);
     }
   }
 
@@ -833,7 +1009,7 @@ export class UiControlService {
     const insertChunkAndSync = async (chunk: string, delayMs: number): Promise<void> => {
       const beforeHead = activeCm?.state?.selection?.main?.head;
       if (chunk) {
-        await wc.insertText(chunk);
+        await this.dispatchAgentInsertText(wc, chunk);
         this.recordMutationInsert(beforeHead, chunk);
       }
       if (delayMs > 0) {
@@ -888,82 +1064,143 @@ export class UiControlService {
   private async typeNow(params: Record<string, unknown>, caller: string): Promise<Record<string, unknown>> {
     return this.timedAsync(async () => {
       const text = this.validateTypeParams(params);
-      const wc = this.requireWebContents();
-      if (params.target !== undefined) {
-        const clickStep = { ...params, target: params.target };
-        const resolved = await this.resolveTargetAsync(params.target);
+      if (params.target !== undefined && this.isAnchorTargetObject(params.target)) {
+        const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
         this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "type");
         this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
         const preferredCm = resolved.cm ?? null;
+        if (!preferredCm || !preferredCm.state?.doc || typeof preferredCm.dispatch !== "function") {
+          throw new UiControlError(
+            "ui_not_editable",
+            `Target note '${resolved.notePath ?? "note"}' does not have an active CodeMirror editor view. Switch the pane to Editing view before typing.`
+          );
+        }
         const targetMeta = this.resolveTargetLeafMeta(resolved);
-        const focusedOwnership = this.resolveFocusedOwnership();
-        const notePath = targetMeta.notePath ?? focusedOwnership.notePath;
-        const paneId = targetMeta.paneId ?? focusedOwnership.paneId;
-        const targetView = resolved.view ?? targetMeta.view ?? focusedOwnership.view ?? null;
-        const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? focusedOwnership.leaf ?? null;
-        const containerEl = resolved.containerEl ?? targetMeta.containerEl ?? focusedOwnership.containerEl ?? null;
+        const notePath = targetMeta.notePath ?? resolved.notePath ?? null;
+        const paneId = targetMeta.paneId ?? resolved.paneId ?? null;
+        const targetView = resolved.view ?? targetMeta.view ?? null;
+        const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? null;
+        const containerEl = resolved.containerEl ?? targetMeta.containerEl ?? null;
+        const ownership: EditorTypingOwnership = {
+          expectedActive: null,
+          notePath,
+          paneId,
+          containerEl,
+          leaf: targetLeaf,
+          view: targetView,
+          cm: preferredCm,
+        };
         return this.withMutationHook(
           "type",
           notePath,
           paneId,
           caller,
           async () => {
-            await this.dispatchResolvedClick(wc, resolved, clickStep, caller, "type");
-            this.assertElementNotProtected(this.win.document.activeElement ?? null, "type");
-            const focus = this.focusState();
-            if (!focus.editable || focus.password) {
-              throw new UiControlError(
-                "ui_not_editable",
-                "Focus an editable text field before typing. Password fields are excluded."
+            this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
+            if (resolved.scrolled) {
+              this.showCursor(
+                caller,
+                "move",
+                resolved.point.x,
+                resolved.point.y,
+                "scroll",
+                params,
+                this.docContextForResolvedTarget(resolved)
               );
             }
-            await this.typeChunks(wc, text, caller, params, preferredCm, {
-              notePath,
-              paneId,
-              containerEl,
-              leaf: targetLeaf,
-              view: targetView,
-            });
+            await this.dispatchCmChunks(
+              preferredCm,
+              text,
+              resolved.pos ?? preferredCm.state?.selection?.main?.head ?? 0,
+              caller,
+              params,
+              ownership,
+              { notePath, paneId, containerEl }
+            );
             return { dispatched: true, characters: text.length, focus: this.focusState() };
           },
           { targetView, targetCm: preferredCm }
         );
       }
 
-      this.assertElementNotProtected(this.win.document.activeElement ?? null, "type");
-      const focus = this.focusState();
-      if (!focus.editable || focus.password) {
-        throw new UiControlError(
-          "ui_not_editable",
-          "Focus an editable text field before typing. Password fields are excluded."
-        );
-      }
-      const focusedOwnership = this.resolveFocusedOwnership();
-      return this.withMutationHook(
-        "type",
-        focusedOwnership.notePath,
-        focusedOwnership.paneId,
-        caller,
-        async () => {
-          await this.typeChunks(wc, text, caller, params, focusedOwnership.cm, {
-            notePath: focusedOwnership.notePath,
-            paneId: focusedOwnership.paneId,
-            containerEl: focusedOwnership.containerEl,
-            leaf: focusedOwnership.leaf,
-            view: focusedOwnership.view,
-          });
-          return { dispatched: true, characters: text.length, focus: this.focusState() };
-        },
-        {
-          targetView: focusedOwnership.view,
-          targetCm: focusedOwnership.cm,
+      const wc = this.requireWebContents();
+      return this.runWithUserInputShield(async () => {
+        if (params.target !== undefined) {
+          const clickStep = { ...params, target: params.target };
+          const resolved = await this.resolveTargetAsync(params.target);
+          this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "type");
+          this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
+          const preferredCm = resolved.cm ?? null;
+          const targetMeta = this.resolveTargetLeafMeta(resolved);
+          const focusedOwnership = this.resolveFocusedOwnership();
+          const notePath = targetMeta.notePath ?? focusedOwnership.notePath;
+          const paneId = targetMeta.paneId ?? focusedOwnership.paneId;
+          const targetView = resolved.view ?? targetMeta.view ?? focusedOwnership.view ?? null;
+          const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? focusedOwnership.leaf ?? null;
+          const containerEl = resolved.containerEl ?? targetMeta.containerEl ?? focusedOwnership.containerEl ?? null;
+          return this.withMutationHook(
+            "type",
+            notePath,
+            paneId,
+            caller,
+            async () => {
+              await this.dispatchResolvedClick(wc, resolved, clickStep, caller, "type");
+              this.assertElementNotProtected(this.win.document.activeElement ?? null, "type");
+              const focus = this.focusState();
+              if (!focus.editable || focus.password) {
+                throw new UiControlError(
+                  "ui_not_editable",
+                  "Focus an editable text field before typing. Password fields are excluded."
+                );
+              }
+              await this.typeChunks(wc, text, caller, params, preferredCm, {
+                notePath,
+                paneId,
+                containerEl,
+                leaf: targetLeaf,
+                view: targetView,
+              });
+              return { dispatched: true, characters: text.length, focus: this.focusState() };
+            },
+            { targetView, targetCm: preferredCm }
+          );
         }
-      );
+
+        this.assertElementNotProtected(this.win.document.activeElement ?? null, "type");
+        const focus = this.focusState();
+        if (!focus.editable || focus.password) {
+          throw new UiControlError(
+            "ui_not_editable",
+            "Focus an editable text field before typing. Password fields are excluded."
+          );
+        }
+        const focusedOwnership = this.resolveFocusedOwnership();
+        return this.withMutationHook(
+          "type",
+          focusedOwnership.notePath,
+          focusedOwnership.paneId,
+          caller,
+          async () => {
+            await this.typeChunks(wc, text, caller, params, focusedOwnership.cm, {
+              notePath: focusedOwnership.notePath,
+              paneId: focusedOwnership.paneId,
+              containerEl: focusedOwnership.containerEl,
+              leaf: focusedOwnership.leaf,
+              view: focusedOwnership.view,
+            });
+            return { dispatched: true, characters: text.length, focus: this.focusState() };
+          },
+          {
+            targetView: focusedOwnership.view,
+            targetCm: focusedOwnership.cm,
+          }
+        );
+      });
     });
   }
 
   insertLine(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
-    return this.executeUiAction(() => this.insertLineNow(params, caller), true);
+    return this.executeUiAction(() => this.insertLineNow(params, caller), true, false);
   }
 
   private async insertLineNow(params: Record<string, unknown>, caller: string): Promise<Record<string, unknown>> {
@@ -979,12 +1216,18 @@ export class UiControlService {
     }
 
     return this.timedAsync(async () => {
-      const wc = this.requireWebContents();
       const rawTarget =
         params.target && typeof params.target === "object" ? params.target : params;
-      const anchor = await this.resolveAnchorTarget(rawTarget, true);
+      const anchor = await this.resolveAnchorTarget(rawTarget, false);
       this.assertElementNotProtected(anchor.leaf.containerEl, "insert_line");
       this.assertPointReceiverSafe(anchor.point, "insert_line", anchor.leaf.containerEl);
+      const cm = anchor.cm;
+      if (!cm || !cm.state?.doc || typeof cm.dispatch !== "function") {
+        throw new UiControlError(
+          "ui_not_editable",
+          `Target note '${anchor.leaf.path}' does not have an active CodeMirror editor view. Switch the pane to Editing view before running insert_line.`
+        );
+      }
       const leafMeta = {
         notePath: anchor.leaf.path,
         paneId: anchor.leaf.pane,
@@ -997,7 +1240,7 @@ export class UiControlService {
           notePath: leafMeta.notePath,
           paneId: leafMeta.paneId,
           containerEl: leafMeta.containerEl,
-          cm: anchor.cm,
+          cm,
           pos,
         });
 
@@ -1007,28 +1250,9 @@ export class UiControlService {
         anchor.leaf.pane,
         caller,
         async () => {
-          const initialCtx = buildAnchorCtx(anchor.pos);
-          if (anchor.scrolled) {
-            this.showCursor(caller, "move", anchor.point.x, anchor.point.y, "scroll", params, initialCtx);
-          }
-          this.showCursor(caller, "click", anchor.point.x, anchor.point.y, "insert_line", params, initialCtx);
-          const atPoint = this.toWindowPoint(wc, anchor.point);
-          wc.sendInputEvent({ type: "mouseMove", ...atPoint });
           this.assertPointReceiverSafe(anchor.point, "insert_line", anchor.leaf.containerEl);
-          try {
-            wc.sendInputEvent({ type: "mouseDown", ...atPoint, button: "left", clickCount: 1 });
-          } finally {
-            wc.sendInputEvent({ type: "mouseUp", ...atPoint, button: "left", clickCount: 1 });
-          }
-          const clickSettleMs = this.actionDelayMs(40, 10);
-          if (clickSettleMs > 0) {
-            await this.sleep(clickSettleMs);
-          }
-          this.assertElementNotProtected(this.win.document.activeElement ?? null, "insert_line");
-
-          const cm = anchor.cm;
           const ownership: EditorTypingOwnership = {
-            expectedActive: this.win.document.activeElement ?? null,
+            expectedActive: null,
             notePath: anchor.leaf.path,
             paneId: anchor.leaf.pane,
             containerEl: anchor.leaf.containerEl,
@@ -1036,61 +1260,40 @@ export class UiControlService {
             view: anchor.leaf.view ?? null,
             cm,
           };
-          this.assertTypingOwnershipIntact(ownership, 0, text.length);
+          this.assertAnchoredOwnershipIntact(ownership, 0, text.length);
 
-          let insertedStartPos: number | undefined;
-          if (cm && cm.state?.doc && typeof cm.dispatch === "function") {
-            const insertAt = anchor.at === "start" ? anchor.from : anchor.to;
-            const newCaretPos = anchor.at === "start" ? anchor.from : anchor.to + 1;
-            insertedStartPos = newCaretPos;
-            // Insert the newline via an explicit CM transaction so Obsidian's Enter keymap does not
-            // auto-insert a duplicate "- " list prefix before typing the caller's line.
-            cm.focus?.();
-            cm.dispatch({
-              changes: { from: insertAt, insert: "\n" },
-              selection: { anchor: newCaretPos },
-              scrollIntoView: true,
-            });
-            this.recordMutationInsert(insertAt, "\n");
-            await this.waitForPaint();
-            await this.ensureCaretInView(cm);
-            this.notifyOverlayNoteUpdated(anchor.leaf.path, {
-              from: insertAt,
-              to: insertAt,
-              insertLength: 1,
-            });
+          const initialCtx = buildAnchorCtx(anchor.pos);
+          if (anchor.scrolled) {
+            this.showCursor(caller, "move", anchor.point.x, anchor.point.y, "scroll", params, initialCtx);
           } else {
-            if (anchor.at === "start") {
-              await this.pressKeyNow({ ...params, key: "Home", modifiers: [] }, caller, false);
-            } else {
-              await this.pressKeyNow({ ...params, key: "End", modifiers: [] }, caller, false);
-            }
-            // Using insertText("\n") instead of Enter avoids triggering Smart Indent Lists.
-            this.assertTypingOwnershipIntact(ownership, 0, text.length);
-            await wc.insertText("\n");
-            this.recordMutationInsert(undefined, "\n");
-            if (anchor.at === "start") {
-              await this.pressKeyNow({ ...params, key: "ArrowUp", modifiers: [] }, caller, false);
-            }
-            const newlineSettleMs = this.actionDelayMs(40, 10);
-            if (newlineSettleMs > 0) {
-              await this.sleep(newlineSettleMs);
-            }
-            await this.ensureCaretInView(cm);
-            this.notifyOverlayNoteUpdated(anchor.leaf.path);
+            this.showCursor(caller, "move", anchor.point.x, anchor.point.y, "insert_line", params, initialCtx);
           }
 
+          const insertAt = anchor.at === "start" ? anchor.from : anchor.to;
+          const newCaretPos = anchor.at === "start" ? anchor.from : anchor.to + 1;
+          cm.dispatch?.({
+            changes: { from: insertAt, insert: "\n" },
+          });
+          this.recordMutationInsert(insertAt, "\n");
+          await this.waitForPaint();
+          await this.ensureCaretInView(cm, newCaretPos);
+          this.notifyOverlayNoteUpdated(anchor.leaf.path, {
+            from: insertAt,
+            to: insertAt,
+            insertLength: 1,
+          });
+
           if (text.length > 0) {
-            await this.typeChunks(wc, text, caller, params, cm, leafMeta);
+            await this.dispatchCmChunks(cm, text, newCaretPos, caller, params, ownership, leafMeta);
           } else {
-            const caretPt = this.resolveCaretOrFocusPoint(cm);
-            const afterCtx = buildAnchorCtx();
+            const caretPt = this.resolveCaretOrFocusPoint(cm, newCaretPos);
+            const afterCtx = buildAnchorCtx(newCaretPos);
             this.showCursor(caller, "move", caretPt.x, caretPt.y, "insert_line", params, afterCtx);
             this.cursorOverlay?.finishTyping?.(caller, afterCtx);
           }
 
           const expectedLine = anchor.at === "start" ? anchor.lineNumber : anchor.lineNumber + 1;
-          const proof = this.readInsertedLineProof(anchor.leaf, cm, expectedLine, insertedStartPos);
+          const proof = this.readInsertedLineProof(anchor.leaf, cm, expectedLine, newCaretPos);
           return {
             dispatched: true,
             path: proof.path,
@@ -1105,7 +1308,7 @@ export class UiControlService {
         },
         {
           targetView: anchor.leaf.view ?? undefined,
-          targetCm: anchor.cm ?? undefined,
+          targetCm: cm,
         }
       );
     });
@@ -1131,68 +1334,81 @@ export class UiControlService {
         throw new UiControlError("invalid_params", err instanceof Error ? err.message : String(err));
       }
       this.assertElementNotProtected(this.win.document.activeElement ?? null, "press_key");
-      const run = async (): Promise<Record<string, unknown>> => {
-        const pt = this.resolveCaretOrFocusPoint();
-        const combo = [...modifiers, key].filter(Boolean).join("+");
-        const beforeCtx = this.buildDocContext();
-        this.showCursor(caller, "move", pt.x, pt.y, combo || "key", params, beforeCtx);
-        try {
-          wc.sendInputEvent({ type: "keyDown", keyCode: press.keyCode, modifiers: press.modifiers });
-          if (press.text !== null) {
-            wc.sendInputEvent({ type: "char", keyCode: press.text, modifiers: press.modifiers });
+      const run = (): Promise<Record<string, unknown>> =>
+        this.runWithUserInputShield(async () => {
+          const pt = this.resolveCaretOrFocusPoint();
+          const combo = [...modifiers, key].filter(Boolean).join("+");
+          const beforeCtx = this.buildDocContext();
+          this.showCursor(caller, "move", pt.x, pt.y, combo || "key", params, beforeCtx);
+          try {
+            this.dispatchAgentKeyInput(wc, {
+              type: "keyDown",
+              keyCode: press.keyCode,
+              modifiers: press.modifiers,
+            });
+            if (press.text !== null) {
+              this.dispatchAgentKeyInput(wc, {
+                type: "char",
+                keyCode: press.text,
+                modifiers: press.modifiers,
+              });
+            }
+          } finally {
+            this.dispatchAgentKeyInput(wc, {
+              type: "keyUp",
+              keyCode: press.keyCode,
+              modifiers: press.modifiers,
+            });
           }
-        } finally {
-          wc.sendInputEvent({ type: "keyUp", keyCode: press.keyCode, modifiers: press.modifiers });
-        }
-        const settleMs = this.actionDelayMs(80, 10);
-        if (settleMs > 0) {
-          await this.sleep(settleMs);
-        }
-        const doc = this.win.document;
-        const afterActive = doc.activeElement ?? null;
-        const afterProtected = this.detectProtectedArea(afterActive);
-        const afterRect =
-          afterActive &&
-          typeof (afterActive as { getBoundingClientRect?: unknown }).getBoundingClientRect === "function"
-            ? afterActive.getBoundingClientRect()
-            : null;
-        const afterStyle =
-          afterActive && typeof this.win.getComputedStyle === "function"
-            ? this.win.getComputedStyle(afterActive)
-            : null;
-        const afterHidden = Boolean(
-          afterRect &&
-            (afterRect.width <= 0 ||
-              afterRect.height <= 0 ||
-              afterStyle?.visibility === "hidden" ||
-              afterStyle?.display === "none")
-        );
-        const focusLeftTargetArea =
-          Boolean(afterProtected) ||
-          !afterActive ||
-          afterActive === doc.body ||
-          afterActive === doc.documentElement ||
-          afterActive.isConnected === false ||
-          afterHidden;
-        if (focusLeftTargetArea) {
-          this.cursorOverlay?.exitAgent?.(caller);
-        } else {
-          await this.ensureCaretInView();
-          const afterPt = this.resolveCaretOrFocusPoint();
-          const afterCtx = this.buildDocContext();
-          this.showCursor(caller, "move", afterPt.x, afterPt.y, combo || "key", params, afterCtx);
-          if (
-            afterCtx?.notePath &&
-            (press.text !== null ||
-              press.keyCode === "Backspace" ||
-              press.keyCode === "Delete" ||
-              press.keyCode === "Return")
-          ) {
-            this.notifyOverlayNoteUpdated(afterCtx.notePath);
+          const settleMs = this.actionDelayMs(80, 10);
+          if (settleMs > 0) {
+            await this.sleep(settleMs);
           }
-        }
-        return { dispatched: true, key, modifiers: press.modifiers, focus: this.focusState() };
-      };
+          const doc = this.win.document;
+          const afterActive = doc.activeElement ?? null;
+          const afterProtected = this.detectProtectedArea(afterActive);
+          const afterRect =
+            afterActive &&
+            typeof (afterActive as { getBoundingClientRect?: unknown }).getBoundingClientRect === "function"
+              ? afterActive.getBoundingClientRect()
+              : null;
+          const afterStyle =
+            afterActive && typeof this.win.getComputedStyle === "function"
+              ? this.win.getComputedStyle(afterActive)
+              : null;
+          const afterHidden = Boolean(
+            afterRect &&
+              (afterRect.width <= 0 ||
+                afterRect.height <= 0 ||
+                afterStyle?.visibility === "hidden" ||
+                afterStyle?.display === "none")
+          );
+          const focusLeftTargetArea =
+            Boolean(afterProtected) ||
+            !afterActive ||
+            afterActive === doc.body ||
+            afterActive === doc.documentElement ||
+            afterActive.isConnected === false ||
+            afterHidden;
+          if (focusLeftTargetArea) {
+            this.cursorOverlay?.exitAgent?.(caller);
+          } else {
+            await this.ensureCaretInView();
+            const afterPt = this.resolveCaretOrFocusPoint();
+            const afterCtx = this.buildDocContext();
+            this.showCursor(caller, "move", afterPt.x, afterPt.y, combo || "key", params, afterCtx);
+            if (
+              afterCtx?.notePath &&
+              (press.text !== null ||
+                press.keyCode === "Backspace" ||
+                press.keyCode === "Delete" ||
+                press.keyCode === "Return")
+            ) {
+              this.notifyOverlayNoteUpdated(afterCtx.notePath);
+            }
+          }
+          return { dispatched: true, key, modifiers: press.modifiers, focus: this.focusState() };
+        });
       if (!notifyMutation) {
         return run();
       }
@@ -1212,7 +1428,7 @@ export class UiControlService {
   }
 
   scroll(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
-    return this.executeUiAction(() => this.scrollNow(params, caller));
+    return this.executeUiAction(() => this.scrollNow(params, caller), false, false);
   }
 
   private async scrollNow(
@@ -1222,7 +1438,7 @@ export class UiControlService {
   ): Promise<Record<string, unknown>> {
     return this.timedAsync(async () => {
       const wc = this.requireWebContents();
-      const resolved = await this.resolveTargetAsync(params.target);
+      const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
       this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "scroll");
       this.assertPointReceiverSafe(resolved.point, "scroll", this.expectedTargetContainer(resolved));
       const point = resolved.point;
@@ -1358,6 +1574,21 @@ export class UiControlService {
     });
   }
 
+  private stepBorrowsFocus(rawStep: unknown): boolean {
+    if (!rawStep || typeof rawStep !== "object") {
+      return false;
+    }
+    const step = rawStep as Record<string, unknown>;
+    const action = typeof step.action === "string" ? step.action : "";
+    if (action === "click" || action === "drag" || action === "press_key") {
+      return true;
+    }
+    if (action === "type") {
+      return !(step.target !== undefined && this.isAnchorTargetObject(step.target));
+    }
+    return false;
+  }
+
   /**
    * Executes a multi-step UI sequence inside one serialized lock so parallel
    * agents cannot interleave click-then-type actions.
@@ -1377,50 +1608,55 @@ export class UiControlService {
         )
       );
     }
-    return this.executeUiAction(async () => {
-      const batchAgentName =
-        typeof params.agentName === "string" && params.agentName.trim()
-          ? params.agentName.trim()
-          : typeof params.callerName === "string" && params.callerName.trim()
-            ? params.callerName.trim()
-            : undefined;
-      const results: unknown[] = [];
-      const stepsList: unknown[] = rawSteps;
-      for (let i = 0; i < stepsList.length; i += 1) {
-        const rawStep = stepsList[i];
-        if (!rawStep || typeof rawStep !== "object") {
-          throw new UiControlError("invalid_params", "Each ui.batch step must be an object.");
+    const borrowFocus = rawSteps.some((step) => this.stepBorrowsFocus(step));
+    return this.executeUiAction(
+      async () => {
+        const batchAgentName =
+          typeof params.agentName === "string" && params.agentName.trim()
+            ? params.agentName.trim()
+            : typeof params.callerName === "string" && params.callerName.trim()
+              ? params.callerName.trim()
+              : undefined;
+        const results: unknown[] = [];
+        const stepsList: unknown[] = rawSteps;
+        for (let i = 0; i < stepsList.length; i += 1) {
+          const rawStep = stepsList[i];
+          if (!rawStep || typeof rawStep !== "object") {
+            throw new UiControlError("invalid_params", "Each ui.batch step must be an object.");
+          }
+          const isLastStep = i === stepsList.length - 1;
+          const baseStep = rawStep as Record<string, unknown>;
+          const step =
+            batchAgentName && baseStep.agentName === undefined && baseStep.callerName === undefined
+              ? { ...baseStep, agentName: batchAgentName }
+              : baseStep;
+          const action = typeof step.action === "string" ? step.action : "";
+          if (action === "click") {
+            results.push(await this.clickNow(step, caller));
+          } else if (action === "type") {
+            results.push(await this.typeNow(step, caller));
+          } else if (action === "insert_line") {
+            results.push(await this.insertLineNow(step, caller));
+          } else if (action === "press_key") {
+            results.push(await this.pressKeyNow(step, caller));
+          } else if (action === "scroll") {
+            results.push(await this.scrollNow(step, caller, isLastStep));
+          } else if (action === "drag") {
+            results.push(await this.dragNow(step, caller));
+          } else if (action === "wait_for") {
+            results.push(await this.waitFor(step, caller));
+          } else {
+            throw new UiControlError(
+              "invalid_params",
+              `Unsupported ui.batch step action '${action}'.`
+            );
+          }
         }
-        const isLastStep = i === stepsList.length - 1;
-        const baseStep = rawStep as Record<string, unknown>;
-        const step =
-          batchAgentName && baseStep.agentName === undefined && baseStep.callerName === undefined
-            ? { ...baseStep, agentName: batchAgentName }
-            : baseStep;
-        const action = typeof step.action === "string" ? step.action : "";
-        if (action === "click") {
-          results.push(await this.clickNow(step, caller));
-        } else if (action === "type") {
-          results.push(await this.typeNow(step, caller));
-        } else if (action === "insert_line") {
-          results.push(await this.insertLineNow(step, caller));
-        } else if (action === "press_key") {
-          results.push(await this.pressKeyNow(step, caller));
-        } else if (action === "scroll") {
-          results.push(await this.scrollNow(step, caller, isLastStep));
-        } else if (action === "drag") {
-          results.push(await this.dragNow(step, caller));
-        } else if (action === "wait_for") {
-          results.push(await this.waitFor(step, caller));
-        } else {
-          throw new UiControlError(
-            "invalid_params",
-            `Unsupported ui.batch step action '${action}'.`
-          );
-        }
-      }
-      return { completed: true, stepCount: results.length, results };
-    });
+        return { completed: true, stepCount: results.length, results };
+      },
+      false,
+      borrowFocus
+    );
   }
 
   private formatCursorLabel(caller: string, params?: Record<string, unknown>): string {
@@ -1643,13 +1879,17 @@ export class UiControlService {
 
   private codeMirrorCaretPoint(
     activeEl: Element | null,
-    preferredCm?: CodeMirrorViewLike | null
+    preferredCm?: CodeMirrorViewLike | null,
+    explicitPos?: number
   ): { x: number; y: number } | null {
     const view = preferredCm ?? this.findFocusedCodeMirrorView(activeEl);
     if (!view || typeof view.coordsAtPos !== "function") {
       return null;
     }
-    const head = view.state?.selection?.main?.head;
+    const head =
+      typeof explicitPos === "number" && Number.isFinite(explicitPos)
+        ? explicitPos
+        : view.state?.selection?.main?.head;
     if (typeof head !== "number") {
       return null;
     }
@@ -1917,13 +2157,27 @@ export class UiControlService {
   }
 
   private resolveCaretOrFocusPoint(
-    preferredCm?: CodeMirrorViewLike | null
+    preferredCm?: CodeMirrorViewLike | null,
+    explicitPos?: number
   ): { x: number; y: number } {
     const activeEl = this.win.document.activeElement ?? null;
 
-    const cmPoint = this.codeMirrorCaretPoint(activeEl, preferredCm);
+    const cmPoint = this.codeMirrorCaretPoint(activeEl, preferredCm, explicitPos);
     if (cmPoint) {
       return cmPoint;
+    }
+
+    if (typeof explicitPos === "number" && preferredCm) {
+      const targetEl = preferredCm.contentDOM ?? preferredCm.dom;
+      if (targetEl && typeof targetEl.getBoundingClientRect === "function") {
+        const r = targetEl.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          return {
+            x: Math.round(r.left + Math.min(r.width * 0.25, 120)),
+            y: Math.round(r.top + Math.min(r.height * 0.2, 64)),
+          };
+        }
+      }
     }
 
     const selPoint = this.selectionRangePoint(activeEl);
@@ -2049,24 +2303,9 @@ export class UiControlService {
   }
 
   private resolveLeafResultPoint(
-    leaf: NoteLeafContext,
-    preferEditor: boolean
+    leaf: NoteLeafContext
   ): { point: { x: number; y: number }; notePath: string; docContext: DocumentCursorContext | null } | null {
     const containerEl = leaf.containerEl;
-    if (!preferEditor) {
-      const tabHeader =
-        leaf.activePane
-          ? containerEl.closest?.(".workspace-tabs")?.querySelector?.(".workspace-tab-header.is-active") ?? null
-          : null;
-      if (this.isRenderableVisible(tabHeader)) {
-        return { point: this.pointOnElement(tabHeader, "header"), notePath: leaf.path, docContext: null };
-      }
-      const viewTitle = containerEl.querySelector?.(".view-header-title") ?? null;
-      if (this.isRenderableVisible(viewTitle)) {
-        return { point: this.pointOnElement(viewTitle, "header"), notePath: leaf.path, docContext: null };
-      }
-    }
-
     if (leaf.cm) {
       const caretPt = this.codeMirrorCaretPoint(null, leaf.cm);
       if (caretPt) {
@@ -2134,7 +2373,7 @@ export class UiControlService {
       containerEl,
       cm,
     };
-    const resolved = this.resolveLeafResultPoint(leafCtx, false);
+    const resolved = this.resolveLeafResultPoint(leafCtx);
     if (!resolved) {
       return null;
     }
@@ -2166,15 +2405,25 @@ export class UiControlService {
       if (this.isRenderableVisible(target.element)) {
         const ctx = this.resolveElementLeafContext(target.element);
         const notePath = target.notePath ?? ctx?.notePath;
-        const asLeaf = notePath ? this.findOpenNoteLeaf(notePath) : null;
-        if (asLeaf && target.prefer !== "file-tree") {
-          resolved = this.resolveLeafResultPoint(asLeaf, target.prefer === "editor");
+        const asLeaf =
+          notePath && target.prefer !== "file-tree"
+            ? this.findOpenNoteLeaf(notePath, target.element)
+            : null;
+        if (asLeaf) {
+          resolved = this.resolveLeafResultPoint(asLeaf);
         }
         if (!resolved) {
           const isModal = target.element.matches?.(MODAL_SELECTOR) ?? false;
           const isEditor = Boolean(target.element.matches?.(".cm-content, .view-content, .workspace-leaf"));
+          const innerEditor =
+            !isModal && isEditor
+              ? [
+                  target.element.querySelector?.(".cm-content") ?? null,
+                  target.element.querySelector?.(".view-content") ?? null,
+                ].find((cand) => this.isRenderableVisible(cand)) ?? target.element
+              : target.element;
           resolved = {
-            point: this.pointOnElement(target.element, isModal ? "modal" : isEditor ? "editor" : "header"),
+            point: this.pointOnElement(innerEditor, isModal ? "modal" : isEditor ? "editor" : "header"),
             ...(notePath ? { notePath } : {}),
             docContext: null,
           };
@@ -2220,13 +2469,13 @@ export class UiControlService {
           } else {
             const leaf = this.findOpenNoteLeaf(notePath);
             if (leaf) {
-              resolved = this.resolveLeafResultPoint(leaf, false);
+              resolved = this.resolveLeafResultPoint(leaf);
             }
           }
         } else {
           const leaf = this.findOpenNoteLeaf(notePath);
           if (leaf) {
-            resolved = this.resolveLeafResultPoint(leaf, prefer === "editor");
+            resolved = this.resolveLeafResultPoint(leaf);
           }
           if (!resolved) {
             const treeEl = this.findFileTreeElement(notePath);
@@ -2328,66 +2577,510 @@ export class UiControlService {
     };
   }
 
+  private restoreElementFocusAndSelection(
+    beforeEl: HTMLElement,
+    before: FocusSnapshot
+  ): void {
+    try {
+      if (typeof beforeEl.focus === "function") {
+        beforeEl.focus({ preventScroll: true });
+      }
+    } catch {
+      try {
+        beforeEl.focus?.();
+      } catch {
+        // Ignore disconnected or unfocusable targets.
+      }
+    }
+    if (
+      isInputOrTextarea(beforeEl) &&
+      before.selectionStart !== null &&
+      before.selectionEnd !== null &&
+      typeof beforeEl.setSelectionRange === "function"
+    ) {
+      try {
+        beforeEl.setSelectionRange(
+          before.selectionStart,
+          before.selectionEnd,
+          before.selectionDirection ?? undefined
+        );
+      } catch {
+        // Ignore input types that reject selection ranges.
+      }
+    } else if (before.domRanges.length > 0) {
+      const sel = this.win.getSelection?.();
+      if (sel && typeof sel.removeAllRanges === "function" && typeof sel.addRange === "function") {
+        try {
+          sel.removeAllRanges();
+          for (const range of before.domRanges) {
+            sel.addRange(range);
+          }
+        } catch {
+          // Ignore stale DOM ranges.
+        }
+      }
+    }
+  }
+
+  private matchesAgentKeyName(evKey: string | undefined, expected: string): boolean {
+    if (!evKey) {
+      return false;
+    }
+    const normalize = (value: string): string => {
+      const lower = value.toLowerCase();
+      const aliases: Record<string, string> = {
+        return: "enter",
+        enter: "enter",
+        space: " ",
+        " ": " ",
+        esc: "escape",
+        escape: "escape",
+        del: "delete",
+        delete: "delete",
+        backspace: "backspace",
+        left: "arrowleft",
+        arrowleft: "arrowleft",
+        right: "arrowright",
+        arrowright: "arrowright",
+        up: "arrowup",
+        arrowup: "arrowup",
+        down: "arrowdown",
+        arrowdown: "arrowdown",
+        pageup: "pageup",
+        pgup: "pageup",
+        pagedown: "pagedown",
+        pgdn: "pagedown",
+        home: "home",
+        end: "end",
+        insert: "insert",
+        ins: "insert",
+        tab: "tab",
+      };
+      return aliases[lower] ?? lower;
+    };
+    return normalize(evKey) === normalize(expected);
+  }
+
+  private consumeAgentDispatchedEvent(ev: {
+    type?: string;
+    key?: string;
+    data?: string | null;
+  }): boolean {
+    const evType = ev.type;
+    if (evType === "keydown" || evType === "keypress") {
+      if (this.agentKeyDepth <= 0) {
+        return false;
+      }
+      if (!this.agentKeyMatch) {
+        return true;
+      }
+      const keyVal = typeof ev.key === "string" ? ev.key : (ev.data ?? "");
+      return this.matchesAgentKeyName(keyVal, this.agentKeyMatch);
+    }
+    if (evType === "beforeinput") {
+      const dataVal = typeof ev.data === "string" ? ev.data : "";
+      if (this.agentInsertTextChunk !== null && dataVal === this.agentInsertTextChunk) {
+        return true;
+      }
+      if (this.agentKeyDepth > 0) {
+        if (!this.agentKeyMatch) {
+          return true;
+        }
+        return this.matchesAgentKeyName(dataVal || ev.key, this.agentKeyMatch);
+      }
+    }
+    return false;
+  }
+
+  private attachUserInputCaptureListener(session: FocusShieldSession): () => void {
+    const doc = this.win.document as unknown as {
+      addEventListener?: (
+        type: string,
+        listener: (event: unknown) => void,
+        options?: boolean | { capture?: boolean }
+      ) => void;
+      removeEventListener?: (
+        type: string,
+        listener: (event: unknown) => void,
+        options?: boolean | { capture?: boolean }
+      ) => void;
+    };
+    const winTarget = this.win as unknown as typeof doc;
+    const host =
+      typeof doc.addEventListener === "function" && typeof doc.removeEventListener === "function"
+        ? doc
+        : typeof winTarget.addEventListener === "function" &&
+            typeof winTarget.removeEventListener === "function"
+          ? winTarget
+          : null;
+    if (!host?.addEventListener || !host?.removeEventListener) {
+      return () => undefined;
+    }
+
+    const types: Array<CapturedUserEvent["type"]> = ["keydown", "keypress", "beforeinput"];
+    const handler = (rawEvent: unknown): void => {
+      if (this.replayingUserInput || !rawEvent || typeof rawEvent !== "object") {
+        return;
+      }
+      const expectedBase = session.userElement ?? this.win.document.body ?? null;
+      const focusMovedAway = (this.win.document.activeElement ?? null) !== expectedBase;
+      if (!focusMovedAway && session.activeCount <= 0) {
+        return;
+      }
+      const ev = rawEvent as {
+        type?: string;
+        isTrusted?: boolean;
+        key?: string;
+        code?: string;
+        keyCode?: number;
+        charCode?: number;
+        which?: number;
+        data?: string | null;
+        inputType?: string;
+        shiftKey?: boolean;
+        ctrlKey?: boolean;
+        altKey?: boolean;
+        metaKey?: boolean;
+        repeat?: boolean;
+        preventDefault?: () => void;
+        stopImmediatePropagation?: () => void;
+        stopPropagation?: () => void;
+      };
+      if (ev.isTrusted === false) {
+        return;
+      }
+      if (
+        ev.type !== "keydown" &&
+        ev.type !== "keypress" &&
+        ev.type !== "beforeinput"
+      ) {
+        return;
+      }
+      if (this.consumeAgentDispatchedEvent(ev)) {
+        return;
+      }
+      ev.preventDefault?.();
+      ev.stopImmediatePropagation?.();
+      ev.stopPropagation?.();
+      session.captured.push({
+        type: ev.type,
+        ...(typeof ev.key === "string" ? { key: ev.key } : {}),
+        ...(typeof ev.code === "string" ? { code: ev.code } : {}),
+        ...(typeof ev.keyCode === "number" ? { keyCode: ev.keyCode } : {}),
+        ...(typeof ev.charCode === "number" ? { charCode: ev.charCode } : {}),
+        ...(typeof ev.which === "number" ? { which: ev.which } : {}),
+        ...(ev.data !== undefined ? { data: ev.data } : {}),
+        ...(typeof ev.inputType === "string" ? { inputType: ev.inputType } : {}),
+        ...(typeof ev.shiftKey === "boolean" ? { shiftKey: ev.shiftKey } : {}),
+        ...(typeof ev.ctrlKey === "boolean" ? { ctrlKey: ev.ctrlKey } : {}),
+        ...(typeof ev.altKey === "boolean" ? { altKey: ev.altKey } : {}),
+        ...(typeof ev.metaKey === "boolean" ? { metaKey: ev.metaKey } : {}),
+        ...(typeof ev.repeat === "boolean" ? { repeat: ev.repeat } : {}),
+      });
+    };
+
+    for (const type of types) {
+      host.addEventListener(type, handler, { capture: true });
+    }
+    return () => {
+      for (const type of types) {
+        host.removeEventListener?.(type, handler, { capture: true });
+      }
+    };
+  }
+
   /**
-   * Preserves the user's keyboard focus across an agent UI action or batch:
-   * if focus started on another control (such as the Herdr terminal) and the
-   * action did not intentionally open a modal (command palette, quick switcher,
-   * or dialog), focus and selection are restored afterward so agents never steal
-   * typing input from the user.
+   * Captures user-originated keyboard/beforeinput events during raw focus-based input
+   * actions so interleaved user typing cannot land inside the agent's target control.
    */
-  private async withFocusRestore<T>(task: () => Promise<T>): Promise<T> {
-    const before = this.captureFocusSnapshot();
+  private async runWithUserInputShield<T>(task: () => Promise<T>): Promise<T> {
+    const session = this.activeShield;
+    if (!session) {
+      return task();
+    }
+    session.activeCount += 1;
+    if (!session.detach) {
+      session.detach = this.attachUserInputCaptureListener(session);
+    }
     try {
       return await task();
     } finally {
+      session.activeCount = Math.max(0, session.activeCount - 1);
+    }
+  }
+
+  private buildReplayDomEvent(ev: CapturedUserEvent): unknown {
+    const winRec = this.win as unknown as {
+      KeyboardEvent?: new (type: string, init: Record<string, unknown>) => unknown;
+      InputEvent?: new (type: string, init: Record<string, unknown>) => unknown;
+    };
+    const KeyboardCtor = winRec.KeyboardEvent;
+    const InputCtor = winRec.InputEvent;
+    if (ev.type === "beforeinput") {
+      if (typeof InputCtor === "function") {
+        try {
+          return new InputCtor("beforeinput", {
+            data: ev.data ?? null,
+            inputType: ev.inputType ?? "insertText",
+            bubbles: true,
+            cancelable: true,
+          });
+        } catch {
+          // Fall back to plain mock event object below.
+        }
+      }
+      return {
+        type: "beforeinput",
+        data: ev.data ?? null,
+        inputType: ev.inputType ?? "insertText",
+        bubbles: true,
+        cancelable: true,
+      };
+    }
+    const init: Record<string, unknown> = {
+      key: ev.key ?? "",
+      code: ev.code ?? "",
+      keyCode: ev.keyCode,
+      charCode: ev.charCode,
+      which: ev.which,
+      shiftKey: Boolean(ev.shiftKey),
+      ctrlKey: Boolean(ev.ctrlKey),
+      altKey: Boolean(ev.altKey),
+      metaKey: Boolean(ev.metaKey),
+      repeat: Boolean(ev.repeat),
+      bubbles: true,
+      cancelable: true,
+    };
+    if (typeof KeyboardCtor === "function") {
+      try {
+        return new KeyboardCtor(ev.type, init);
+      } catch {
+        // Fall back to plain mock event object below.
+      }
+    }
+    return { type: ev.type, ...init };
+  }
+
+  private applyTextToNativeInput(
+    target: HTMLInputElement | HTMLTextAreaElement,
+    insertText: string,
+    backspace = false
+  ): void {
+    const value = typeof target.value === "string" ? target.value : "";
+    const start =
+      typeof target.selectionStart === "number" ? target.selectionStart : value.length;
+    const end =
+      typeof target.selectionEnd === "number" ? target.selectionEnd : start;
+    if (backspace) {
+      const nextStart = start === end ? Math.max(0, start - 1) : start;
+      target.value = value.slice(0, nextStart) + value.slice(end);
+      if (typeof target.setSelectionRange === "function") {
+        target.setSelectionRange(nextStart, nextStart);
+      } else {
+        target.selectionStart = nextStart;
+        target.selectionEnd = nextStart;
+      }
+    } else {
+      target.value = value.slice(0, start) + insertText + value.slice(end);
+      const nextPos = start + insertText.length;
+      if (typeof target.setSelectionRange === "function") {
+        target.setSelectionRange(nextPos, nextPos);
+      } else {
+        target.selectionStart = nextPos;
+        target.selectionEnd = nextPos;
+      }
+    }
+    const dispatcher = target as unknown as { dispatchEvent?: (event: unknown) => boolean };
+    if (typeof dispatcher.dispatchEvent === "function") {
+      const InputCtor = (
+        this.win as unknown as { InputEvent?: new (type: string, init: Record<string, unknown>) => unknown }
+      ).InputEvent;
+      const inputEv =
+        typeof InputCtor === "function"
+          ? new InputCtor("input", {
+              data: backspace ? null : insertText,
+              inputType: backspace ? "deleteContentBackward" : "insertText",
+              bubbles: true,
+            })
+          : {
+              type: "input",
+              data: backspace ? null : insertText,
+              inputType: backspace ? "deleteContentBackward" : "insertText",
+              bubbles: true,
+            };
+      dispatcher.dispatchEvent(inputEv);
+    }
+  }
+
+  private async replayCapturedUserInputs(
+    target: HTMLElement,
+    captured: CapturedUserEvent[],
+    preserveCurrentFocus = false
+  ): Promise<void> {
+    if (captured.length === 0 || target.isConnected === false) {
+      return;
+    }
+    const isElectron =
+      typeof process !== "undefined" &&
+      Boolean((process as { versions?: { electron?: string } }).versions?.electron);
+    const wc = this.getWebContents();
+    this.replayingUserInput = true;
+    try {
+      if (isElectron && wc && !preserveCurrentFocus && this.win.document.activeElement === target) {
+        let lastKeyChar: string | null = null;
+        for (const ev of captured) {
+          if (ev.type === "keydown") {
+            const key = ev.key ?? "";
+            if (!key || key === "Shift" || key === "Control" || key === "Alt" || key === "Meta") {
+              continue;
+            }
+            const modifiers: string[] = [];
+            if (ev.shiftKey) modifiers.push("Shift");
+            if (ev.ctrlKey) modifiers.push("Control");
+            if (ev.altKey) modifiers.push("Alt");
+            if (ev.metaKey) modifiers.push("Meta");
+            try {
+              const press = buildKeyPress(key, modifiers, this.platform);
+              wc.sendInputEvent({ type: "keyDown", keyCode: press.keyCode, modifiers: press.modifiers });
+              if (press.text !== null) {
+                wc.sendInputEvent({ type: "char", keyCode: press.text, modifiers: press.modifiers });
+              }
+              wc.sendInputEvent({ type: "keyUp", keyCode: press.keyCode, modifiers: press.modifiers });
+              lastKeyChar = press.text;
+            } catch {
+              if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+                await wc.insertText(key);
+                lastKeyChar = key;
+              }
+            }
+          } else if (ev.type === "keypress") {
+            const ch = ev.key || ev.data || "";
+            if (lastKeyChar !== null && ch === lastKeyChar) {
+              continue;
+            }
+            if (ch.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+              await wc.insertText(ch);
+              lastKeyChar = ch;
+            }
+          } else if (ev.type === "beforeinput") {
+            const data = typeof ev.data === "string" ? ev.data : "";
+            if (!data) {
+              continue;
+            }
+            if (lastKeyChar === data) {
+              lastKeyChar = null;
+              continue;
+            }
+            lastKeyChar = null;
+            await wc.insertText(data);
+          }
+        }
+        return;
+      }
+
+      const dispatcher = target as unknown as { dispatchEvent?: (event: unknown) => boolean };
+      const nativeTarget = isInputOrTextarea(target) ? target : null;
+      let insertedForKey: string | null = null;
+      for (const ev of captured) {
+        const domEv = this.buildReplayDomEvent(ev);
+        const notCanceled =
+          typeof dispatcher.dispatchEvent === "function" ? dispatcher.dispatchEvent(domEv) !== false : true;
+        if (!nativeTarget || !notCanceled) {
+          continue;
+        }
+        if (ev.type === "keydown") {
+          const key = ev.key ?? "";
+          if (key === "Backspace" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+            this.applyTextToNativeInput(nativeTarget, "", true);
+            insertedForKey = null;
+          } else if (key === "Enter" && (nativeTarget.tagName ?? "").toUpperCase() === "TEXTAREA" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+            this.applyTextToNativeInput(nativeTarget, "\n");
+            insertedForKey = "\n";
+          } else if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+            this.applyTextToNativeInput(nativeTarget, key);
+            insertedForKey = key;
+          } else {
+            insertedForKey = null;
+          }
+        } else if (ev.type === "keypress") {
+          const ch = ev.key || ev.data || "";
+          if (insertedForKey !== null && ch === insertedForKey) {
+            continue;
+          }
+          if (ch.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+            this.applyTextToNativeInput(nativeTarget, ch);
+            insertedForKey = ch;
+          }
+        } else if (ev.type === "beforeinput") {
+          const data = typeof ev.data === "string" ? ev.data : "";
+          if (data && data === insertedForKey) {
+            insertedForKey = null;
+            continue;
+          }
+          insertedForKey = null;
+          if (data) {
+            this.applyTextToNativeInput(nativeTarget, data);
+          }
+        }
+      }
+    } finally {
+      this.replayingUserInput = false;
+    }
+  }
+
+  /**
+   * Preserves the user's keyboard focus across an agent action that borrows DOM
+   * focus: attaches a continuous input shield for the entire borrowed-focus
+   * interval, restores focus afterward unless a modal was opened, and retains
+   * or re-delivers captured user keystrokes in either outcome.
+   */
+  private async withFocusRestore<T>(task: () => Promise<T>): Promise<T> {
+    const before = this.captureFocusSnapshot();
+    const ownsShield = this.activeShield === null;
+    const shieldSession: FocusShieldSession = this.activeShield ?? {
+      userElement: before.element,
+      activeCount: 0,
+      captured: [],
+      detach: null,
+    };
+    if (ownsShield) {
+      shieldSession.detach = this.attachUserInputCaptureListener(shieldSession);
+      this.activeShield = shieldSession;
+    }
+    try {
+      return await task();
+    } finally {
+      if (ownsShield) {
+        shieldSession.detach?.();
+        shieldSession.detach = null;
+        this.activeShield = null;
+      }
       const beforeEl = before.element;
       const doc = this.win.document;
       const afterEl = (doc.activeElement as HTMLElement | null) ?? null;
+      let blockedByModal = false;
       if (beforeEl && beforeEl.isConnected !== false && afterEl !== beforeEl) {
         const afterModals = this.visibleModalElements();
         const openedNewModal = afterModals.some((el) => !before.visibleModals.has(el));
         const beforeInModal = Boolean(beforeEl.closest?.(MODAL_SELECTOR));
         const afterInModal = Boolean(afterEl?.closest?.(MODAL_SELECTOR));
-        if (!openedNewModal && !(afterInModal && !beforeInModal)) {
-          try {
-            if (typeof beforeEl.focus === "function") {
-              beforeEl.focus({ preventScroll: true });
-            }
-          } catch {
+        blockedByModal = openedNewModal || (afterInModal && !beforeInModal);
+        if (!blockedByModal) {
+          this.restoreElementFocusAndSelection(beforeEl, before);
+        }
+      }
+      if (ownsShield && shieldSession.captured.length > 0) {
+        if (beforeEl && beforeEl.isConnected !== false) {
+          await this.replayCapturedUserInputs(beforeEl, shieldSession.captured, blockedByModal);
+          if (blockedByModal && afterEl && afterEl.isConnected !== false && doc.activeElement !== afterEl) {
             try {
-              beforeEl.focus?.();
+              afterEl.focus?.({ preventScroll: true });
             } catch {
-              // Ignore disconnected or unfocusable targets.
+              afterEl.focus?.();
             }
           }
-          if (
-            isInputOrTextarea(beforeEl) &&
-            before.selectionStart !== null &&
-            before.selectionEnd !== null &&
-            typeof beforeEl.setSelectionRange === "function"
-          ) {
-            try {
-              beforeEl.setSelectionRange(
-                before.selectionStart,
-                before.selectionEnd,
-                before.selectionDirection ?? undefined
-              );
-            } catch {
-              // Ignore input types that reject selection ranges.
-            }
-          } else if (before.domRanges.length > 0) {
-            const sel = this.win.getSelection?.();
-            if (sel && typeof sel.removeAllRanges === "function" && typeof sel.addRange === "function") {
-              try {
-                sel.removeAllRanges();
-                for (const range of before.domRanges) {
-                  sel.addRange(range);
-                }
-              } catch {
-                // Ignore stale DOM ranges.
-              }
-            }
-          }
+        } else {
+          this.deferredUserInputs.push(...shieldSession.captured);
         }
       }
     }
@@ -3018,7 +3711,7 @@ export class UiControlService {
     return null;
   }
 
-  private findOpenNoteLeaf(notePath: string): NoteLeafContext | null {
+  private findOpenNoteLeaf(notePath: string, preferredContainer?: Element | null): NoteLeafContext | null {
     const wanted = notePath.trim();
     if (this.resolveNoteLeaf) {
       return this.resolveNoteLeaf(wanted);
@@ -3056,7 +3749,13 @@ export class UiControlService {
     }
 
     if (matches.length > 0) {
-      return matches.find((m) => m.activePane) ?? matches[0];
+      const byContainer =
+        preferredContainer
+          ? matches.find(
+              (m) => m.containerEl === preferredContainer || m.containerEl.contains?.(preferredContainer)
+            )
+          : undefined;
+      return byContainer ?? matches.find((m) => m.activePane) ?? matches[0];
     }
 
     for (const leafEl of this.queryAll(".workspace-leaf")) {
@@ -3184,11 +3883,15 @@ export class UiControlService {
     return 0;
   }
 
-  private async ensureCaretInView(preferredCm?: CodeMirrorViewLike | null): Promise<boolean> {
+  private async ensureCaretInView(
+    preferredCm?: CodeMirrorViewLike | null,
+    explicitPos?: number
+  ): Promise<boolean> {
     const activeEl = this.win.document.activeElement ?? null;
     const view = preferredCm ?? this.findFocusedCodeMirrorView(activeEl);
     if (view) {
-      const head = view.state?.selection?.main?.head;
+      const hasExplicitPos = typeof explicitPos === "number" && Number.isFinite(explicitPos);
+      const head = hasExplicitPos ? explicitPos : view.state?.selection?.main?.head;
       if (typeof head !== "number") {
         return false;
       }
@@ -3206,7 +3909,11 @@ export class UiControlService {
       // virtualized lines render, then enforce the 3-line scroll margin on scrollDOM.
       if (!hasNonZeroBox(rect) || rect.top < bounds.top + 4 || rectBottom > bounds.bottom - 4) {
         if (typeof view.dispatch === "function") {
-          view.dispatch({ scrollIntoView: true });
+          if (hasExplicitPos) {
+            this.dispatchScrollToPos(view, head, false);
+          } else {
+            view.dispatch({ scrollIntoView: true });
+          }
           await this.waitForPaint();
           didScroll = true;
           bounds = this.scrollBounds(view);
@@ -3220,7 +3927,11 @@ export class UiControlService {
           await this.waitForPaint();
           didScroll = true;
         } else if (!didScroll && typeof view.dispatch === "function") {
-          view.dispatch({ scrollIntoView: true });
+          if (hasExplicitPos) {
+            this.dispatchScrollToPos(view, head, false);
+          } else {
+            view.dispatch({ scrollIntoView: true });
+          }
           await this.waitForPaint();
           didScroll = true;
         }

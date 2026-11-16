@@ -1448,7 +1448,7 @@ export class VaultOpsService {
           null;
         await this.pointAtUiResult(
           caller,
-          { notePath: file.path, element: leafEl, prefer: "leaf" },
+          { notePath: file.path, element: leafEl, prefer: "editor" },
           "open"
         );
 

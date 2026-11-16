@@ -159,38 +159,58 @@ Cleanup: scratch note trashed and removed from the demo vault trash, test screen
 | `THIRD_PARTY_NOTICES.md` | `1752` | `b9a795457258171354ba15ac8e9a6a78458b9d2ebb755c5612828d1a2286d65c` |
 | `README.md` | `7162` | `a18cef7f974c7690af49ab98dc50fb85873f639c961a862a9be952a25a065308` |
 
-### 6. UI hardening, note anchors, proof attribution, and CLI/docs alignment (2026-11-16 candidate, pending final orchestrator stamp)
+### 6. Release `0.3.0` candidate: UI hardening, note anchors, proof attribution, and CLI/docs alignment (2026-11-16)
 
-- Visual cursors (`src/control/agent-cursor.ts`): `1500 ms` idle dimming, `60000 ms` auto-hide, plain agent-name pill labels (stripping numeric and alphanumeric pane suffixes such as `w1:pA` when known, falling back to pane ID when unknown, unified `HERDR_PANE_ID_RE` across formatting and `reconcileLiveCallers`), and observer-driven cleanup (`ResizeObserver`, `MutationObserver`, scroll, `notifyNoteUpdated`) without unused helper methods.
-- Settings and UI safety (`src/domain/types.ts`, `src/ui/settings-tab.ts`, `src/control/ui-control.ts`, `src/services/herdr-coordinator.ts`): `uiTypingSpeed` (`"visible"` default or `"fast"`), `allowUiInProtectedAreas` (`false` default; blocks Herdr terminal views, Settings modal, and community plugin toggles with `ui_protected_area` when false, checked across actual hit-test points), viewport-only offscreen scroll in `ui.locate`, note/leaf ownership verification during typing, split-bound `insertLine` proof (`path`, `pane`, `line`, `text`, `heading`, plus `durationMs` and post-restore `focus`), and caller-scoped UI Undo conflict checking.
+- Release bump (`4280903` + `0.3.0` prep and post-commit fixes): `manifest.json`, `package.json`, `package-lock.json`, and `versions.json` (`"0.3.0": "1.14.4"`) updated to `0.3.0`.
+- Visual cursors (`src/control/agent-cursor.ts`, `styles.css`): `1500 ms` idle dimming, `60000 ms` auto-hide, plain agent-name pill labels (stripping numeric and alphanumeric pane suffixes such as `w1:pA` when known, falling back to pane ID when unknown, unified `HERDR_PANE_ID_RE` across formatting and `reconcileLiveCallers`), SVG pointer hotspot aligned at local `(0, 0)` with preserved subpixel coordinates (`formatCssPx`, `caretPointFromCoords`), tight lower-right pill (`10px, 5px`), and observer-driven cleanup (`ResizeObserver`, `MutationObserver`, scroll, `notifyNoteUpdated`) without unused helper methods.
+- Settings and UI safety (`src/domain/types.ts`, `src/ui/settings-tab.ts`, `src/control/ui-control.ts`, `src/bridge/vault-ops.ts`, `src/services/herdr-coordinator.ts`): `uiTypingSpeed` (`"visible"` default or `"fast"`), `allowUiInProtectedAreas` (`false` default; blocks Herdr terminal views, Settings modal, and community plugin toggles with `ui_protected_area` when false, checked across actual hit-test points), viewport-only offscreen scroll in `ui.locate`, focus-free CodeMirror transaction streaming for `insert_line` and anchored edits plus `workspace.open_note` / `pointAtResult` editor parking (not tab headers), note/leaf ownership verification during typing, split-bound `insertLine` proof (`path`, `pane`, `line`, `text`, `heading`, plus `durationMs` and post-restore `focus`), user input shield for raw `ui.type`/`ui.key`, and caller-scoped UI Undo conflict checking (including unknown-scope tracking for `commands.execute` and post-read revalidation + destructive guard before trashing created notes).
 - Bridge CLI/docs parity (`src/bridge/runtime-kit.ts`, `README.md`): unified strict lexical parsing across Node and Python (`parsePositiveInt`, `parseNonNegativeInt`, `parseFiniteNumber`), `SHARED_MCP_TOOLS.length` (`25` tools) aligned in CLI help and `README.md`, and documented `insert-line` proof fields, protected-area refusals, and typing speed.
 
-Scope boundary: A build and automated suite run is not an Obsidian runtime test. The Section 6 checks below combine static checks, bundling, simulated DOM/Electron unit and integration tests, and an isolated headless `herdr` daemon integration test (`Live Herdr 0.8.2 Daemon Integration`). The candidate `main.js` bundle has not yet been installed, reloaded, or exercised inside a live Obsidian desktop window; live desktop observations remain scoped to Sections 4 and 5 on those earlier dated builds.
-
-Final gate and hash commands (orchestrator fills the exact outputs and hashes below after all final-round edits settle and one final `npm run build` runs):
+Acceptance and runtime status for `0.3.0`:
+- Automated verification on this build: `46/46` tests passing across `6` suites (simulated DOM/Electron unit and integration suites plus isolated headless `herdr` daemon integration), TypeScript check exit `0`, esbuild bundle exit `0`, strict ESLint exit `0`.
+- Live Obsidian `1.15` on Linux (reported by the orchestrator on `2026-11-16`):
+  - PASSED live: anchored `insert-line` while Daniel typed to the Herdr terminal (8 lines clean, his whole message arrived intact); cursor tip on the caret mid-typing; offscreen anchored insert scrolls and returns proof; protected-area click refused; parked cursor follows its text.
+- Known issues (open, from `.agent/review-focus.md` Recheck verdict):
+  - Raw `ui.key` delayed agent key events can be replayed to the user's control.
+  - Text typed by the user while an agent-opened modal is up can be dropped in a Markdown editor.
+- Still pending: Undo via Mission Control button; newly launched Codex agent `PATH`; physical macOS and Windows hardware verification; Obsidian team directory review.
 
 ```text
-$ npm run check && npm run lint && npm run build && npm test
--> check: <PENDING_FINAL_BUILD: tsc --noEmit exit status>
--> lint:  <PENDING_FINAL_BUILD: eslint src --max-warnings=0 exit status and warning count>
--> build: <PENDING_FINAL_BUILD: esbuild main.js byte count>
--> test:  <PENDING_FINAL_BUILD: node scripts/run-tests.mjs suite summary and duration>
+> herdr-obs@0.3.0 check
+> tsc --noEmit
+-> exit 0
 
-$ wc -c main.js manifest.json styles.css versions.json package.json package-lock.json LICENSE src/control/LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md \
-  && sha256sum main.js manifest.json styles.css versions.json package.json package-lock.json LICENSE src/control/LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md
+> herdr-obs@0.3.0 build
+> tsc --noEmit && node esbuild.config.mjs
+-> exit 0, main.js 925884 bytes ("obsidian", "electron", "@codemirror/view", and "node:*" externalized)
+
+> herdr-obs@0.3.0 lint
+> eslint src --max-warnings=0
+-> exit 0, 0 warnings
+
+> herdr-obs@0.3.0 test
+> node scripts/run-tests.mjs
+-> exit 0
+✔ UI control: keys, Electron input, permission gating, CLI, and MCP images (659.665766ms)
+✔ Domain: OSC stream observer, path guard, shell quoting, and settings migration (1.354726ms)
+✔ Terminal: Live POSIX PtySession with resize over control FD (173.73438ms)
+✔ Vault Control Bridge: Authenticated socket, permission tiers, obs-herdr CLI, undo, and stdio MCP (3479.465852ms)
+✔ Live Herdr 0.8.2 Daemon Integration (isolated config & session) (2047.69697ms)
+✔ AgentCursorOverlay: Round 3 collaborator presence, honest state, and lifecycle (536.741437ms)
+ℹ tests 46 | suites 6 | pass 46 | fail 0 | cancelled 0 | skipped 0 | todo 0 | duration_ms 6950.6098
 ```
 
-#### Exact dependency and artifact SHA-256 hashes (Section 6 final candidate placeholder)
+#### Exact dependency and artifact SHA-256 hashes (release `0.3.0`)
 | File | Bytes | SHA-256 |
 |---|---:|---|
-| `main.js` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `manifest.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `styles.css` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `versions.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `package.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `package-lock.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `LICENSE` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `src/control/LICENSE` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `NOTICE` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `THIRD_PARTY_NOTICES.md` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
-| `README.md` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `main.js` | `925884` | `75d2dca3ae0b68c675e0c614373b37230b8eddf1d48cf411fa01cf66a90174f9` |
+| `manifest.json` | `374` | `3e051ddfee910ae813fe61b9837cf22eacb995b7fb4d8244219c12ebba848604` |
+| `styles.css` | `23879` | `e525061e01e2076c76d107827434ef809478879e4d8f203c8d9e1f2619f5f06d` |
+| `versions.json` | `129` | `b88f1f7e1da12420a84ae56c0f1f14a5af160df9e7f6f7b2949145d71291f5b4` |
+| `package.json` | `1152` | `09ec870fb2edec3011895b8c5d380e1d67b3fa4d80fb6787da71b6dbb403c4ac` |
+| `package-lock.json` | `191939` | `ebb483bdfe82db2e0b761b420a0f85674462304614ae4c200bb02b3a98369c3e` |
+| `LICENSE` | `1070` | `fe617d451da04ca0ed4ccbcc054574429712fa3e99fcea05d205b2c6a6573f13` |
+| `src/control/LICENSE` | `11358` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
+| `NOTICE` | `697` | `2da6936fb0e557bb5a919962e85b902a0707e7f8a98081d1f277e4e753323919` |
+| `THIRD_PARTY_NOTICES.md` | `1752` | `b9a795457258171354ba15ac8e9a6a78458b9d2ebb755c5612828d1a2286d65c` |
+| `README.md` | `8977` | `44a2c3fee9d708e3e2236d22bdc6ac7873ddf7fe658e4e22cb0caba84049ebe9` |

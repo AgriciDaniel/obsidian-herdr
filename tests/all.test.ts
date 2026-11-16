@@ -1249,6 +1249,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
     };
 
     const recordedCalls: Array<{ method: string; caller?: string; params: Record<string, unknown> }> = [];
+    const pointCalls: Array<{ caller: string; target: Record<string, unknown>; label: string }> = [];
     const uiStub = {
       isAvailable: () => true,
       locate: async (params: Record<string, unknown>, caller?: string) => {
@@ -1262,6 +1263,10 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       waitFor: async (params: Record<string, unknown>, caller?: string) => {
         recordedCalls.push({ method: "ui.wait_for", caller, params });
         return { matched: true, caller };
+      },
+      pointAtResult: async (caller: string, target: Record<string, unknown>, label: string) => {
+        pointCalls.push({ caller, target, label });
+        return { shown: true, label };
       },
     };
 
@@ -1364,6 +1369,13 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         { method: "ui.wait_for", caller: "agy2-wait", params: { text: "gamma" } },
         { method: "ui.insert_line", caller: "agy2-writer", params: { target: { note: "Shared.md", line: 1 }, text: "ok" } },
       ]);
+
+      await vaultOps.dispatch("workspace.open_note", { path: "Shared.md", pane: "split" }, "orchestrator");
+      assert.equal(pointCalls.length, 1);
+      assert.equal(pointCalls[0].caller, "orchestrator");
+      assert.equal(pointCalls[0].label, "open");
+      assert.equal(pointCalls[0].target.notePath, "Shared.md");
+      assert.equal(pointCalls[0].target.prefer, "editor");
     } finally {
       await server.stop();
       fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -1758,7 +1770,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       assert.equal(actionEl.classes.has("is-visible"), false);
       assert.equal(cursorEl.classes.has("is-typing"), false);
       assert.equal(cursorEl.classes.has("is-idle"), true);
-      assert.equal(cursorEl.style.transform, `translate3d(260px, ${startCoords.top}px, 0)`);
+      assert.equal(cursorEl.style.transform, `translate3d(260px, ${Math.round((startCoords.top + startCoords.bottom) / 2)}px, 0)`);
 
       // Wait beyond idleAfterMs and verify long-idle parked presence persists across turns
       await new Promise((r) => setTimeout(r, 60));
@@ -1773,7 +1785,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       const expectedCoords = lineCoordsForPos(expectedNewPos);
       assert.equal(
         cursorEl.style.transform,
-        `translate3d(260px, ${expectedCoords.top}px, 0)`,
+        `translate3d(260px, ${Math.round((expectedCoords.top + expectedCoords.bottom) / 2)}px, 0)`,
         "Parked cursor should follow its anchored text line down when lines are inserted above"
       );
       // Re-anchoring must not falsely mark the idle collaborator as typing
@@ -2016,7 +2028,8 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
         cb([{ target: scrollDom }]);
       }
       const afterResizeCoords = coordsForPos(pos);
-      assert.equal(cursorEl.style.transform, `translate3d(${afterResizeCoords.left}px, ${afterResizeCoords.top}px, 0)`);
+      const afterResizeMidY = Math.round((afterResizeCoords.top + afterResizeCoords.bottom) / 2);
+      assert.equal(cursorEl.style.transform, `translate3d(${afterResizeCoords.left}px, ${afterResizeMidY}px, 0)`);
       assert.equal(cursorEl.classes.has("is-offscreen"), false);
 
       // CodeMirror DOM mutates with a line inserted above without calling notifyNoteUpdated
@@ -2025,7 +2038,8 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
         cb();
       }
       const afterMutCoords = coordsForPos(docText.indexOf("Line B anchored"));
-      assert.equal(cursorEl.style.transform, `translate3d(${afterMutCoords.left}px, ${afterMutCoords.top}px, 0)`);
+      const afterMutMidY = Math.round((afterMutCoords.top + afterMutCoords.bottom) / 2);
+      assert.equal(cursorEl.style.transform, `translate3d(${afterMutCoords.left}px, ${afterMutMidY}px, 0)`);
       assert.equal(cursorEl.classes.has("is-idle"), true);
     } finally {
       overlay.dispose();
@@ -2215,7 +2229,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       assert.equal(actionEl.classes.has("is-visible"), false);
       assert.equal(cursorEl.classes.has("is-typing"), false);
       assert.equal(cursorEl.classes.has("is-idle"), true);
-      assert.equal(cursorEl.style.transform, "translate3d(264px, 184px, 0)");
+      assert.equal(cursorEl.style.transform, "translate3d(264px, 194px, 0)");
 
       // R3-4: projection returns null -> marker hides cleanly without clearing anchor, then recovers when coords return
       coordsReturn = null;
@@ -2225,7 +2239,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       coordsReturn = { left: 264, right: 266, top: 210, bottom: 230 };
       overlay.notifyNoteUpdated("Notes/R3.md");
       assert.equal(cursorEl.classes.has("is-offscreen"), false);
-      assert.equal(cursorEl.style.transform, "translate3d(264px, 210px, 0)");
+      assert.equal(cursorEl.style.transform, "translate3d(264px, 220px, 0)");
     } finally {
       overlay.dispose();
     }
@@ -2274,6 +2288,171 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       overlay.reconcileLiveCallers([]);
       assert.equal(overlay.getActiveCount(), 0);
       assert.equal(layer.children[0].classes.has("is-exiting"), true);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("places arrow tip rect within 1px of caret midpoint without CSS translate/margin offsets and keeps pill tight", () => {
+    const css = fs.readFileSync(path.resolve("styles.css"), "utf8");
+    const pointerRuleMatch = /\.herdr-cursor-pointer\s*\{([^}]*)\}/.exec(css);
+    assert.ok(pointerRuleMatch, ".herdr-cursor-pointer rule must exist in styles.css");
+    const pointerRule = pointerRuleMatch[1];
+    assert.equal(/translate\s*\(/i.test(pointerRule), false, ".herdr-cursor-pointer must not use translate()");
+    assert.equal(/margin\s*:(?!\s*0(?:px|em|rem)?\s*;)/i.test(pointerRule), false, ".herdr-cursor-pointer must not have non-zero margin");
+    assert.ok(/transform-origin\s*:\s*0\s+0/i.test(pointerRule), ".herdr-cursor-pointer must scale from transform-origin 0 0");
+
+    const svgAttrs: Record<string, string> = {};
+    const pathAttrs: Record<string, string> = {};
+    const baseWin = makeCursorMockWin(true);
+    let svgElCreated: ReturnType<typeof makeCursorMockEl> | null = null;
+    const win = {
+      ...(baseWin.win as unknown as Record<string, unknown>),
+      document: {
+        body: baseWin.body,
+        createElementNS: (_ns: string, tag: string) => {
+          const mock = makeCursorMockEl({ cls: tag });
+          mock.setAttribute = (k: string, v: string) => {
+            if (tag === "svg") svgAttrs[k] = v;
+            if (tag === "path") pathAttrs[k] = v;
+          };
+          if (tag === "svg") {
+            svgElCreated = mock;
+          }
+          return mock;
+        },
+      },
+    } as unknown as Window;
+
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+    try {
+      const targetCaret = { left: 312.51, right: 314.51, top: 200.51, bottom: 224.51 };
+      const expectedTargetX = targetCaret.left;
+      const expectedTargetY = (targetCaret.top + targetCaret.bottom) / 2;
+      const docText = "Focus test line: agent typing.";
+      const cm: CursorCodeMirrorLike = {
+        state: {
+          doc: {
+            toString: () => docText,
+            get length() {
+              return docText.length;
+            },
+          },
+        },
+        coordsAtPos: () => targetCaret,
+      };
+
+      overlay.setTyping("herdr:w1:pA#sol3", "sol3 (w1:pA)", expectedTargetX, expectedTargetY, {
+        notePath: "Notes/Test.md",
+        pane: "w1:pA",
+        pos: docText.length,
+        cm,
+      });
+      overlay.finishTyping("herdr:w1:pA#sol3");
+
+      const cursorEl = baseWin.body.children[0].children[0];
+      assert.ok(svgElCreated, "SVG pointer element should be created");
+      const m = /translate3d\(\s*(-?\d+(?:\.\d+)?)px,\s*(-?\d+(?:\.\d+)?)px,\s*0\)/.exec(cursorEl.style.transform);
+      assert.ok(m, `Expected translate3d transform, got ${cursorEl.style.transform}`);
+      const containerX = Number(m[1]);
+      const containerY = Number(m[2]);
+
+      const vbParts = (svgAttrs.viewBox || "").trim().split(/\s+/).map(Number);
+      assert.equal(vbParts.length, 4, `Expected valid SVG viewBox, got ${svgAttrs.viewBox}`);
+      const [vbMinX, vbMinY, vbW, vbH] = vbParts;
+      const svgW = Number(svgAttrs.width || vbW);
+      const svgH = Number(svgAttrs.height || vbH);
+      const scaleX = svgW / vbW;
+      const scaleY = svgH / vbH;
+
+      const pathMove = /^M\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/.exec(pathAttrs.d || "");
+      assert.ok(pathMove, `Expected M x y start in pointer path d, got ${pathAttrs.d}`);
+      const apexVbX = Number(pathMove[1]);
+      const apexVbY = Number(pathMove[2]);
+
+      // Exact rendered hotspot: apex vertex / stroke join center in viewport coordinates (no bounding-box corner subtraction)
+      const renderedHotspotX = containerX + (apexVbX - vbMinX) * scaleX;
+      const renderedHotspotY = containerY + (apexVbY - vbMinY) * scaleY;
+
+      assert.ok(
+        Math.abs(renderedHotspotX - expectedTargetX) < 0.02 && Math.abs(renderedHotspotY - expectedTargetY) < 0.02,
+        `Rendered SVG tip hotspot (${renderedHotspotX}, ${renderedHotspotY}) must match fractional caret midpoint (${expectedTargetX}, ${expectedTargetY}) within 0.02px`
+      );
+      assert.equal(apexVbX, 0, "SVG pointer apex hotspot must sit at viewBox X=0");
+      assert.equal(apexVbY, 0, "SVG pointer apex hotspot must sit at viewBox Y=0");
+
+      const pillEl = cursorEl.children[2];
+      const pillX = Number.parseFloat(pillEl.style.props["--herdr-pill-x"]);
+      const pillY = Number.parseFloat(pillEl.style.props["--herdr-pill-y"]);
+      assert.ok(pillX > 0 && pillX <= 12, `Pill X offset (${pillX}) must be tight to lower-right of arrow`);
+      assert.ok(pillY > 0 && pillY <= 8, `Pill Y offset (${pillY}) must be tight so it does not cover next line`);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("follows inserted text via CodeMirror transactions during visible typing without focus", () => {
+    const { win, body } = makeCursorMockWin(true);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+
+    let docText = "Line one\n- inserted: ";
+    const userHeadPos = 0; // Terminal/user selection elsewhere; CM never takes focus
+    const cm: CursorCodeMirrorLike = {
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+        selection: {
+          main: {
+            get head() {
+              return userHeadPos;
+            },
+          },
+        },
+      },
+      coordsAtPos: (pos: number) => {
+        const before = docText.slice(0, pos);
+        const lines = before.split("\n");
+        const lineIdx = lines.length - 1;
+        const col = lines[lineIdx].length;
+        const top = 140 + lineIdx * 24;
+        return { left: 100 + col * 8, right: 102 + col * 8, top, bottom: top + 20 };
+      },
+    };
+
+    try {
+      let insertPos = docText.length;
+      const chunk1 = "hello";
+      docText = docText.slice(0, insertPos) + chunk1 + docText.slice(insertPos);
+      const afterChunk1Pos = insertPos + chunk1.length;
+      const c1 = cm.coordsAtPos!(afterChunk1Pos)!;
+      overlay.setTyping("herdr:w1:pA#sol3", "sol3", c1.left, Math.round((c1.top + c1.bottom!) / 2), {
+        notePath: "Notes/Tx.md",
+        pane: "w1:pA",
+        pos: afterChunk1Pos,
+        cm,
+      });
+      overlay.notifyNoteUpdated("Notes/Tx.md", { from: insertPos, to: insertPos, insertLength: chunk1.length });
+      insertPos = afterChunk1Pos;
+
+      const cursorEl = body.children[0].children[0];
+      assert.equal(cursorEl.style.transform, `translate3d(${c1.left}px, ${Math.round((c1.top + c1.bottom!) / 2)}px, 0)`);
+      assert.equal(userHeadPos, 0);
+
+      const chunk2 = " world";
+      docText = docText.slice(0, insertPos) + chunk2 + docText.slice(insertPos);
+      overlay.notifyNoteUpdated("Notes/Tx.md", { from: insertPos, to: insertPos, insertLength: chunk2.length });
+      insertPos += chunk2.length;
+
+      const c2 = cm.coordsAtPos!(insertPos)!;
+      assert.equal(cursorEl.style.transform, `translate3d(${c2.left}px, ${Math.round((c2.top + c2.bottom!) / 2)}px, 0)`);
+
+      overlay.finishTyping("herdr:w1:pA#sol3");
+      assert.equal(cursorEl.classes.has("is-idle"), true);
+      assert.equal(cursorEl.style.transform, `translate3d(${c2.left}px, ${Math.round((c2.top + c2.bottom!) / 2)}px, 0)`);
     } finally {
       overlay.dispose();
     }

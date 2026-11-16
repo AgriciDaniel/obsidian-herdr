@@ -995,6 +995,11 @@
   position: fixed;
   top: 0;
   left: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
   pointer-events: none;
   color: hsl(var(--herdr-cursor-hue, 210) 84% 48%);
   opacity: 1;
@@ -1049,14 +1054,21 @@
 }
 
 .herdr-cursor-pointer {
+  position: absolute;
+  top: 0;
+  left: 0;
   display: block;
-  transform: translate(-3px, -2px);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: visible;
+  transform-origin: 0 0;
   filter: drop-shadow(0 1px 2px var(--background-modifier-box-shadow));
   transition: transform 110ms ease;
 }
 
 .herdr-cursor.is-clicking .herdr-cursor-pointer {
-  transform: translate(-3px, -2px) scale(0.86);
+  transform: scale(0.86);
 }
 
 .herdr-cursor-ring {
@@ -1091,19 +1103,19 @@
   position: absolute;
   top: 0;
   left: 0;
-  transform: translate3d(var(--herdr-pill-x, 12px), var(--herdr-pill-y, 16px), 0);
+  transform: translate3d(var(--herdr-pill-x, 10px), var(--herdr-pill-y, 5px), 0);
   transition: transform 140ms ease;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 2px 8px;
+  gap: 4px;
+  padding: 1px 6px;
   border-radius: var(--radius-m);
-  border: 1.5px solid hsl(var(--herdr-cursor-hue, 210) 88% 58%);
+  border: 1px solid hsl(var(--herdr-cursor-hue, 210) 88% 58%);
   background-color: hsl(var(--herdr-cursor-hue, 210) 76% 32%);
   color: #ffffff;
-  font-size: var(--font-ui-smaller);
+  font-size: var(--font-ui-smallest);
   font-weight: 600;
-  line-height: 1.3;
+  line-height: 1.15;
   white-space: nowrap;
   text-shadow: 0 1px 1px rgba(0, 0, 0, 0.45);
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);

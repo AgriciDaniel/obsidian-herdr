@@ -175,9 +175,28 @@ const SPRING_STIFFNESS = 280;
 const SPRING_DAMPING = 26;
 const SETTLE_EPSILON = 0.35;
 const HUE_BUCKETS = 12;
-const PILL_DEFAULT_X = 12;
-const PILL_DEFAULT_Y = 16;
-const PILL_ROW_STEP = 26;
+const PILL_DEFAULT_X = 10;
+const PILL_DEFAULT_Y = 5;
+const PILL_ROW_STEP = 20;
+
+function formatCssPx(value: number): string {
+  const rounded = Math.round(value * 100) / 100;
+  return `${Object.is(rounded, -0) ? 0 : rounded}px`;
+}
+
+/** Returns the text caret anchor at the left edge and vertical midpoint of the line box. */
+export function caretPointFromCoords(
+  coords: { left: number; top: number; bottom?: number }
+): { x: number; y: number } {
+  const midY =
+    typeof coords.bottom === "number" && Number.isFinite(coords.bottom)
+      ? (coords.top + coords.bottom) / 2
+      : coords.top;
+  return {
+    x: coords.left,
+    y: midY,
+  };
+}
 const PILL_PAD = 4;
 
 interface PillRect {
@@ -624,15 +643,16 @@ export class AgentCursorOverlay {
 
     const svg = this.win.document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("class", "herdr-cursor-pointer");
-    svg.setAttribute("width", "20");
-    svg.setAttribute("height", "20");
-    svg.setAttribute("viewBox", "0 0 20 20");
+    svg.setAttribute("width", "14");
+    svg.setAttribute("height", "14");
+    svg.setAttribute("viewBox", "0 0 14 14");
     svg.setAttribute("fill", "none");
     const path = this.win.document.createElementNS(SVG_NS, "path");
-    path.setAttribute("d", "M3 2L16 9.5L10.2 11.2L8.4 17L3 2Z");
+    // Hotspot is the filled tip apex and stroke join center at SVG (0, 0); CSS overflow: visible keeps it centered on the caret.
+    path.setAttribute("d", "M0 0L10.5 5.8L5.8 7.2L4.4 11.8L0 0Z");
     path.setAttribute("fill", "currentColor");
     path.setAttribute("stroke", "var(--background-primary)");
-    path.setAttribute("stroke-width", "1.5");
+    path.setAttribute("stroke-width", "1.2");
     path.setAttribute("stroke-linejoin", "round");
     svg.appendChild(path);
     el.appendChild(svg);
@@ -648,7 +668,7 @@ export class AgentCursorOverlay {
 
     const startX = Math.round((this.win.innerWidth || 800) / 2);
     const startY = Math.round((this.win.innerHeight || 600) / 2);
-    el.style.transform = `translate3d(${startX}px, ${startY}px, 0)`;
+    el.style.transform = `translate3d(${formatCssPx(startX)}, ${formatCssPx(startY)}, 0)`;
 
     const instance: CursorInstance = {
       caller,
@@ -684,8 +704,8 @@ export class AgentCursorOverlay {
     }
     const textLen = cursor.label.length + (cursor.actionEl.textContent?.length ?? 0);
     return {
-      width: Math.max(48, textLen * 7 + 24),
-      height: 22,
+      width: Math.max(44, textLen * 7 + 18),
+      height: 18,
     };
   }
 
@@ -850,7 +870,7 @@ export class AgentCursorOverlay {
       cursor.vx = 0;
       cursor.vy = 0;
       cursor.initialized = true;
-      cursor.el.style.transform = `translate3d(${Math.round(clampedX)}px, ${Math.round(clampedY)}px, 0)`;
+      cursor.el.style.transform = `translate3d(${formatCssPx(clampedX)}, ${formatCssPx(clampedY)}, 0)`;
     } else {
       this.startLoop();
     }
@@ -1132,7 +1152,9 @@ export class AgentCursorOverlay {
       typeof maxPos === "number" ? Math.max(0, Math.min(maxPos, anchor.pos)) : Math.max(0, anchor.pos);
     anchor.pos = clampedPos;
 
-    const coords = anchor.cm.coordsAtPos(clampedPos);
+    const coords =
+      anchor.cm.coordsAtPos(clampedPos) ??
+      anchor.cm.coordsAtPos(clampedPos, -1);
     if (!coords || !Number.isFinite(coords.left) || !Number.isFinite(coords.top)) {
       cursor.paneBounds = null;
       cursor.el.classList.add("is-offscreen");
@@ -1156,8 +1178,9 @@ export class AgentCursorOverlay {
     cursor.el.classList.toggle("is-offscreen", offscreen);
     cursor.paneBounds = offscreen ? null : activeBounds;
 
-    const clampedX = Math.max(0, Math.min(this.win.innerWidth || coords.left, coords.left));
-    const clampedY = Math.max(0, Math.min(this.win.innerHeight || coords.top, coords.top));
+    const caretPt = caretPointFromCoords(coords);
+    const clampedX = Math.max(0, Math.min(this.win.innerWidth || caretPt.x, caretPt.x));
+    const clampedY = Math.max(0, Math.min(this.win.innerHeight || caretPt.y, caretPt.y));
     cursor.targetX = clampedX;
     cursor.targetY = clampedY;
 
@@ -1172,7 +1195,7 @@ export class AgentCursorOverlay {
       cursor.vx = 0;
       cursor.vy = 0;
       cursor.initialized = true;
-      cursor.el.style.transform = `translate3d(${Math.round(clampedX)}px, ${Math.round(clampedY)}px, 0)`;
+      cursor.el.style.transform = `translate3d(${formatCssPx(clampedX)}, ${formatCssPx(clampedY)}, 0)`;
     } else {
       this.startLoop();
     }
@@ -1424,7 +1447,7 @@ export class AgentCursorOverlay {
         cursor.y += cursor.vy * dt;
         anyMoving = true;
       }
-      cursor.el.style.transform = `translate3d(${cursor.x.toFixed(1)}px, ${cursor.y.toFixed(1)}px, 0)`;
+      cursor.el.style.transform = `translate3d(${formatCssPx(cursor.x)}, ${formatCssPx(cursor.y)}, 0)`;
     }
 
     if (anyMoving) {

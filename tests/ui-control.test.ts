@@ -1791,9 +1791,9 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
         ["drag", "Notes/Alpha.md", "pane-a", "herdr:p1"],
       ]
     );
-    // For type with inactive target Beta.md, beforeMutation fires before insertText and never double-fires click.
+    // For type with anchored target Beta.md, beforeMutation fires before CM dispatch and never double-fires click.
     const typeMutIdx = timeline.indexOf("beforeMutation:type:Notes/Beta.md:herdr:p2");
-    const firstBetaInsertIdx = timeline.findIndex((t) => t.startsWith("insertText:"));
+    const firstBetaInsertIdx = timeline.findIndex((t) => t.startsWith("cm-dispatch-b:"));
     assert.ok(typeMutIdx >= 0 && firstBetaInsertIdx > typeMutIdx);
 
     // Concurrent queued insertLines capture sequential pre-mutation snapshots inside the lock (R2-1 prevention)
@@ -3046,15 +3046,15 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
           ?.children.find((c) => c.classList.contains("herdr-cursor-pill"))
           ?.children.find((c) => c.classList.contains("herdr-cursor-action"))?.textContent ?? "";
 
-      // 1) workspace.open -> glides to opened note's active tab header with "open" label.
+      // 1) workspace.open -> glides inside the opened note editor (not onto the tab title bar) with "open" label.
       const openRes = await ui.pointAtResult("herdr:w1:p6#agy1", { notePath: "Notes/Opened.md", prefer: "leaf" }, "open");
       assert.equal(openRes.shown, true);
       assert.equal(openRes.notePath, "Notes/Opened.md");
-      assert.equal(openRes.x, 400);
-      assert.equal(openRes.y, 26);
+      assert.equal(openRes.x, 410);
+      assert.equal(openRes.y, 150);
       assert.equal(actionText(), "open");
 
-      // 2) prefer: "editor" glides to CM caret and installs note doc anchor.
+      // 2) prefer: "editor" glides to CM caret inside opened editor and installs note doc anchor.
       const editorRes = await ui.pointAtResult("herdr:w1:p6#agy1", { notePath: "Notes/Opened.md", prefer: "editor" }, "command: Toggle reading view");
       assert.equal(editorRes.shown, true);
       assert.equal(editorRes.x, 410);
@@ -3085,11 +3085,11 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       assert.equal(actionText(), "command: Quick switcher");
       modalVisible = false;
 
-      // 5) command.run without modal falls back to active workspace leaf; selector target also works.
+      // 5) command.run without modal falls back inside active workspace editor (not tab title); selector target also works.
       const fallbackRes = await ui.pointAtResult("herdr:w1:p6#agy1", { prefer: "modal" }, "command: Toggle reading view");
       assert.equal(fallbackRes.shown, true);
-      assert.equal(fallbackRes.x, 400);
-      assert.equal(fallbackRes.y, 26);
+      assert.equal(fallbackRes.x, 410);
+      assert.equal(fallbackRes.y, 150);
 
       const selRes = await ui.pointAtResult("herdr:w1:p6#agy1", { selector: ".reading-toggle-btn" }, "command: Toggle reading view");
       assert.equal(selRes.shown, true);
@@ -3513,11 +3513,12 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
         return { left: 40, top: 30 + lineIdx * 24, right: 140, bottom: 50 + lineIdx * 24 };
       },
       dispatch: (spec: { changes?: { from: number; insert: string }; selection?: { anchor: number } }) => {
-        if (spec.changes?.insert === "\n") {
+        if (typeof spec.changes?.insert === "string") {
           const textBefore = docLines.join("\n");
           const updated =
-            textBefore.slice(0, spec.changes.from) + "\n" + textBefore.slice(spec.changes.from);
+            textBefore.slice(0, spec.changes.from) + spec.changes.insert + textBefore.slice(spec.changes.from);
           docLines.splice(0, docLines.length, ...updated.split("\n"));
+          headPos = spec.changes.from + spec.changes.insert.length;
         }
         if (typeof spec.selection?.anchor === "number") {
           headPos = spec.selection.anchor;
@@ -4510,6 +4511,13 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
           },
         },
         coordsAtPos: () => ({ left: 100, top: 100, right: 102, bottom: 120 }),
+        dispatch: (spec: Record<string, unknown>) => {
+          const ch = spec.changes as { from: number; insert: string } | undefined;
+          if (ch && typeof ch.insert === "string") {
+            chunksDelivered.push({ path: currentPath, chunk: ch.insert });
+            text = text.slice(0, ch.from) + ch.insert + text.slice(ch.from);
+          }
+        },
         focus: () => {
           doc.activeElement = cmContent;
         },
@@ -4562,7 +4570,11 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
           head = text.length;
         },
         otherText: () => text,
-        makeUi: (speed: "visible" | "fast", onSleep: () => Promise<void> | void) =>
+        makeUi: (
+          speed: "visible" | "fast",
+          onSleep: () => Promise<void> | void,
+          onHook?: () => Promise<void> | void
+        ) =>
           new UiControlService({
             win,
             getUiTypingSpeed: () => speed,
@@ -4575,8 +4587,9 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
                 head += chunk.length;
               },
             }),
-            beforeMutation: (ctx) => {
+            beforeMutation: async (ctx) => {
               hookContexts.push(ctx);
+              await onHook?.();
               return (completion) => {
                 completions.push(completion);
               };
@@ -4619,16 +4632,20 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       { from: 9, to: 9, insert: visibleHarness.chunksDelivered[0].chunk },
     ]);
 
-    // Targeted fast mode: note switches during preparatory click settle before insertText executes.
+    // Targeted fast mode: note switches inside async hook before CM transaction executes.
     completions.length = 0;
     const fastHarness = makeSwitchHarness();
     let clickSettled = false;
-    const uiFast = fastHarness.makeUi("fast", () => {
-      if (!clickSettled) {
-        clickSettled = true;
-        fastHarness.switchToOther();
+    const uiFast = fastHarness.makeUi(
+      "fast",
+      () => undefined,
+      () => {
+        if (!clickSettled) {
+          clickSettled = true;
+          fastHarness.switchToOther();
+        }
       }
-    });
+    );
     await assert.rejects(
       () => uiFast.type({ target: { note: "Shared.md", line: 1 }, text: "never written to other" }, "writer"),
       (err: unknown) => err instanceof UiControlError && err.code === "ui_target_changed"
@@ -4842,19 +4859,21 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     assert.equal(keyOut.focus.label, "Search filter");
 
     // P2-1 failure case: if the target split closes during insertLine, fail with ui_target_changed instead of reading splitB.
+    const origDispatchA = splitA.cm.dispatch;
+    splitA.cm.dispatch = (spec: Record<string, unknown>) => {
+      origDispatchA(spec);
+      const ch = spec.changes as { insert?: string } | undefined;
+      if (ch?.insert === "x") {
+        splitA.containerEl.isConnected = false;
+      }
+    };
     const closingUi = new UiControlService({
       win,
       getUiTypingSpeed: () => "fast",
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1000, 600)),
-        sendInputEvent: (ev) => {
-          if (ev.type === "mouseDown") {
-            doc.activeElement = splitA.cmContent;
-          }
-        },
-        insertText: () => {
-          splitA.containerEl.isConnected = false;
-        },
+        sendInputEvent: () => undefined,
+        insertText: () => undefined,
       }),
       resolveNoteLeaf: () => (preferSplit === "A" ? splitA : splitB),
       sleep: async () => undefined,
@@ -4865,5 +4884,982 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       () => closingUi.insertLine({ target: { note: "Shared.md", line: 1 }, text: "x" }, "agy1"),
       (err: unknown) => err instanceof UiControlError && err.code === "ui_target_changed"
     );
+  });
+
+  it("streams insert_line and anchored edits via CodeMirror view.dispatch without stealing focus or selection (P0-1)", async () => {
+    let noteText = "## sol3\nFirst bullet";
+    let cmHead = 3; // User caret resting on "## sol3" inside note should not jump.
+    const cmSpecs: Array<Record<string, unknown>> = [];
+    const cursorEvents: Array<{ kind: string; x: number; y: number; pos?: number }> = [];
+    let focusChanges = 0;
+    let cmFocusCalls = 0;
+
+    const terminalEl = {
+      tagName: "TEXTAREA",
+      value: "echo ",
+      selectionStart: 5,
+      selectionEnd: 5,
+      selectionDirection: "forward",
+      readOnly: false,
+      disabled: false,
+      isContentEditable: false,
+      isConnected: true,
+      matches: (s: string) => s.includes("textarea") && !s.includes("password"),
+      closest: (s: string) => (s.includes(".xterm-helper-textarea") ? terminalEl : null),
+      getAttribute: (n: string) => (n === "aria-label" ? "Terminal input" : null),
+      focus: () => {
+        focusChanges += 1;
+      },
+      setSelectionRange: (start: number, end: number) => {
+        terminalEl.selectionStart = start;
+        terminalEl.selectionEnd = end;
+      },
+      getBoundingClientRect: () => ({ left: 500, top: 450, right: 900, bottom: 580, width: 400, height: 130 }),
+    };
+
+    const leafEl = {
+      tagName: "DIV",
+      isConnected: true,
+      classList: { contains: (c: string) => c === "workspace-leaf" || c === "mod-active" },
+      contains: (other: unknown) => other === leafEl || other === cmContent,
+      closest: (s: string) => (s.includes(".workspace-leaf") ? leafEl : null),
+      matches: (s: string) => s.includes(".workspace-leaf"),
+      getAttribute: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 480, height: 550, right: 480, bottom: 550 }),
+    };
+    const cmContent = {
+      tagName: "DIV",
+      isConnected: true,
+      isContentEditable: true,
+      classList: { contains: (c: string) => c === "cm-content" },
+      matches: () => false,
+      closest: (s: string) => (s.includes(".workspace-leaf") ? leafEl : null),
+      contains: (o: unknown) => o === cmContent,
+      getAttribute: () => null,
+      getBoundingClientRect: () => ({ left: 20, top: 40, width: 440, height: 480, right: 460, bottom: 520 }),
+    };
+    const cm = {
+      dom: leafEl as unknown as Element,
+      contentDOM: cmContent as unknown as Element,
+      scrollDOM: leafEl as unknown as HTMLElement,
+      state: {
+        doc: {
+          toString: () => noteText,
+          get length() {
+            return noteText.length;
+          },
+          get lines() {
+            return noteText.split("\n").length;
+          },
+          line: (n: number) => {
+            const all = noteText.split("\n");
+            const from = all.slice(0, n - 1).reduce((s, line) => s + line.length + 1, 0);
+            return { number: n, from, to: from + all[n - 1].length, text: all[n - 1] };
+          },
+        },
+        selection: {
+          main: {
+            get head() {
+              return cmHead;
+            },
+            set head(v: number) {
+              cmHead = v;
+            },
+            get anchor() {
+              return cmHead;
+            },
+            set anchor(v: number) {
+              cmHead = v;
+            },
+          },
+        },
+      },
+      coordsAtPos: (pos: number) => {
+        const before = noteText.slice(0, pos).split("\n");
+        const lineIdx = before.length - 1;
+        const col = before[lineIdx].length;
+        const x = 40 + col * 8;
+        const y = 80 + lineIdx * 24;
+        return { left: x, top: y, right: x + 2, bottom: y + 20 };
+      },
+      focus: () => {
+        cmFocusCalls += 1;
+        focusChanges += 1;
+        doc.activeElement = cmContent;
+      },
+      dispatch: (spec: Record<string, unknown>) => {
+        cmSpecs.push(spec);
+        const ch = spec.changes as { from: number; insert: string } | undefined;
+        if (ch && typeof ch.insert === "string") {
+          noteText = noteText.slice(0, ch.from) + ch.insert + noteText.slice(ch.from);
+        }
+        const sel = spec.selection as { anchor?: number } | undefined;
+        if (sel && typeof sel.anchor === "number") {
+          cmHead = sel.anchor;
+        }
+      },
+    };
+    const leafCtx = {
+      path: "Crew Test/Mission Board 2.md",
+      pane: "main",
+      activePane: true,
+      containerEl: leafEl as unknown as Element,
+      cm,
+      view: { file: { path: "Crew Test/Mission Board 2.md" }, editor: { cm } },
+    };
+    const doc = {
+      body: { innerText: "" },
+      documentElement: {},
+      activeElement: terminalEl as unknown,
+      querySelectorAll: () => [],
+      elementFromPoint: (x: number) => (x < 480 ? cmContent : terminalEl),
+    };
+    const win = {
+      innerWidth: 1000,
+      innerHeight: 600,
+      document: doc,
+      getComputedStyle: () => ({ visibility: "visible", display: "block" }),
+      requestAnimationFrame: (cb: () => void) => {
+        cb();
+        return 1;
+      },
+      setTimeout,
+    } as unknown as Window;
+
+    const webInputEvents: Array<Record<string, unknown>> = [];
+    const webTyped: string[] = [];
+    const userTypedDuringAgent = ["j", "u", "s", "t"];
+    let userTypeStep = 0;
+
+    const ui = new UiControlService({
+      win,
+      getUiTypingSpeed: () => "visible",
+      getWebContents: () => fakeWebContents(webInputEvents, webTyped),
+      resolveNoteLeaf: () => leafCtx,
+      resolveElementContext: (el) =>
+        el === leafEl ? { notePath: leafCtx.path, pane: "main", activePane: true } : null,
+      sleep: async () => {
+        // Focus must still be on terminalEl on every sleep tick; simulated user keystrokes go straight to terminalEl.
+        assert.equal(doc.activeElement, terminalEl);
+        if (userTypeStep < userTypedDuringAgent.length) {
+          terminalEl.value += userTypedDuringAgent[userTypeStep];
+          terminalEl.selectionStart = terminalEl.value.length;
+          terminalEl.selectionEnd = terminalEl.value.length;
+          userTypeStep += 1;
+        }
+      },
+      cursorOverlay: {
+        moveTo: (_c: string, _l: string, x: number, y: number, _a?: string, ctx?: { pos?: number }) => {
+          cursorEvents.push({ kind: "move", x, y, pos: ctx?.pos });
+        },
+        pulseClick: (_c: string, _l: string, x: number, y: number, _a?: string, ctx?: { pos?: number }) => {
+          cursorEvents.push({ kind: "click", x, y, pos: ctx?.pos });
+        },
+        setTyping: (_c: string, _l: string, x: number, y: number, ctx?: { pos?: number }) => {
+          cursorEvents.push({ kind: "type", x, y, pos: ctx?.pos });
+        },
+        finishTyping: (_c: string, ctx?: { pos?: number }) => {
+          cursorEvents.push({ kind: "finish", x: 0, y: 0, pos: ctx?.pos });
+        },
+      } as unknown as AgentCursorOverlay,
+    });
+
+    const insertOut = (await ui.insertLine(
+      {
+        target: { note: "Crew Test/Mission Board 2.md", heading: "sol3" },
+        text: "Focus retest line types cleanly",
+      },
+      "agy1"
+    )) as { line: number; text: string; focus: { tag: string; label: string } };
+    assert.equal(insertOut.line, 3);
+    assert.equal(insertOut.text, "Focus retest line types cleanly");
+
+    await ui.type(
+      {
+        target: { note: "Crew Test/Mission Board 2.md", after: "Focus retest line types cleanly" },
+        text: " without stealing focus",
+      },
+      "agy1"
+    );
+
+    assert.equal(noteText, "## sol3\nFirst bullet\nFocus retest line types cleanly without stealing focus");
+    assert.equal(terminalEl.value, "echo just", "User keys typed during visible mode go cleanly to terminal");
+    assert.equal(terminalEl.selectionStart, 9);
+    assert.equal(cmHead, 3, "Existing CM selection in target note must not be moved");
+    assert.equal(cmFocusCalls, 0, "cm.focus must never be called for anchored edits");
+    assert.equal(focusChanges, 0, "Focus must never leave or re-focus away from user's element");
+    assert.equal(doc.activeElement, terminalEl);
+    assert.equal(webInputEvents.length, 0, "No mouse/key OS input events may be sent during anchored edits");
+    assert.equal(webTyped.length, 0, "wc.insertText must not be used for anchored edits");
+    assert.equal(
+      cmSpecs.some((spec) => spec.selection !== undefined),
+      false,
+      "CM transactions must never set selection during anchored edits"
+    );
+    const typeXs = cursorEvents.filter((e) => e.kind === "type").map((e) => e.x);
+    assert.ok(typeXs.length > 3, "Visible mode must stream multiple cursor typing updates across chunks");
+    assert.ok(typeXs.at(-1)! > typeXs[0], "Cursor overlay X advances monotonically along inserted chunks");
+  });
+
+  it("captures and re-delivers interleaved user keydown/keypress/beforeinput events during raw ui.type and ui.key (P0-2)", async () => {
+    const docListeners = new Map<string, Array<(ev: unknown) => void>>();
+    const terminalListeners = new Map<string, Array<(ev: unknown) => void>>();
+    const searchListeners = new Map<string, Array<(ev: unknown) => void>>();
+    const agentReceivedUserEvents: string[] = [];
+
+    const makeDispatcher = (
+      map: Map<string, Array<(ev: unknown) => void>>,
+      onDefault?: (ev: Record<string, unknown>) => void
+    ) => ({
+      addEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = map.get(type) ?? [];
+        list.push(fn);
+        map.set(type, list);
+      },
+      removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = map.get(type) ?? [];
+        map.set(
+          type,
+          list.filter((entry) => entry !== fn)
+        );
+      },
+      dispatchEvent: (rawEv: Record<string, unknown>) => {
+        let stoppedImmediate = false;
+        let stopped = false;
+        let prevented = false;
+        const ev = {
+          ...rawEv,
+          get defaultPrevented() {
+            return prevented;
+          },
+          preventDefault: () => {
+            prevented = true;
+          },
+          stopImmediatePropagation: () => {
+            stoppedImmediate = true;
+            stopped = true;
+          },
+          stopPropagation: () => {
+            stopped = true;
+          },
+        };
+        for (const capFn of [...(docListeners.get(String(rawEv.type)) ?? [])]) {
+          capFn(ev);
+          if (stoppedImmediate) break;
+        }
+        if (!stopped) {
+          for (const tgtFn of [...(map.get(String(rawEv.type)) ?? [])]) {
+            tgtFn(ev);
+            if (stoppedImmediate) break;
+          }
+          if (!prevented) {
+            onDefault?.(ev);
+          }
+        }
+        return !prevented;
+      },
+    });
+
+    const terminalDispatcher = makeDispatcher(terminalListeners);
+    const terminalEl = {
+      tagName: "TEXTAREA",
+      value: "",
+      selectionStart: 0,
+      selectionEnd: 0,
+      selectionDirection: "forward",
+      readOnly: false,
+      disabled: false,
+      isContentEditable: false,
+      isConnected: true,
+      matches: (s: string) => s.includes("textarea") && !s.includes("password"),
+      closest: (s: string) => (s.includes(".xterm-helper-textarea") ? terminalEl : null),
+      getAttribute: (n: string) => (n === "aria-label" ? "Terminal input" : null),
+      focus: () => {
+        doc.activeElement = terminalEl;
+      },
+      setSelectionRange: (start: number, end: number) => {
+        terminalEl.selectionStart = start;
+        terminalEl.selectionEnd = end;
+      },
+      dispatchEvent: terminalDispatcher.dispatchEvent,
+      addEventListener: terminalDispatcher.addEventListener,
+      removeEventListener: terminalDispatcher.removeEventListener,
+      getBoundingClientRect: () => ({ left: 400, top: 480, right: 800, bottom: 580, width: 400, height: 100 }),
+    };
+
+    const searchDispatcher = makeDispatcher(searchListeners);
+    const searchInput = {
+      tagName: "INPUT",
+      value: "",
+      selectionStart: 0,
+      selectionEnd: 0,
+      selectionDirection: "forward",
+      readOnly: false,
+      disabled: false,
+      isContentEditable: false,
+      isConnected: true,
+      matches: (s: string) => s.includes(".search-input") || (s.includes("input") && !s.includes("password")),
+      closest: () => null,
+      getAttribute: () => null,
+      contains: (other: unknown) => other === searchInput,
+      focus: () => {
+        doc.activeElement = searchInput;
+      },
+      dispatchEvent: searchDispatcher.dispatchEvent,
+      addEventListener: searchDispatcher.addEventListener,
+      removeEventListener: searchDispatcher.removeEventListener,
+      getBoundingClientRect: () => ({ left: 60, top: 60, right: 300, bottom: 96, width: 240, height: 36 }),
+    };
+    const agentReceivedAgentKeys: string[] = [];
+    for (const type of ["keydown", "keypress", "beforeinput"]) {
+      searchInput.addEventListener(type, (ev) => {
+        const rec = ev as { key?: string; data?: string; isTrusted?: boolean };
+        if (type === "keydown" && rec.key === "Right") {
+          agentReceivedAgentKeys.push(rec.key);
+          return;
+        }
+        // Ignore the agent's own beforeinput triggered by wc.insertText; record any user event as a leak.
+        if (type !== "beforeinput" || rec.data !== "agent query string".slice(0, rec.data?.length ?? 0)) {
+          if (type !== "beforeinput" || ["j", "u", "o", "k", "z"].includes(rec.data ?? "")) {
+            agentReceivedUserEvents.push(`${type}:${rec.key ?? rec.data ?? ""}`);
+          }
+        }
+      });
+    }
+
+    const terminalReceivedTypes: string[] = [];
+    for (const type of ["keydown", "keypress", "beforeinput", "input"]) {
+      terminalEl.addEventListener(type, (ev) => {
+        const rec = ev as { key?: string; data?: string };
+        terminalReceivedTypes.push(`${type}:${rec.key ?? rec.data ?? ""}`);
+      });
+    }
+
+    const doc = {
+      body: { innerText: "" },
+      documentElement: {},
+      activeElement: terminalEl as unknown,
+      querySelectorAll: (s: string) => (s.includes(".search-input") ? [searchInput] : []),
+      elementFromPoint: () => searchInput,
+      addEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = docListeners.get(type) ?? [];
+        list.push(fn);
+        docListeners.set(type, list);
+      },
+      removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = docListeners.get(type) ?? [];
+        docListeners.set(
+          type,
+          list.filter((entry) => entry !== fn)
+        );
+      },
+    };
+
+    const win = {
+      innerWidth: 900,
+      innerHeight: 600,
+      document: doc,
+      getComputedStyle: () => ({ visibility: "visible", display: "block" }),
+      requestAnimationFrame: (cb: () => void) => {
+        cb();
+        return 1;
+      },
+      setTimeout,
+    } as unknown as Window;
+
+    const sendTrustedUserEvent = (ev: Record<string, unknown>) => {
+      const target = doc.activeElement as { dispatchEvent?: (e: Record<string, unknown>) => boolean } | null;
+      target?.dispatchEvent?.({ ...ev, isTrusted: true });
+    };
+
+    let sleepCount = 0;
+    const ui = new UiControlService({
+      win,
+      getUiTypingSpeed: () => "visible",
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(900, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") {
+            doc.activeElement = searchInput;
+          } else if (ev.type === "keyDown") {
+            (doc.activeElement as { dispatchEvent?: (e: Record<string, unknown>) => void } | null)?.dispatchEvent?.({
+              type: "keydown",
+              key: ev.keyCode,
+              isTrusted: true,
+            });
+          } else if (ev.type === "char") {
+            (doc.activeElement as { dispatchEvent?: (e: Record<string, unknown>) => void } | null)?.dispatchEvent?.({
+              type: "keypress",
+              key: ev.keyCode,
+              isTrusted: true,
+            });
+          }
+        },
+        insertText: (chunk) => {
+          searchInput.dispatchEvent({
+            type: "beforeinput",
+            data: chunk,
+            inputType: "insertText",
+            isTrusted: true,
+          });
+          searchInput.value += chunk;
+        },
+      }),
+      sleep: async () => {
+        sleepCount += 1;
+        // Inject trusted user keystrokes while the agent holds focus on searchInput.
+        if (sleepCount === 2) {
+          sendTrustedUserEvent({ type: "keydown", key: "j" });
+          sendTrustedUserEvent({ type: "keypress", key: "j" });
+          sendTrustedUserEvent({ type: "beforeinput", data: "j", inputType: "insertText" });
+          sendTrustedUserEvent({ type: "keydown", key: "u" });
+          sendTrustedUserEvent({ type: "beforeinput", data: "u", inputType: "insertText" });
+        } else if (sleepCount === 3) {
+          sendTrustedUserEvent({ type: "keydown", key: "Backspace" });
+          sendTrustedUserEvent({ type: "keydown", key: "o" });
+          sendTrustedUserEvent({ type: "beforeinput", data: "o", inputType: "insertText" });
+          sendTrustedUserEvent({ type: "keydown", key: "k" });
+          sendTrustedUserEvent({ type: "beforeinput", data: "k", inputType: "insertText" });
+        }
+      },
+    });
+
+    await ui.type(
+      { target: { selector: ".search-input" }, text: "agent query string" },
+      "agy1"
+    );
+
+    assert.equal(agentReceivedUserEvents.length, 0, "Interleaved user keys must never reach agent's target");
+    assert.equal(searchInput.value, "agent query string");
+    assert.equal(doc.activeElement, terminalEl, "Focus must restore to terminal after raw ui.type");
+    assert.equal(terminalEl.value, "jok", "Captured user keystrokes must replay cleanly to user's terminal");
+    assert.ok(terminalReceivedTypes.includes("keydown:j"));
+    assert.ok(terminalReceivedTypes.includes("keypress:j"));
+    assert.ok(terminalReceivedTypes.includes("beforeinput:j"));
+
+    // Also test interleaved user keystroke during raw ui.key inside a batch holding searchInput focus.
+    sleepCount = 0;
+    let keyBatchSleeps = 0;
+    const uiKey = new UiControlService({
+      win,
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(900, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") {
+            doc.activeElement = searchInput;
+          } else if (ev.type === "keyDown") {
+            searchInput.dispatchEvent({ type: "keydown", key: ev.keyCode, isTrusted: true });
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        keyBatchSleeps += 1;
+        if (doc.activeElement === searchInput && keyBatchSleeps === 2) {
+          sendTrustedUserEvent({ type: "keydown", key: "z" });
+          sendTrustedUserEvent({ type: "beforeinput", data: "z", inputType: "insertText" });
+        }
+      },
+    });
+
+    await uiKey.batch(
+      {
+        steps: [
+          { action: "click", target: { selector: ".search-input" } },
+          { action: "press_key", key: "ArrowRight" },
+        ],
+      },
+      "agy1"
+    );
+    assert.equal(agentReceivedUserEvents.length, 0, "Interleaved key during ui.key must not hit agent target");
+    assert.deepEqual(agentReceivedAgentKeys, ["Right"], "Agent's own trusted ArrowRight must pass through to agent target");
+    assert.equal(doc.activeElement, terminalEl);
+    assert.equal(terminalEl.value, "jokz");
+    assert.equal(docListeners.get("keydown")?.length ?? 0, 0, "Shield listeners must detach cleanly in finally");
+  });
+
+  it("blocks matching physical keys during press_key settle, shields rAF/wait_for gaps, avoids obsolete focus restore in insert_line, and retains keys when modals open (review-focus P1-1..P1-4)", async () => {
+    const createHarness = () => {
+      const listeners = new Map<string, Array<(ev: unknown) => void>>();
+      const makeField = (label: string, extraClasses = "") => {
+        const names = new Set(extraClasses.split(/\s+/).filter(Boolean));
+        const field: Record<string, unknown> = {
+          tagName: "INPUT",
+          value: "",
+          selectionStart: 0,
+          selectionEnd: 0,
+          selectionDirection: "none",
+          disabled: false,
+          readOnly: false,
+          isConnected: true,
+          parentElement: null as unknown,
+          classList: { contains: (c: string) => names.has(c) },
+          getAttribute: (k: string) => (k === "aria-label" ? label : null),
+          matches: (s: string) =>
+            (s.includes("input") && !s.includes("password")) ||
+            Array.from(names).some((n) => s.includes(`.${n}`)),
+          closest: (s: string): unknown =>
+            (field.matches as (sel: string) => boolean)(s)
+              ? field
+              : ((field.parentElement as { closest?: (sel: string) => unknown } | null)?.closest?.(s) ?? null),
+          contains: (o: unknown) => o === field,
+          focus: () => {
+            doc.activeElement = field;
+          },
+          setSelectionRange: (a: number, b: number) => {
+            field.selectionStart = a;
+            field.selectionEnd = b;
+          },
+          dispatchEvent: () => true,
+          getBoundingClientRect: () => ({ left: 20, top: 30, width: 200, height: 30, right: 220, bottom: 60 }),
+        };
+        return field;
+      };
+
+      const user = makeField("Original input");
+      const next = makeField("Next input");
+      const agent = makeField("Agent target", "agent-target");
+      const palette = makeField("Palette input");
+      const modalNames = new Set(["modal-container", "prompt"]);
+      const modal = {
+        tagName: "DIV",
+        isConnected: true,
+        classList: { contains: (c: string) => modalNames.has(c) },
+        matches: (s: string) => Array.from(modalNames).some((n) => s.includes(`.${n}`)),
+        closest: (s: string) => (Array.from(modalNames).some((n) => s.includes(`.${n}`)) ? modal : null),
+        contains: (o: unknown) => o === modal || o === palette,
+        getAttribute: () => null,
+        getBoundingClientRect: () => ({ left: 30, top: 30, width: 300, height: 200, right: 330, bottom: 230 }),
+      };
+      palette.parentElement = modal;
+
+      let modalOpen = false;
+      const doc: Record<string, unknown> = {
+        body: { innerText: "" },
+        documentElement: {},
+        activeElement: user,
+        querySelectorAll: (s: string) => {
+          if (modalOpen && s.includes(".modal")) return [modal];
+          if (s.includes(".agent-target")) return [agent];
+          return [];
+        },
+        elementFromPoint: () => agent,
+        addEventListener: (t: string, fn: (ev: unknown) => void) => {
+          const list = listeners.get(t) ?? [];
+          list.push(fn);
+          listeners.set(t, list);
+        },
+        removeEventListener: (t: string, fn: (ev: unknown) => void) => {
+          listeners.set(t, (listeners.get(t) ?? []).filter((f) => f !== fn));
+        },
+      };
+
+      const emit = (type: string, init: Record<string, unknown> = {}) => {
+        let prevented = false;
+        let stopped = false;
+        const ev = {
+          type,
+          isTrusted: true,
+          ...init,
+          preventDefault: () => {
+            prevented = true;
+          },
+          stopImmediatePropagation: () => {
+            stopped = true;
+          },
+          stopPropagation: () => undefined,
+        };
+        for (const fn of [...(listeners.get(type) ?? [])]) {
+          fn(ev);
+          if (stopped) break;
+        }
+        return { prevented, stopped };
+      };
+
+      const typePhysicalChar = (ch: string, onDeliver?: () => void) => {
+        if (emit("keydown", { key: ch }).prevented) return false;
+        if (emit("keypress", { key: ch }).prevented) return false;
+        if (emit("beforeinput", { data: ch, inputType: "insertText" }).prevented) return false;
+        if (onDeliver) {
+          onDeliver();
+        } else {
+          const active = doc.activeElement as { value?: string; selectionStart?: number; selectionEnd?: number };
+          if (typeof active.value === "string") {
+            active.value += ch;
+            active.selectionStart = active.value.length;
+            active.selectionEnd = active.value.length;
+          }
+        }
+        return true;
+      };
+
+      const win = {
+        innerWidth: 1000,
+        innerHeight: 600,
+        document: doc,
+        getComputedStyle: () => ({ visibility: "visible", display: "block" }),
+        requestAnimationFrame: (cb: () => void) => {
+          cb();
+          return 1;
+        },
+        setTimeout,
+        clearTimeout,
+      } as unknown as Window;
+
+      return {
+        win,
+        doc,
+        user,
+        next,
+        agent,
+        palette,
+        emit,
+        typePhysicalChar,
+        setModalOpen: (v: boolean) => {
+          modalOpen = v;
+        },
+      };
+    };
+
+    // 1) P1-1: Physical key matching agent press_key ("a") during settle must NEVER bypass shield into agent target;
+    //    and Electron "Right" normalizes cleanly to DOM "ArrowRight" during synchronous dispatch.
+    {
+      const h = createHarness();
+      let sleeps = 0;
+      let deliveredMatchedChar: boolean | null = null;
+      const ui = new UiControlService({
+        win: h.win,
+        getWebContents: () => ({
+          capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+          sendInputEvent: (ev) => {
+            if (ev.type === "mouseDown") h.doc.activeElement = h.agent;
+          },
+          insertText: () => undefined,
+        }),
+        sleep: async () => {
+          sleeps += 1;
+          if (sleeps === 2) {
+            deliveredMatchedChar = h.typePhysicalChar("a");
+          }
+        },
+      });
+      await ui.batch(
+        { steps: [{ action: "click", target: { selector: ".agent-target" } }, { action: "press_key", key: "a" }] },
+        "A"
+      );
+      assert.equal(deliveredMatchedChar, false, "Matching physical 'a' during settle must be intercepted");
+      assert.equal(h.agent.value, "", "Agent target must not receive physical 'a' from user");
+      assert.equal(h.user.value, "a", "User input must receive buffered 'a' after restore");
+
+      // Sync ArrowRight normalization: Electron keyCode "Right" emits DOM key "ArrowRight" during dispatch.
+      h.user.value = "";
+      h.agent.value = "";
+      const replayedToUser: string[] = [];
+      let arrowCanceled: boolean | null = null;
+      h.user.dispatchEvent = (e?: { key?: string }) => {
+        if (e?.key) replayedToUser.push(e.key);
+        return true;
+      };
+      const uiArrow = new UiControlService({
+        win: h.win,
+        getWebContents: () => ({
+          capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+          sendInputEvent: (ev) => {
+            if (ev.type === "mouseDown") h.doc.activeElement = h.agent;
+            if (ev.type === "keyDown" && ev.keyCode === "Right") {
+              arrowCanceled = h.emit("keydown", { key: "ArrowRight" }).prevented;
+            }
+          },
+          insertText: () => undefined,
+        }),
+        sleep: async () => undefined,
+      });
+      await uiArrow.batch(
+        { steps: [{ action: "click", target: { selector: ".agent-target" } }, { action: "press_key", key: "ArrowRight" }] },
+        "A"
+      );
+      assert.equal(arrowCanceled, false, "Agent's normalized ArrowRight must pass through to agent target");
+      assert.deepEqual(replayedToUser, []);
+    }
+
+    // 2) P1-2: Shield covers full borrowed-focus window: both click rAF paint AND wait_for polling inside batch.
+    {
+      const h = createHarness();
+      let sleeps = 0;
+      const uiBatch = new UiControlService({
+        win: h.win,
+        getWebContents: () => ({
+          capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+          sendInputEvent: (ev) => {
+            if (ev.type === "mouseDown") h.doc.activeElement = h.agent;
+          },
+          insertText: () => undefined,
+        }),
+        sleep: async () => {
+          sleeps += 1;
+          if (sleeps === 2) {
+            h.typePhysicalChar("j");
+            (h.doc.body as { innerText: string }).innerText = "READY";
+          }
+        },
+      });
+      await uiBatch.batch(
+        {
+          steps: [
+            { action: "click", target: { selector: ".agent-target" } },
+            { action: "wait_for", text: "READY", timeoutMs: 300 },
+          ],
+        },
+        "A"
+      );
+      assert.equal(h.agent.value, "", "User typing during batch wait_for must not hit agent target");
+      assert.equal(h.user.value, "j", "Captured key during batch wait_for must replay to user input");
+
+      // Standalone anchored click paint gap test (user keystroke during waitForPaint rAF).
+      let noteText = "agent note";
+      const leafEl = {
+        tagName: "DIV",
+        isConnected: true,
+        classList: { contains: (c: string) => c === "workspace-leaf" || c === "mod-active" },
+        contains: (o: unknown) => o === leafEl || o === contentEl,
+        closest: (s: string) => (s.includes(".workspace-leaf") ? leafEl : null),
+        matches: (s: string) => s.includes(".workspace-leaf"),
+        getAttribute: () => null,
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 450, height: 550, right: 450, bottom: 550 }),
+      };
+      const contentEl = {
+        tagName: "DIV",
+        isConnected: true,
+        isContentEditable: true,
+        classList: { contains: (c: string) => c === "cm-content" },
+        matches: () => false,
+        closest: (s: string) => (s.includes(".workspace-leaf") ? leafEl : null),
+        contains: (o: unknown) => o === contentEl,
+        getAttribute: () => null,
+        getBoundingClientRect: () => ({ left: 20, top: 40, width: 400, height: 480, right: 420, bottom: 520 }),
+      };
+      const cm = {
+        dom: leafEl as unknown as Element,
+        contentDOM: contentEl as unknown as Element,
+        scrollDOM: leafEl as unknown as HTMLElement,
+        state: {
+          doc: {
+            toString: () => noteText,
+            get length() {
+              return noteText.length;
+            },
+            get lines() {
+              return 1;
+            },
+            line: () => ({ number: 1, from: 0, to: noteText.length, text: noteText }),
+          },
+          selection: { main: { head: 0, anchor: 0 } },
+        },
+        coordsAtPos: () => ({ left: 100, top: 120, right: 102, bottom: 140 }),
+        focus: () => {
+          h.doc.activeElement = contentEl;
+        },
+        dispatch: () => undefined,
+      };
+      h.user.value = "";
+      h.doc.activeElement = h.user;
+      h.doc.elementFromPoint = () => contentEl;
+      let painted = false;
+      h.win.requestAnimationFrame = ((cb: () => void) => {
+        if (!painted && h.doc.activeElement === contentEl) {
+          painted = true;
+          h.typePhysicalChar("j", () => {
+            noteText += "j";
+          });
+        }
+        cb();
+        return 1;
+      }) as unknown as typeof window.requestAnimationFrame;
+      const uiPaint = new UiControlService({
+        win: h.win,
+        resolveNoteLeaf: () => ({
+          path: "Shared.md",
+          pane: "main",
+          activePane: true,
+          containerEl: leafEl as unknown as Element,
+          cm,
+        }),
+        resolveElementContext: (el) => (el === leafEl ? { notePath: "Shared.md", pane: "main", activePane: true } : null),
+        getWebContents: () => ({
+          capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+          sendInputEvent: (ev) => {
+            if (ev.type === "mouseDown") h.doc.activeElement = contentEl;
+          },
+          insertText: () => undefined,
+        }),
+        sleep: async () => undefined,
+      });
+      await uiPaint.click({ target: { note: "Shared.md", line: 1 } }, "A");
+      assert.equal(noteText, "agent note", "Key typed during waitForPaint must never reach clicked note");
+      assert.equal(h.user.value, "j", "Key typed during waitForPaint must replay to user input");
+      assert.equal(h.doc.activeElement, h.user);
+    }
+
+    // 3) P1-3: Nonfocusing insertLine and anchored ui.type preserve newer user focus and selection choices.
+    {
+      const h = createHarness();
+      h.user.value = "echo ";
+      h.user.selectionStart = 5;
+      h.user.selectionEnd = 5;
+      h.doc.activeElement = h.user;
+      let noteText = "## A\nline";
+      const leafEl = {
+        tagName: "DIV",
+        isConnected: true,
+        classList: { contains: (c: string) => c === "workspace-leaf" || c === "mod-active" },
+        contains: (o: unknown) => o === leafEl || o === contentEl,
+        closest: (s: string) => (s.includes(".workspace-leaf") ? leafEl : null),
+        matches: (s: string) => s.includes(".workspace-leaf"),
+        getAttribute: () => null,
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 450, height: 550, right: 450, bottom: 550 }),
+      };
+      const contentEl = {
+        tagName: "DIV",
+        isConnected: true,
+        isContentEditable: true,
+        classList: { contains: (c: string) => c === "cm-content" },
+        matches: () => false,
+        closest: (s: string) => (s.includes(".workspace-leaf") ? leafEl : null),
+        contains: (o: unknown) => o === contentEl,
+        getAttribute: () => null,
+        getBoundingClientRect: () => ({ left: 20, top: 40, width: 400, height: 480, right: 420, bottom: 520 }),
+      };
+      const cm = {
+        dom: leafEl as unknown as Element,
+        contentDOM: contentEl as unknown as Element,
+        scrollDOM: leafEl as unknown as HTMLElement,
+        state: {
+          doc: {
+            toString: () => noteText,
+            get length() {
+              return noteText.length;
+            },
+            get lines() {
+              return noteText.split("\n").length;
+            },
+            line: (n: number) => {
+              const all = noteText.split("\n");
+              const from = all.slice(0, n - 1).reduce((s, line) => s + line.length + 1, 0);
+              return { number: n, from, to: from + all[n - 1].length, text: all[n - 1] };
+            },
+          },
+          selection: { main: { head: 0, anchor: 0 } },
+        },
+        coordsAtPos: () => ({ left: 100, top: 120, right: 102, bottom: 140 }),
+        focus: () => {
+          h.doc.activeElement = contentEl;
+        },
+        dispatch: (spec: Record<string, unknown>) => {
+          const ch = spec.changes as { from: number; insert: string } | undefined;
+          if (ch && typeof ch.insert === "string") {
+            noteText = noteText.slice(0, ch.from) + ch.insert + noteText.slice(ch.from);
+          }
+        },
+      };
+      h.doc.elementFromPoint = () => contentEl;
+      let userMoved = false;
+      const uiAnchored = new UiControlService({
+        win: h.win,
+        getUiTypingSpeed: () => "visible",
+        resolveNoteLeaf: () => ({
+          path: "Shared.md",
+          pane: "main",
+          activePane: true,
+          containerEl: leafEl as unknown as Element,
+          cm,
+          view: { file: { path: "Shared.md" }, editor: { cm } },
+        }),
+        resolveElementContext: (el) => (el === leafEl ? { notePath: "Shared.md", pane: "main", activePane: true } : null),
+        getWebContents: () => null,
+        sleep: async () => {
+          if (!userMoved) {
+            userMoved = true;
+            h.user.value = `${String(h.user.value)}x`;
+            h.user.selectionStart = 6;
+            h.user.selectionEnd = 6;
+            (h.next.focus as () => void)();
+            (h.next.setSelectionRange as (a: number, b: number) => void)(1, 1);
+          }
+        },
+      });
+      const out = (await uiAnchored.insertLine(
+        { target: { note: "Shared.md", heading: "A" }, text: "alpha beta gamma" },
+        "A"
+      )) as { focus: { label: string } };
+      assert.equal(h.doc.activeElement, h.next, "insert_line must never restore obsolete initial user focus");
+      assert.equal(h.user.selectionStart, 6, "insert_line must never overwrite newer user selection");
+      assert.equal(h.next.selectionStart, 1);
+      assert.equal(out.focus.label, "Next input");
+
+      // Also verify anchored ui.type leaves newer user focus & selection untouched.
+      h.user.selectionStart = 2;
+      let movedDuringType = false;
+      const uiType = new UiControlService({
+        win: h.win,
+        getUiTypingSpeed: () => "visible",
+        resolveNoteLeaf: () => ({
+          path: "Shared.md",
+          pane: "main",
+          activePane: true,
+          containerEl: leafEl as unknown as Element,
+          cm,
+          view: { file: { path: "Shared.md" }, editor: { cm } },
+        }),
+        resolveElementContext: (el) => (el === leafEl ? { notePath: "Shared.md", pane: "main", activePane: true } : null),
+        getWebContents: () => null,
+        sleep: async () => {
+          if (!movedDuringType) {
+            movedDuringType = true;
+            h.doc.activeElement = h.user;
+            h.user.selectionStart = 4;
+          }
+        },
+      });
+      await uiType.type({ target: { note: "Shared.md", after: "alpha beta gamma" }, text: " tail tail" }, "A");
+      assert.equal(h.doc.activeElement, h.user);
+      assert.equal(h.user.selectionStart, 4);
+    }
+
+    // 4) P1-4: Opening a modal (Mod+P) keeps modal focus without discarding captured user typing.
+    {
+      const h = createHarness();
+      let sentKey = false;
+      const uiModal = new UiControlService({
+        win: h.win,
+        getWebContents: () => ({
+          capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+          sendInputEvent: (ev) => {
+            if (ev.type === "keyDown") {
+              h.emit("keydown", { key: ev.keyCode });
+              h.setModalOpen(true);
+              h.doc.activeElement = h.palette;
+            }
+          },
+          insertText: () => undefined,
+        }),
+        sleep: async () => {
+          if (!sentKey) {
+            sentKey = true;
+            h.typePhysicalChar("j");
+            h.typePhysicalChar("k");
+          }
+        },
+      });
+      await uiModal.pressKey({ key: "p", modifiers: ["Mod"] }, "A");
+      assert.equal(h.doc.activeElement, h.palette, "Opened modal must retain focus");
+      assert.equal(h.palette.value, "", "Modal input must not be polluted by user's pre-modal typing");
+      assert.equal(h.user.value, "jk", "Captured user typing during modal open must not be dropped");
+    }
   });
 });
