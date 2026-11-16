@@ -8,6 +8,8 @@ export type ReadSource = "visible" | "recent" | "recent_unwrapped" | "detection"
 
 export type VaultPermissionMode = "off" | "read-only" | "read-write" | "full";
 
+export type UiTypingSpeed = "visible" | "fast";
+
 export type TerminalProfileKind =
   | "herdr-vault"
   | "herdr-agent"
@@ -298,6 +300,9 @@ export interface HerdrPluginSettings {
   vaultPermissionMode: VaultPermissionMode;
   allowHiddenConfigReads: boolean;
   allowUiControl: boolean;
+  uiTypingSpeed: UiTypingSpeed;
+  allowUiInProtectedAreas: boolean;
+  showAgentCursors: boolean;
   defaultAgentKind: string;
   showOfflinePreviewWhenStopped: boolean;
 }
@@ -342,6 +347,9 @@ export const DEFAULT_SETTINGS: HerdrPluginSettings = {
   vaultPermissionMode: "read-write",
   allowHiddenConfigReads: false,
   allowUiControl: false,
+  uiTypingSpeed: "visible",
+  allowUiInProtectedAreas: false,
+  showAgentCursors: true,
   defaultAgentKind: "claude",
   showOfflinePreviewWhenStopped: true,
 };
@@ -360,6 +368,11 @@ export function migrateSettings(raw: unknown): HerdrPluginSettings {
     validModes.includes(src.vaultPermissionMode)
       ? src.vaultPermissionMode
       : DEFAULT_SETTINGS.vaultPermissionMode;
+
+  const typingSpeed: UiTypingSpeed =
+    src.uiTypingSpeed === "visible" || src.uiTypingSpeed === "fast"
+      ? src.uiTypingSpeed
+      : DEFAULT_SETTINGS.uiTypingSpeed;
 
   const fontSize =
     typeof src.terminalFontSize === "number" && Number.isFinite(src.terminalFontSize)
@@ -431,6 +444,15 @@ export function migrateSettings(raw: unknown): HerdrPluginSettings {
       typeof src.allowUiControl === "boolean"
         ? src.allowUiControl
         : DEFAULT_SETTINGS.allowUiControl,
+    uiTypingSpeed: typingSpeed,
+    allowUiInProtectedAreas:
+      typeof src.allowUiInProtectedAreas === "boolean"
+        ? src.allowUiInProtectedAreas
+        : DEFAULT_SETTINGS.allowUiInProtectedAreas,
+    showAgentCursors:
+      typeof src.showAgentCursors === "boolean"
+        ? src.showAgentCursors
+        : DEFAULT_SETTINGS.showAgentCursors,
     defaultAgentKind:
       typeof src.defaultAgentKind === "string" && src.defaultAgentKind.trim()
         ? src.defaultAgentKind.trim()

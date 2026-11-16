@@ -32,8 +32,9 @@ Pick any of them from **Spawn agent** in Mission Control. Run `herdr integration
 Some things only the app can show: a view, a plugin panel, a layout. Turn on **Let agents see and operate Obsidian** in Herdr settings and agents can:
 
 - **See.** Take a screenshot of the window and list its buttons and fields.
-- **Act.** Click, type, press shortcuts like `Ctrl+P`, scroll and drag. This also needs the **Full** permission level.
-- **Check.** Wait until some text appears, so they confirm what happened.
+- **Act.** Click, type (at `Visible` or `Fast` `uiTypingSpeed`), press shortcuts like `Ctrl+P`, scroll, drag, and insert lines directly at note anchors (`--note` with `--heading`, `--after`, `--line`, and `--at start|end`). This also needs the **Full** permission level.
+- **See who is acting.** Live visual agent cursors show each agent's plain name label as it works in Obsidian, dim after `1,500 ms` idle, auto-hide after `60,000 ms`, and disappear immediately when panes close, collapse, or switch notes.
+- **Verify and stay safe.** `obs-herdr ui insert-line` returns verified proof (`path`, `pane`, `line`, `text`, `heading`, `durationMs`) so extra read-backs are unnecessary. Wait commands confirm visible UI text, and UI actions inside protected areas (Herdr terminal views, Obsidian Settings, and community plugin toggles) fail with `ui_protected_area` unless `allowUiInProtectedAreas` is enabled.
 
 It is off by default. Typing that changes the open note is logged and can be undone like any other edit.
 
@@ -104,13 +105,14 @@ obs-herdr note rename "Specs/Plan.md" "Specs/Approved Plan.md"
 obs-herdr workspace open "Specs/Approved Plan.md" --pane split
 obs-herdr ui screenshot            # saves a PNG and prints its path
 obs-herdr ui inspect --text "Settings"
+obs-herdr ui insert-line --note "Specs/Plan.md" --heading "Steps" --text "- verify"
 obs-herdr ui click --selector ".workspace-leaf.mod-active .cm-content"
 obs-herdr ui key Mod+P
 obs-herdr ui type "Hello from an agent"
-obs-herdr mcp   # stdio MCP server, 24 tools
+obs-herdr mcp   # stdio MCP server, 25 tools
 ```
 
-UI control goes through Electron's own capture and input APIs from inside the plugin, so it needs no debugging port and no extra install. Selectors must match exactly one visible, uncovered element, password fields are refused, and input from several agents is queued so it never interleaves.
+UI control goes through Electron's own capture and input APIs from inside the plugin, so it needs no debugging port and no extra install. Selectors must match exactly one visible, uncovered element, password fields are refused, protected areas (`ui_protected_area`: Herdr terminal views, Settings modal, community plugin toggles) are blocked unless `allowUiInProtectedAreas` is enabled, `uiTypingSpeed` selects `visible` or `fast` typing, and input from several agents is queued inside one serialized lock so it never interleaves.
 
 To connect an MCP client, click **Copy MCP JSON config** in Mission Control, Vault Bridge.
 

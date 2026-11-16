@@ -7,7 +7,13 @@ import {
   TFolder,
   normalizePath,
 } from "obsidian";
-import { UiControlError, type UiControlService } from "../control/ui-control";
+import {
+  UiControlError,
+  type PointAtResultTarget,
+  type MutationCompleteCallback,
+  type UiControlService,
+  type UiMutationContext,
+} from "../control/ui-control";
 import { guardVaultRelativePath, VaultPathGuardError } from "../domain/path-guard";
 import type {
   VaultAuditEntry,
@@ -23,6 +29,42 @@ export class BridgeRpcError extends Error {
     this.name = "BridgeRpcError";
     this.code = code;
   }
+}
+
+export interface VaultTextChange {
+  before: string;
+  after: string;
+  from: number;
+  to: number;
+  insertLength: number;
+}
+
+function editedTextRange(before: string, after: string): VaultTextChange | undefined {
+  if (before === after) {
+    return undefined;
+  }
+  let from = 0;
+  const limit = Math.min(before.length, after.length);
+  while (from < limit && before.charCodeAt(from) === after.charCodeAt(from)) {
+    from++;
+  }
+  const splitsSurrogate = (text: string, pos: number): boolean =>
+    pos > 0 && pos < text.length && text.charCodeAt(pos - 1) >= 0xd800 &&
+    text.charCodeAt(pos - 1) <= 0xdbff && text.charCodeAt(pos) >= 0xdc00 && text.charCodeAt(pos) <= 0xdfff;
+  if (splitsSurrogate(before, from) || splitsSurrogate(after, from)) {
+    from--;
+  }
+  let suffix = 0;
+  while (
+    suffix < limit - from &&
+    before.charCodeAt(before.length - suffix - 1) === after.charCodeAt(after.length - suffix - 1)
+  ) {
+    suffix++;
+  }
+  if (splitsSurrogate(before, before.length - suffix) || splitsSurrogate(after, after.length - suffix)) {
+    suffix--;
+  }
+  return { before, after, from, to: before.length - suffix, insertLength: after.length - suffix - from };
 }
 
 function asStr(value: unknown, fallback = ""): string {
@@ -65,7 +107,7 @@ const WRITE_METHODS = new Set<string>([
 const FULL_METHODS = new Set<string>(["commands.execute"]);
 
 /** Seeing the window: any bridge tier, plus the separate UI control setting. */
-const UI_OBSERVE_METHODS = new Set<string>(["ui.screenshot", "ui.inspect", "ui.wait_for"]);
+const UI_OBSERVE_METHODS = new Set<string>(["ui.screenshot", "ui.inspect", "ui.wait_for", "ui.locate"]);
 
 /** Operating the window can do anything a person can, so it needs Full plus the UI control setting. */
 const UI_INPUT_METHODS = new Set<string>([
@@ -74,6 +116,8 @@ const UI_INPUT_METHODS = new Set<string>([
   "ui.press_key",
   "ui.scroll",
   "ui.drag",
+  "ui.batch",
+  "ui.insert_line",
 ]);
 
 const BLOCKED_COMMAND_SUBSTRINGS = [
@@ -110,14 +154,45 @@ interface CanvasDocument {
   edges: CanvasEdgeRecord[];
 }
 
+interface UiSnapshotSession {
+  context: UiMutationContext;
+  view: MarkdownView;
+  editor: MarkdownView["editor"];
+  cm: UiMutationContext["targetCm"];
+  path: string;
+  before: string;
+  revision: number;
+  commandRevision: number;
+  conflicted: boolean;
+  depth: number;
+}
+
+interface SnapshotGuard {
+  revision: number;
+  commandRevision: number;
+  postContent: string | null | undefined;
+  conflicted: boolean;
+}
+
 export class VaultOpsService {
   private readonly app: App;
   private readonly getPermissionMode: () => VaultPermissionMode;
   private readonly getAllowHiddenReads: () => boolean;
   private readonly uiControl: UiControlService | null;
   private readonly getAllowUiControl: () => boolean;
+  private readonly onAgentActivity:
+    | ((caller: string, targetPath: string | undefined, action: string, change?: VaultTextChange) => void)
+    | null;
   private readonly auditEntries: VaultAuditEntry[] = [];
   private readonly auditListeners = new Set<() => void>();
+  private readonly pathQueues = new Map<string, Promise<unknown>>();
+  private readonly pendingUiSnapshots = new Set<UiSnapshotSession>();
+  private readonly noteRevisions = new Map<string, number>();
+  private readonly nativeWrites = new Map<string, number>();
+  private readonly snapshotGuards = new WeakMap<VaultMutationSnapshot, SnapshotGuard>();
+  private readonly destructiveUndoPaths = new Set<string>();
+  private commandRevision = 0;
+  private commandsInFlight = 0;
   private auditSeq = 0;
 
   constructor(options: {
@@ -126,12 +201,14 @@ export class VaultOpsService {
     getAllowHiddenReads: () => boolean;
     uiControl?: UiControlService | null;
     getAllowUiControl?: () => boolean;
+    onAgentActivity?: (caller: string, targetPath: string | undefined, action: string, change?: VaultTextChange) => void;
   }) {
     this.app = options.app;
     this.getPermissionMode = options.getPermissionMode;
     this.getAllowHiddenReads = options.getAllowHiddenReads;
     this.uiControl = options.uiControl ?? null;
     this.getAllowUiControl = options.getAllowUiControl ?? (() => false);
+    this.onAgentActivity = options.onAgentActivity ?? null;
   }
 
   onAuditUpdated(listener: () => void): () => void {
@@ -199,6 +276,7 @@ export class VaultOpsService {
       );
     }
 
+    const finishNativeWrite = this.trackNativeWrite(method, params);
     try {
       const result = await this.executeMethod(method, params, caller);
       return result;
@@ -229,6 +307,8 @@ export class VaultOpsService {
         "execution_error",
         err instanceof Error ? err.message : String(err)
       );
+    } finally {
+      finishNativeWrite();
     }
   }
 
@@ -242,43 +322,186 @@ export class VaultOpsService {
     }
 
     const snap = entry.snapshot;
-    if (snap.kind === "created") {
-      const created = this.app.vault.getAbstractFileByPath(snap.path);
-      if (created instanceof TFile) {
-        await this.app.fileManager.trashFile(created);
+    return this.withPathLock(snap.path, async () => {
+      if (entry.undone) {
+        throw new Error("This mutation has already been undone.");
       }
-      entry.undone = true;
-      this.notifyAudit();
-      return `Moved created note '${snap.path}' to trash.`;
-    }
+      const guard = this.snapshotGuards.get(snap);
+      if (guard && (guard.conflicted || guard.revision !== this.noteRevision(snap.path) ||
+        guard.commandRevision !== this.commandRevision ||
+        this.hasPendingWrite(snap.path))) {
+        throw this.undoConflict(snap.path);
+      }
+      const finishNativeWrite = this.beginNativeWrite([snap.path]);
+      try {
+        if (snap.kind === "created") {
+          const created = this.app.vault.getAbstractFileByPath(snap.path);
+          if (!(created instanceof TFile) || !guard || typeof guard.postContent !== "string") {
+            throw this.undoConflict(snap.path);
+          }
+          const persisted = await this.app.vault.read(created);
+          this.assertUndoStillCurrent(snap.path, guard);
+          if (this.app.vault.getAbstractFileByPath(snap.path) !== created || persisted !== guard.postContent ||
+            this.liveSourceViews(snap.path).some((view) => view.editor.getValue() !== guard.postContent)) {
+            throw this.undoConflict(snap.path);
+          }
+          // Hold the write guard from final validation until the destructive API settles.
+          this.destructiveUndoPaths.add(snap.path);
+          try {
+            await this.app.fileManager.trashFile(created);
+          } finally {
+            this.destructiveUndoPaths.delete(snap.path);
+          }
+          entry.undone = true;
+          this.notifyAudit();
+          return `Moved created note '${snap.path}' to trash.`;
+        }
 
-    if (snap.kind === "modified" && typeof snap.previousContent === "string") {
-      const existing = this.app.vault.getAbstractFileByPath(snap.path);
-      if (existing instanceof TFile) {
-        const restored = snap.previousContent;
-        await this.app.vault.process(existing, () => restored);
+        if (snap.kind === "modified" && typeof snap.previousContent === "string") {
+          await this.restoreModifiedSnapshot(snap, guard);
+          entry.undone = true;
+          this.notifyAudit();
+          return `Restored previous content of '${snap.path}'.`;
+        }
+
+        if (snap.kind === "renamed" && snap.previousPath) {
+          const current = this.app.vault.getAbstractFileByPath(snap.path);
+          if (!(current instanceof TFile)) {
+            throw new Error(`Renamed note '${snap.path}' is no longer present.`);
+          }
+          await this.ensureParentFolders(snap.previousPath);
+          await this.app.fileManager.renameFile(current, snap.previousPath);
+          entry.undone = true;
+          this.notifyAudit();
+          return `Renamed '${snap.path}' back to '${snap.previousPath}'.`;
+        }
+
+        throw new Error("Unsupported snapshot kind.");
+      } finally {
+        if (entry.undone) this.noteRevisions.set(snap.path, this.noteRevision(snap.path) + 1);
+        finishNativeWrite();
+      }
+    });
+  }
+
+  private undoConflict(path: string): BridgeRpcError {
+    return new BridgeRpcError("undo_conflict", `Cannot undo '${path}': another change overlaps or follows this change.`);
+  }
+
+  private noteRevision(path: string): number {
+    return this.noteRevisions.get(path) ?? 0;
+  }
+
+  private hasPendingWrite(path: string): boolean {
+    return this.commandsInFlight > 0 || (this.nativeWrites.get(path) ?? 0) > 0 ||
+      [...this.pendingUiSnapshots].some((session) => session.path === path);
+  }
+
+  private beginNativeWrite(paths: string[]): () => void {
+    for (const path of paths) this.assertNoDestructiveUndo(path);
+    for (const path of paths) {
+      this.nativeWrites.set(path, (this.nativeWrites.get(path) ?? 0) + 1);
+      for (const session of this.pendingUiSnapshots) {
+        if (session.path === path) {
+          session.conflicted = true;
+        }
+      }
+    }
+    return () => {
+      for (const path of paths) {
+        const count = (this.nativeWrites.get(path) ?? 1) - 1;
+        if (count <= 0) this.nativeWrites.delete(path);
+        else this.nativeWrites.set(path, count);
+      }
+    };
+  }
+
+  private trackNativeWrite(method: string, params: Record<string, unknown>): () => void {
+    if (method === "commands.execute") {
+      this.assertNoDestructiveUndo();
+      // Arbitrary commands have unknown write scope, so invalidate all existing captures and guards.
+      this.commandRevision++;
+      this.commandsInFlight++;
+      for (const session of this.pendingUiSnapshots) session.conflicted = true;
+      return () => {
+        this.commandsInFlight--;
+        this.commandRevision++;
+      };
+    }
+    if (!WRITE_METHODS.has(method) || method.startsWith("workspace.")) {
+      return () => undefined;
+    }
+    const paths = new Set<string>();
+    if (typeof params.path === "string") {
+      const path = method === "canvas.upsert_node" && !params.path.endsWith(".canvas")
+        ? `${params.path}.canvas` : params.path;
+      paths.add(normalizePath(path));
+    }
+    if (typeof params.newPath === "string") paths.add(normalizePath(params.newPath));
+    if (method.startsWith("editor.")) {
+      const path = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
+      if (path) paths.add(path);
+    }
+    return this.beginNativeWrite([...paths]);
+  }
+
+  private assertNoDestructiveUndo(path?: string): void {
+    if (path ? this.destructiveUndoPaths.has(path) : this.destructiveUndoPaths.size > 0) {
+      throw new BridgeRpcError("undo_in_progress", "A created-note Undo is in progress; retry the write afterward.");
+    }
+  }
+
+  private liveSourceViews(path: string): MarkdownView[] {
+    const views: MarkdownView[] = [];
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view instanceof MarkdownView && leaf.view.file?.path === path && leaf.view.getMode() === "source") {
+        views.push(leaf.view);
+      }
+    });
+    return views;
+  }
+
+  private assertUndoStillCurrent(path: string, guard: SnapshotGuard): void {
+    if (guard.revision !== this.noteRevision(path) || guard.commandRevision !== this.commandRevision ||
+      this.commandsInFlight > 0 || (this.nativeWrites.get(path) ?? 0) > 1 ||
+      [...this.pendingUiSnapshots].some((session) => session.path === path)) {
+      throw this.undoConflict(path);
+    }
+  }
+
+  private async restoreModifiedSnapshot(snap: VaultMutationSnapshot, guard?: SnapshotGuard): Promise<void> {
+    const restored = snap.previousContent;
+    if (typeof restored !== "string" || !guard || guard.postContent === undefined) {
+      throw this.undoConflict(snap.path);
+    }
+    const existing = this.app.vault.getAbstractFileByPath(snap.path);
+    if (guard.postContent === null) {
+      if (existing) throw this.undoConflict(snap.path);
+      await this.ensureParentFolders(snap.path);
+      await this.app.vault.create(snap.path, restored);
+    } else {
+      if (!(existing instanceof TFile)) throw this.undoConflict(snap.path);
+      const live = this.liveSourceViews(snap.path);
+      if (live.length > 0) {
+        const persisted = await this.app.vault.read(existing);
+        this.assertUndoStillCurrent(snap.path, guard);
+        const currentLive = this.liveSourceViews(snap.path);
+        if ((persisted !== restored && persisted !== guard.postContent) || currentLive.length === 0 ||
+          currentLive.some((view) => view.editor.getValue() !== guard.postContent)) {
+          throw this.undoConflict(snap.path);
+        }
+        // No await between validating the live buffers and replacing the owned change.
+        for (const view of currentLive) view.editor.setValue(restored);
       } else {
-        await this.ensureParentFolders(snap.path);
-        await this.app.vault.create(snap.path, snap.previousContent);
+        await this.app.vault.process(existing, (current) => {
+          this.assertUndoStillCurrent(snap.path, guard);
+          if (current !== guard.postContent || this.liveSourceViews(snap.path).length > 0) {
+            throw this.undoConflict(snap.path);
+          }
+          return restored;
+        });
       }
-      entry.undone = true;
-      this.notifyAudit();
-      return `Restored previous content of '${snap.path}'.`;
     }
-
-    if (snap.kind === "renamed" && snap.previousPath) {
-      const current = this.app.vault.getAbstractFileByPath(snap.path);
-      if (!(current instanceof TFile)) {
-        throw new Error(`Renamed note '${snap.path}' is no longer present.`);
-      }
-      await this.ensureParentFolders(snap.previousPath);
-      await this.app.fileManager.renameFile(current, snap.previousPath);
-      entry.undone = true;
-      this.notifyAudit();
-      return `Renamed '${snap.path}' back to '${snap.previousPath}'.`;
-    }
-
-    throw new Error("Unsupported snapshot kind.");
   }
 
   private isMethodPermitted(method: string, mode: VaultPermissionMode): boolean {
@@ -303,6 +526,18 @@ export class VaultOpsService {
     return false;
   }
 
+  private async pointAtUiResult(
+    caller: string,
+    target: PointAtResultTarget,
+    label: string
+  ): Promise<void> {
+    try {
+      await this.uiControl?.pointAtResult(caller, target, label);
+    } catch {
+      // Passive visual feedback must never fail a completed operation.
+    }
+  }
+
   private async executeUiMethod(
     method: string,
     params: Record<string, unknown>,
@@ -321,45 +556,201 @@ export class VaultOpsService {
       return ui.inspect(params);
     }
     if (method === "ui.wait_for") {
-      return ui.waitFor(params);
+      return ui.waitFor(params, caller);
     }
-
-    // Input can change the active note, so keep its text for one-click Undo when it does.
-    const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const notePath = mdView?.file?.path;
-    const before = mdView && notePath ? mdView.editor.getValue() : null;
+    if (method === "ui.locate") {
+      return ui.locate(params, caller);
+    }
 
     let result: unknown;
     let summary: string;
     if (method === "ui.click") {
-      result = await ui.click(params);
+      result = await ui.click(params, caller);
       summary = "Clicked in the Obsidian window.";
     } else if (method === "ui.type") {
-      result = await ui.type(params);
+      result = await ui.type(params, caller);
       summary = `Typed ${asStr(params.text).length} characters in the Obsidian window.`;
     } else if (method === "ui.press_key") {
-      result = await ui.pressKey(params);
+      result = await ui.pressKey(params, caller);
       const mods = Array.isArray(params.modifiers) ? params.modifiers.map(String) : [];
       summary = `Pressed ${[...mods, asStr(params.key)].join("+")} in the Obsidian window.`;
     } else if (method === "ui.scroll") {
-      result = await ui.scroll(params);
+      result = await ui.scroll(params, caller);
       summary = "Scrolled in the Obsidian window.";
-    } else {
-      result = await ui.drag(params);
+    } else if (method === "ui.drag") {
+      result = await ui.drag(params, caller);
       summary = "Dragged in the Obsidian window.";
+    } else if (method === "ui.insert_line") {
+      result = await ui.insertLine(params, caller);
+      summary = "Inserted a line at a note anchor in the Obsidian window.";
+    } else {
+      result = await ui.batch(params, caller);
+      const stepCount = Array.isArray(params.steps) ? params.steps.length : 0;
+      summary = `Executed ${stepCount} UI batch steps in the Obsidian window.`;
     }
 
-    const changed =
-      before !== null && mdView !== null && mdView.file?.path === notePath && mdView.editor.getValue() !== before;
     this.recordAudit({
       method,
       caller,
-      targetPath: changed ? notePath : undefined,
       allowed: true,
-      summary: changed ? `${summary} Changed '${notePath}'.` : summary,
-      snapshot: changed && notePath && before !== null ? { kind: "modified", path: notePath, previousContent: before } : undefined,
+      summary,
     });
     return result;
+  }
+
+  /** Called by the UI service inside its input lock, with the actual target editor. */
+  captureUiMutation(context: UiMutationContext, targetView?: MarkdownView | null): MutationCompleteCallback {
+    this.assertNoDestructiveUndo();
+    const notePath = context.notePath;
+    if (!notePath) {
+      return () => undefined;
+    }
+    const suppliedView = context.targetView;
+    if (suppliedView !== undefined && !(suppliedView instanceof MarkdownView)) {
+      throw new BridgeRpcError("ui_snapshot_unavailable", "The original Markdown view cannot be verified.");
+    }
+    let view = suppliedView instanceof MarkdownView ? suppliedView : targetView ?? null;
+    if (!view) {
+      this.app.workspace.iterateAllLeaves((leaf) => {
+        if (view) {
+          return;
+        }
+        const candidate = leaf.view;
+        const paneId = (leaf as unknown as { id?: string }).id;
+        if (
+          candidate instanceof MarkdownView && candidate.file?.path === notePath &&
+          (!context.paneId || paneId === context.paneId)
+        ) {
+          view = candidate;
+        }
+      });
+    }
+    // Non-note controls can carry DOM fallback metadata; they have no note preimage.
+    if (!view) {
+      return () => undefined;
+    }
+    if (view.file?.path !== notePath) {
+      throw new BridgeRpcError("ui_snapshot_unavailable", `Cannot capture the target editor for '${notePath}'.`);
+    }
+    if (context.targetCm && (view.editor as unknown as { cm?: unknown }).cm !== context.targetCm) {
+      throw new BridgeRpcError("ui_snapshot_unavailable", `The original editor for '${notePath}' changed.`);
+    }
+    const editorView = view;
+    // Only nested helpers for this caller and action share a change record.
+    let session = [...this.pendingUiSnapshots].find((pending) => pending.view === editorView &&
+      pending.path === notePath && pending.context.caller === context.caller &&
+      pending.context.action === context.action);
+    if (session) {
+      session.depth++;
+    } else {
+      session = {
+        context, view: editorView, editor: editorView.editor, cm: context.targetCm, path: notePath,
+        before: editorView.getMode() === "source" ? editorView.editor.getValue() : editorView.getViewData(),
+        revision: this.noteRevision(notePath),
+        commandRevision: this.commandRevision,
+        conflicted: this.commandsInFlight > 0 || (this.nativeWrites.get(notePath) ?? 0) > 0,
+        depth: 1,
+      };
+      for (const pending of this.pendingUiSnapshots) {
+        if (pending.path === notePath) {
+          pending.conflicted = true;
+          session.conflicted = true;
+        }
+      }
+      this.pendingUiSnapshots.add(session);
+    }
+    const captured = session;
+    let completed = false;
+    return async (completion) => {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      if (--captured.depth > 0) return;
+      try {
+        const sameEditor = editorView.file?.path === notePath && editorView.editor === captured.editor &&
+          (!captured.cm || (editorView.editor as unknown as { cm?: unknown }).cm === captured.cm);
+        let partialContent: string | undefined;
+        if (completion?.abortedAfterNoteSwitch && completion.edits?.length) {
+          let text = captured.before;
+          let inserted = 0;
+          let valid = true;
+          for (const edit of completion.edits) {
+            if (!Number.isInteger(edit.from) || !Number.isInteger(edit.to) ||
+              edit.from < 0 || edit.to < edit.from || edit.to > text.length || typeof edit.insert !== "string") {
+              valid = false;
+              break;
+            }
+            text = text.slice(0, edit.from) + edit.insert + text.slice(edit.to);
+            inserted += edit.insert.length;
+          }
+          if (valid && inserted === completion.insertedChars) partialContent = text;
+        }
+        const unverifiedPartial = Boolean(completion?.abortedAfterNoteSwitch &&
+          (completion.insertedChars ?? 0) > 0 && partialContent === undefined);
+        let postContent: string | undefined;
+        try {
+          postContent = unverifiedPartial ? undefined : partialContent ?? (sameEditor
+            ? editorView.getMode() === "source" ? captured.editor.getValue() : editorView.getViewData()
+            : await this.app.vault.read(this.requireFile(notePath)));
+          if (!sameEditor && partialContent === undefined) captured.conflicted = true;
+        } catch {
+          // Preserve the partial-operation audit without replacing its original failure.
+          captured.conflicted = true;
+        }
+        if (postContent === captured.before && !unverifiedPartial) return;
+        this.pendingUiSnapshots.delete(captured);
+        this.recordAudit({
+          method: `ui.${context.action}`,
+          caller: context.caller,
+          targetPath: notePath,
+          allowed: true,
+          summary: `${completion?.ok === false ? "Partially changed" : "Changed"} '${notePath}' via ${context.action}${context.paneId ? ` in pane '${context.paneId}'` : ""}.${unverifiedPartial ? ` ${completion?.insertedChars ?? 0} characters reported; final content unverified.` : ""}`,
+          snapshot: { kind: "modified", path: notePath, previousContent: captured.before },
+          postContent,
+          snapshotConflicted: captured.conflicted || captured.revision !== this.noteRevision(notePath) ||
+            captured.commandRevision !== this.commandRevision,
+        });
+      } finally {
+        this.pendingUiSnapshots.delete(captured);
+      }
+    };
+  }
+
+  private withPathLock<T>(pathKey: string, task: () => Promise<T>): Promise<T> {
+    const prev = this.pathQueues.get(pathKey) ?? Promise.resolve();
+    const run = prev.then(task, task);
+    const tail = run.then(
+      () => {
+        if (this.pathQueues.get(pathKey) === tail) {
+          this.pathQueues.delete(pathKey);
+        }
+      },
+      () => {
+        if (this.pathQueues.get(pathKey) === tail) {
+          this.pathQueues.delete(pathKey);
+        }
+      }
+    );
+    this.pathQueues.set(pathKey, tail);
+    return run;
+  }
+
+  private notifyActivity(
+    caller: string,
+    targetPath: string | undefined,
+    action: string,
+    beforeContent?: string,
+    afterContent?: string
+  ): void {
+    try {
+      const change = beforeContent !== undefined && afterContent !== undefined
+        ? editedTextRange(beforeContent, afterContent)
+        : undefined;
+      this.onAgentActivity?.(caller, targetPath, action, change);
+    } catch {
+      // Visual cursor notifications must never fail a vault operation.
+    }
   }
 
   private safePath(raw: unknown, isWrite: boolean): string {
@@ -507,7 +898,17 @@ export class VaultOpsService {
       case "vault.read_note": {
         const relPath = this.safePath(params.path, false);
         const file = this.requireFile(relPath);
-        const content = await this.app.vault.cachedRead(file);
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const buffers: Array<{ view: MarkdownView; content: string }> = [];
+        this.app.workspace.iterateAllLeaves((leaf) => {
+          const view = leaf.view;
+          if (view instanceof MarkdownView && view.file?.path === relPath && view.getMode() === "source") {
+            buffers.push({ view, content: view.editor.getValue() });
+          }
+        });
+        // Prefer the focused split if several editors display this note.
+        const live = buffers.find((buffer) => buffer.view === activeView) ?? buffers[0];
+        const content = live ? live.content : await this.app.vault.cachedRead(file);
         const cache = this.app.metadataCache.getFileCache(file);
         const backlinks = this.collectBacklinksForPath(file.path);
 
@@ -522,9 +923,12 @@ export class VaultOpsService {
         return {
           path: file.path,
           basename: file.basename,
-          size: file.stat.size,
+          size: Buffer.byteLength(content, "utf8"),
           mtime: file.stat.mtime,
           content,
+          source: live ? "editor" : "vault",
+          conflictingBuffers: buffers.some((buffer) => buffer.content !== content),
+          metadataSource: "cache",
           frontmatter: cache?.frontmatter ?? null,
           headings: (cache?.headings || []).map((h) => ({
             level: h.level,
@@ -683,108 +1087,123 @@ export class VaultOpsService {
         const relPath = this.safePath(params.path, true);
         const content = asStr(params.content);
         const overwrite = Boolean(params.overwrite);
-        const existing = this.app.vault.getAbstractFileByPath(relPath);
+        return this.withPathLock(relPath, async () => {
+          const existing = this.app.vault.getAbstractFileByPath(relPath);
 
-        if (existing instanceof TFolder) {
-          throw new BridgeRpcError("is_folder", `'${relPath}' is an existing folder.`);
-        }
-
-        if (existing instanceof TFile) {
-          if (!overwrite) {
-            throw new BridgeRpcError(
-              "already_exists",
-              `Note '${relPath}' already exists. Use vault.update_note or pass overwrite=true.`
-            );
+          if (existing instanceof TFolder) {
+            throw new BridgeRpcError("is_folder", `'${relPath}' is an existing folder.`);
           }
-          const prev = await this.app.vault.read(existing);
-          await this.app.vault.process(existing, () => content);
+
+          if (existing instanceof TFile) {
+            if (!overwrite) {
+              throw new BridgeRpcError(
+                "already_exists",
+                `Note '${relPath}' already exists. Use vault.update_note or pass overwrite=true.`
+              );
+            }
+            let prev = await this.app.vault.read(existing);
+            await this.app.vault.process(existing, (current) => {
+              prev = current;
+              return content;
+            });
+            this.recordAudit({
+              method,
+              caller,
+              targetPath: relPath,
+              allowed: true,
+              summary: `Overwrote note '${relPath}' (${content.length} chars).`,
+              snapshot: {
+                kind: "modified",
+                path: relPath,
+                previousContent: prev,
+              },
+              postContent: content,
+            });
+            this.notifyActivity(caller, relPath, "write", prev, content);
+            await this.pointAtUiResult(caller, { notePath: relPath, prefer: "file-tree" }, "create");
+            return { path: relPath, created: false, updated: true, bytes: content.length };
+          }
+
+          await this.ensureParentFolders(relPath);
+          const created = await this.app.vault.create(relPath, content);
           this.recordAudit({
             method,
             caller,
-            targetPath: relPath,
+            targetPath: created.path,
             allowed: true,
-            summary: `Overwrote note '${relPath}' (${content.length} chars).`,
+            summary: `Created note '${created.path}' (${content.length} chars).`,
             snapshot: {
-              kind: "modified",
-              path: relPath,
-              previousContent: prev,
+              kind: "created",
+              path: created.path,
             },
+            postContent: content,
           });
-          return { path: relPath, created: false, updated: true, bytes: content.length };
-        }
-
-        await this.ensureParentFolders(relPath);
-        const created = await this.app.vault.create(relPath, content);
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: created.path,
-          allowed: true,
-          summary: `Created note '${created.path}' (${content.length} chars).`,
-          snapshot: {
-            kind: "created",
-            path: created.path,
-          },
+          this.notifyActivity(caller, created.path, "create", "", content);
+          await this.pointAtUiResult(caller, { notePath: created.path, prefer: "file-tree" }, "create");
+          return { path: created.path, created: true, updated: false, bytes: content.length };
         });
-        return { path: created.path, created: true, updated: false, bytes: content.length };
       }
 
       case "vault.update_note": {
         const relPath = this.safePath(params.path, true);
-        const file = this.requireFile(relPath);
         const mode = asStr(params.mode, "append");
         const text = asStr(params.content);
         const heading = typeof params.heading === "string" ? params.heading.trim() : "";
         const search = typeof params.search === "string" ? params.search : "";
 
-        const previousContent = await this.app.vault.read(file);
+        return this.withPathLock(relPath, async () => {
+          const file = this.requireFile(relPath);
+          let previousContent = await this.app.vault.read(file);
 
-        const updatedContent = await this.app.vault.process(file, (current) => {
-          if (mode === "replace") {
-            return text;
-          }
-          if (mode === "prepend") {
-            return current ? `${text}\n${current}` : text;
-          }
-          if (mode === "search_replace") {
-            if (!search || !current.includes(search)) {
-              throw new BridgeRpcError(
-                "search_target_not_found",
-                `Target substring was not found in '${relPath}'.`
-              );
+          const updatedContent = await this.app.vault.process(file, (current) => {
+            previousContent = current;
+            if (mode === "replace") {
+              return text;
             }
-            return current.replace(search, text);
-          }
-          if (mode === "under_heading" && heading) {
-            return insertUnderMarkdownHeading(current, heading, text);
-          }
-          // Default: append
-          if (!current) {
-            return text;
-          }
-          const sep = current.endsWith("\n") ? "" : "\n";
-          return `${current}${sep}${text}${text.endsWith("\n") ? "" : "\n"}`;
-        });
+            if (mode === "prepend") {
+              return current ? `${text}\n${current}` : text;
+            }
+            if (mode === "search_replace") {
+              if (!search || !current.includes(search)) {
+                throw new BridgeRpcError(
+                  "search_target_not_found",
+                  `Target substring was not found in '${relPath}'.`
+                );
+              }
+              return current.replace(search, text);
+            }
+            if (mode === "under_heading" && heading) {
+              return insertUnderMarkdownHeading(current, heading, text);
+            }
+            // Default: append
+            if (!current) {
+              return text;
+            }
+            const sep = current.endsWith("\n") ? "" : "\n";
+            return `${current}${sep}${text}${text.endsWith("\n") ? "" : "\n"}`;
+          });
 
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: file.path,
-          allowed: true,
-          summary: `Updated '${file.path}' via mode '${mode}'.`,
-          snapshot: {
-            kind: "modified",
-            path: file.path,
-            previousContent,
-          },
-        });
+          this.recordAudit({
+            method,
+            caller,
+            targetPath: file.path,
+            allowed: true,
+            summary: `Updated '${file.path}' via mode '${mode}'.`,
+            snapshot: {
+              kind: "modified",
+              path: file.path,
+              previousContent,
+            },
+            postContent: updatedContent,
+          });
+          this.notifyActivity(caller, file.path, "edit", previousContent, updatedContent);
 
-        return { path: file.path, mode, length: updatedContent.length };
+          return { path: file.path, mode, length: updatedContent.length };
+        });
       }
 
       case "vault.patch_frontmatter": {
         const relPath = this.safePath(params.path, true);
-        const file = this.requireFile(relPath);
         const setObj =
           params.set && typeof params.set === "object"
             ? (params.set as Record<string, unknown>)
@@ -793,86 +1212,109 @@ export class VaultOpsService {
           ? params.unset.map((k) => String(k))
           : [];
 
-        const previousContent = await this.app.vault.read(file);
+        return this.withPathLock(relPath, async () => {
+          const file = this.requireFile(relPath);
+          const previousContent = await this.app.vault.read(file);
 
-        await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
-          for (const [k, v] of Object.entries(setObj)) {
-            fm[k] = v;
-          }
-          for (const k of unsetKeys) {
-            delete fm[k];
-          }
-        });
+          await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+            for (const [k, v] of Object.entries(setObj)) {
+              fm[k] = v;
+            }
+            for (const k of unsetKeys) {
+              delete fm[k];
+            }
+          });
 
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: file.path,
-          allowed: true,
-          summary: `Patched YAML frontmatter on '${file.path}'.`,
-          snapshot: {
-            kind: "modified",
+          let updatedContent: string | undefined;
+          try {
+            updatedContent = await this.app.vault.read(file);
+          } catch {
+            // Keep the successful write; without a verified postimage Undo must refuse.
+          }
+          this.recordAudit({
+            method,
+            caller,
+            targetPath: file.path,
+            allowed: true,
+            summary: `Patched YAML frontmatter on '${file.path}'.`,
+            snapshot: {
+              kind: "modified",
+              path: file.path,
+              previousContent,
+            },
+            postContent: updatedContent,
+          });
+          this.notifyActivity(caller, file.path, "props", previousContent, updatedContent);
+
+          return {
             path: file.path,
-            previousContent,
-          },
+            updatedKeys: Object.keys(setObj),
+            removedKeys: unsetKeys,
+          };
         });
-
-        return {
-          path: file.path,
-          updatedKeys: Object.keys(setObj),
-          removedKeys: unsetKeys,
-        };
       }
 
       case "vault.rename_note": {
         const fromPath = this.safePath(params.path, true);
         const toPath = this.safePath(params.newPath, true);
-        const file = this.requireFile(fromPath);
-        if (this.app.vault.getAbstractFileByPath(toPath)) {
-          throw new BridgeRpcError(
-            "destination_exists",
-            `Destination '${toPath}' already exists.`
-          );
-        }
-        await this.ensureParentFolders(toPath);
-        await this.app.fileManager.renameFile(file, toPath);
+        const [firstLock, secondLock] = [fromPath, toPath].sort();
+        const doRename = async () => {
+          const file = this.requireFile(fromPath);
+          if (this.app.vault.getAbstractFileByPath(toPath)) {
+            throw new BridgeRpcError(
+              "destination_exists",
+              `Destination '${toPath}' already exists.`
+            );
+          }
+          await this.ensureParentFolders(toPath);
+          await this.app.fileManager.renameFile(file, toPath);
 
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: toPath,
-          allowed: true,
-          summary: `Renamed '${fromPath}' to '${toPath}' with automatic wiki link updates.`,
-          snapshot: {
-            kind: "renamed",
-            path: toPath,
-            previousPath: fromPath,
-          },
-        });
+          this.recordAudit({
+            method,
+            caller,
+            targetPath: toPath,
+            allowed: true,
+            summary: `Renamed '${fromPath}' to '${toPath}' with automatic wiki link updates.`,
+            snapshot: {
+              kind: "renamed",
+              path: toPath,
+              previousPath: fromPath,
+            },
+          });
+          this.notifyActivity(caller, toPath, "rename");
+          await this.pointAtUiResult(caller, { notePath: toPath, prefer: "file-tree" }, "rename");
 
-        return { previousPath: fromPath, path: toPath };
+          return { previousPath: fromPath, path: toPath };
+        };
+        return this.withPathLock(firstLock, () =>
+          firstLock === secondLock ? doRename() : this.withPathLock(secondLock, doRename)
+        );
       }
 
       case "vault.trash_note": {
         const relPath = this.safePath(params.path, true);
-        const file = this.requireFile(relPath);
-        const previousContent = await this.app.vault.read(file);
-        await this.app.fileManager.trashFile(file);
+        return this.withPathLock(relPath, async () => {
+          const file = this.requireFile(relPath);
+          const previousContent = await this.app.vault.read(file);
+          await this.app.fileManager.trashFile(file);
 
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: relPath,
-          allowed: true,
-          summary: `Moved '${relPath}' to trash via FileManager.trashFile.`,
-          snapshot: {
-            kind: "modified",
-            path: relPath,
-            previousContent,
-          },
+          this.recordAudit({
+            method,
+            caller,
+            targetPath: relPath,
+            allowed: true,
+            summary: `Moved '${relPath}' to trash via FileManager.trashFile.`,
+            snapshot: {
+              kind: "modified",
+              path: relPath,
+              previousContent,
+            },
+            postContent: null,
+          });
+          this.notifyActivity(caller, relPath, "trash");
+
+          return { trashed: true, path: relPath };
         });
-
-        return { trashed: true, path: relPath };
       }
 
       case "canvas.upsert_node": {
@@ -896,42 +1338,48 @@ export class VaultOpsService {
           ...(typeof params.color === "string" ? { color: params.color } : {}),
         };
 
-        const existing = this.app.vault.getAbstractFileByPath(canvasPath);
-        if (existing instanceof TFile) {
-          const prevText = await this.app.vault.read(existing);
-          await this.app.vault.process(existing, (raw) => {
-            const doc = parseCanvasDoc(raw);
-            const idx = doc.nodes.findIndex((n) => n.id === nodeId);
-            if (idx >= 0) {
-              doc.nodes[idx] = { ...doc.nodes[idx], ...newNode };
-            } else {
-              doc.nodes.push(newNode);
-            }
-            return JSON.stringify(doc, null, 2) + "\n";
-          });
-          this.recordAudit({
-            method,
-            caller,
-            targetPath: canvasPath,
-            allowed: true,
-            summary: `Upserted Canvas node '${nodeId}' in '${canvasPath}'.`,
-            snapshot: { kind: "modified", path: canvasPath, previousContent: prevText },
-          });
-        } else {
-          await this.ensureParentFolders(canvasPath);
-          const doc: CanvasDocument = { nodes: [newNode], edges: [] };
-          await this.app.vault.create(canvasPath, JSON.stringify(doc, null, 2) + "\n");
-          this.recordAudit({
-            method,
-            caller,
-            targetPath: canvasPath,
-            allowed: true,
-            summary: `Created Canvas '${canvasPath}' with node '${nodeId}'.`,
-            snapshot: { kind: "created", path: canvasPath },
-          });
-        }
+        return this.withPathLock(canvasPath, async () => {
+          const existing = this.app.vault.getAbstractFileByPath(canvasPath);
+          if (existing instanceof TFile) {
+            let prevText = await this.app.vault.read(existing);
+            const updatedText = await this.app.vault.process(existing, (raw) => {
+              prevText = raw;
+              const doc = parseCanvasDoc(raw);
+              const idx = doc.nodes.findIndex((n) => n.id === nodeId);
+              if (idx >= 0) {
+                doc.nodes[idx] = { ...doc.nodes[idx], ...newNode };
+              } else {
+                doc.nodes.push(newNode);
+              }
+              return JSON.stringify(doc, null, 2) + "\n";
+            });
+            this.recordAudit({
+              method,
+              caller,
+              targetPath: canvasPath,
+              allowed: true,
+              summary: `Upserted Canvas node '${nodeId}' in '${canvasPath}'.`,
+              snapshot: { kind: "modified", path: canvasPath, previousContent: prevText },
+              postContent: updatedText,
+            });
+          } else {
+            await this.ensureParentFolders(canvasPath);
+            const doc: CanvasDocument = { nodes: [newNode], edges: [] };
+            await this.app.vault.create(canvasPath, JSON.stringify(doc, null, 2) + "\n");
+            this.recordAudit({
+              method,
+              caller,
+              targetPath: canvasPath,
+              allowed: true,
+              summary: `Created Canvas '${canvasPath}' with node '${nodeId}'.`,
+              snapshot: { kind: "created", path: canvasPath },
+              postContent: JSON.stringify(doc, null, 2) + "\n",
+            });
+          }
+          this.notifyActivity(caller, canvasPath, "canvas");
 
-        return { path: canvasPath, nodeId };
+          return { path: canvasPath, nodeId };
+        });
       }
 
       case "workspace.get_state": {
@@ -994,6 +1442,16 @@ export class VaultOpsService {
           summary: `Opened '${file.path}' in Obsidian (${paneMode}).`,
         });
 
+        const leafEl =
+          (leaf as unknown as { containerEl?: Element }).containerEl ??
+          leaf.view?.containerEl ??
+          null;
+        await this.pointAtUiResult(
+          caller,
+          { notePath: file.path, element: leafEl, prefer: "leaf" },
+          "open"
+        );
+
         return { opened: true, path: file.path, line: lineOneBased ?? null };
       }
 
@@ -1032,6 +1490,7 @@ export class VaultOpsService {
           throw new BridgeRpcError("no_active_editor", "No Markdown editor is currently focused.");
         }
         const replacement = asStr(params.text);
+        const previousContent = mdView.editor.getValue();
         mdView.editor.replaceSelection(replacement);
         this.recordAudit({
           method,
@@ -1040,6 +1499,7 @@ export class VaultOpsService {
           allowed: true,
           summary: `Replaced active editor selection (${replacement.length} chars).`,
         });
+        this.notifyActivity(caller, mdView.file?.path, "edit", previousContent, mdView.editor.getValue());
         return { updated: true, file: mdView.file?.path ?? null };
       }
 
@@ -1049,6 +1509,7 @@ export class VaultOpsService {
           throw new BridgeRpcError("no_active_editor", "No Markdown editor is currently focused.");
         }
         const text = asStr(params.text);
+        const previousContent = mdView.editor.getValue();
         const cursor = mdView.editor.getCursor();
         mdView.editor.replaceRange(text, cursor);
         this.recordAudit({
@@ -1058,6 +1519,7 @@ export class VaultOpsService {
           allowed: true,
           summary: `Inserted ${text.length} chars at line ${cursor.line + 1}.`,
         });
+        this.notifyActivity(caller, mdView.file?.path, "edit", previousContent, mdView.editor.getValue());
         return { inserted: true, file: mdView.file?.path ?? null, line: cursor.line + 1 };
       }
 
@@ -1095,6 +1557,13 @@ export class VaultOpsService {
           allowed: true,
           summary: `Executed Obsidian command '${commandId}'.`,
         });
+        const commandName = this.getCommandRegistry()[commandId]?.name?.trim() || commandId;
+        const activePath = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
+        await this.pointAtUiResult(
+          caller,
+          { ...(activePath ? { notePath: activePath } : {}), prefer: "modal" },
+          `command: ${commandName}`
+        );
         return { executed: true, commandId };
       }
 
@@ -1163,7 +1632,31 @@ export class VaultOpsService {
     allowed: boolean;
     summary: string;
     snapshot?: VaultMutationSnapshot;
+    postContent?: string | null;
+    snapshotConflicted?: boolean;
   }): void {
+    if (entry.snapshot) {
+      const path = entry.snapshot.path;
+      const revision = this.noteRevision(path) + 1;
+      this.noteRevisions.set(path, revision);
+      this.snapshotGuards.set(entry.snapshot, {
+        revision,
+        commandRevision: this.commandRevision,
+        postContent: entry.postContent,
+        conflicted: Boolean(entry.snapshotConflicted) || this.commandsInFlight > 0 ||
+          (this.nativeWrites.get(path) ?? 0) > 1 ||
+          [...this.pendingUiSnapshots].some((pending) => pending.path === path),
+      });
+      for (const pending of this.pendingUiSnapshots) {
+        if (pending.path === path) pending.conflicted = true;
+      }
+    } else if (entry.allowed && entry.targetPath && WRITE_METHODS.has(entry.method) &&
+      !entry.method.startsWith("workspace.")) {
+      this.noteRevisions.set(entry.targetPath, this.noteRevision(entry.targetPath) + 1);
+      for (const pending of this.pendingUiSnapshots) {
+        if (pending.path === entry.targetPath) pending.conflicted = true;
+      }
+    }
     this.auditEntries.unshift({
       id: `audit_${Date.now()}_${(this.auditSeq += 1)}`,
       timestamp: Date.now(),

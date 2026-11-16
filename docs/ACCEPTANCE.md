@@ -137,12 +137,19 @@ Live desktop run (Wayland, Flatpak Obsidian `1.15.0`, Herdr Demo Vault, built `m
 
 Cleanup: scratch note trashed and removed from the demo vault trash, test screenshots deleted, demo vault back on default settings. Not verified: macOS, Windows, HiDPI scaling, Obsidian zoom other than `1`, pop-out windows, and native dialogs.
 
-## Exact dependency and artifact SHA-256 hashes
+### 5. Multi-agent visual cursor overlay and parallel execution (2026-11-15, historical capture)
+
+- Added `AgentCursorOverlay` (`src/control/agent-cursor.ts`) with per-agent spring physics, fade-in on spawn, click ripple rings, typing/action badges, `1500 ms` idle dimming, `8000 ms` initial auto-hide default (later raised to `60000 ms` in Section 6), `prefers-reduced-motion` support, and full `dispose()` cleanup.
+- Added atomic `ui.batch` (`src/control/ui-control.ts`, `src/bridge/vault-ops.ts`, `src/bridge/runtime-kit.ts`, `25` MCP tools, `SHARED_SKILL_TEXT` help) and per-path async locking (`withPathLock`) in `VaultOpsService` for parallel note and Canvas writes, plus `ui.press_key` cursor feedback.
+- Gates after final edit (`npm run check && npm run build && npm run lint && npm test`): exit `0`, `11/11` tests across `5` suites in `2560.67` ms, `0` ESLint warnings/errors, `main.js` `778,961` bytes, `plugin_review_audit.py --strict` `100/100` (`gate_status: "static-signals-clear"`, `css_hardcoded_hex_count: 0`).
+- Live isolated Flatpak Obsidian `1.14.5` desktop run (`/tmp/ohd-live-test`, cleaned up afterward): opened `NoteA.md` and `NoteB.md` in split panes, ran `HERDR_PANE_ID=claude:w1:p1 obs-herdr ui batch` (click + type `"Typed atomically by Claude!"`) in parallel with `HERDR_PANE_ID=codex:w1:p2 obs-herdr note update NoteB.md --mode append`, and visually verified via `ui screenshot` (`1280x1039` PNG) that both color-coded cursors (`claude:w1:p1 typing`, `codex:w1:p2 edit` with ripple ring) and idle dimming (`claude-w1:p1 click`) rendered cleanly over their respective panes. Updated `.herdr-cursor-pill` lightness to `34%` afterward for higher text contrast across all hues.
+
+#### Section 5 dependency and artifact SHA-256 hashes (2026-11-15 capture)
 | File | Bytes | SHA-256 |
 |---|---:|---|
-| `main.js` | `767667` | `bede248ffd1548b9f0d4388e2a5558030c30b8a87e5f20122dcbc13958e6cff1` |
+| `main.js` | `778961` | `2a7137510ef2de924036e66a27a68ebf2e6fd6e45637fb6c24c78c02f3ba0b3d` |
 | `manifest.json` | `404` | `56ca321ad6f89b0ff90e851c8b9e7b801ee7fbb33b0fce4d3f6d2ab7487214e6` |
-| `styles.css` | `19993` | `c03211dd7dd3df1cb03f578205f2805ad66dbb67d886907ab8bb48d484ac3387` |
+| `styles.css` | `22286` | `0dcef1824634af1a6ca86f0c2d86d0e6467385a59732c11bdcf65a75b5936cc7` |
 | `versions.json` | `45` | `ca324faefba6fbffcd9d622e46d2c07f3fd2740ff1140dce026a087c34a62937` |
 | `package.json` | `1148` | `7f5d5ebc1a69c541206d19cf78eebc56012a22aed150776f474680ac8d1f7bbd` |
 | `package-lock.json` | `191923` | `7b37af04a258548b249052bd035d86afa6e95e1ddd37f3f4347e5378aa41323c` |
@@ -151,3 +158,39 @@ Cleanup: scratch note trashed and removed from the demo vault trash, test screen
 | `NOTICE` | `697` | `2da6936fb0e557bb5a919962e85b902a0707e7f8a98081d1f277e4e753323919` |
 | `THIRD_PARTY_NOTICES.md` | `1752` | `b9a795457258171354ba15ac8e9a6a78458b9d2ebb755c5612828d1a2286d65c` |
 | `README.md` | `7162` | `a18cef7f974c7690af49ab98dc50fb85873f639c961a862a9be952a25a065308` |
+
+### 6. UI hardening, note anchors, proof attribution, and CLI/docs alignment (2026-11-16 candidate, pending final orchestrator stamp)
+
+- Visual cursors (`src/control/agent-cursor.ts`): `1500 ms` idle dimming, `60000 ms` auto-hide, plain agent-name pill labels (stripping numeric and alphanumeric pane suffixes such as `w1:pA` when known, falling back to pane ID when unknown, unified `HERDR_PANE_ID_RE` across formatting and `reconcileLiveCallers`), and observer-driven cleanup (`ResizeObserver`, `MutationObserver`, scroll, `notifyNoteUpdated`) without unused helper methods.
+- Settings and UI safety (`src/domain/types.ts`, `src/ui/settings-tab.ts`, `src/control/ui-control.ts`, `src/services/herdr-coordinator.ts`): `uiTypingSpeed` (`"visible"` default or `"fast"`), `allowUiInProtectedAreas` (`false` default; blocks Herdr terminal views, Settings modal, and community plugin toggles with `ui_protected_area` when false, checked across actual hit-test points), viewport-only offscreen scroll in `ui.locate`, note/leaf ownership verification during typing, split-bound `insertLine` proof (`path`, `pane`, `line`, `text`, `heading`, plus `durationMs` and post-restore `focus`), and caller-scoped UI Undo conflict checking.
+- Bridge CLI/docs parity (`src/bridge/runtime-kit.ts`, `README.md`): unified strict lexical parsing across Node and Python (`parsePositiveInt`, `parseNonNegativeInt`, `parseFiniteNumber`), `SHARED_MCP_TOOLS.length` (`25` tools) aligned in CLI help and `README.md`, and documented `insert-line` proof fields, protected-area refusals, and typing speed.
+
+Scope boundary: A build and automated suite run is not an Obsidian runtime test. The Section 6 checks below combine static checks, bundling, simulated DOM/Electron unit and integration tests, and an isolated headless `herdr` daemon integration test (`Live Herdr 0.8.2 Daemon Integration`). The candidate `main.js` bundle has not yet been installed, reloaded, or exercised inside a live Obsidian desktop window; live desktop observations remain scoped to Sections 4 and 5 on those earlier dated builds.
+
+Final gate and hash commands (orchestrator fills the exact outputs and hashes below after all final-round edits settle and one final `npm run build` runs):
+
+```text
+$ npm run check && npm run lint && npm run build && npm test
+-> check: <PENDING_FINAL_BUILD: tsc --noEmit exit status>
+-> lint:  <PENDING_FINAL_BUILD: eslint src --max-warnings=0 exit status and warning count>
+-> build: <PENDING_FINAL_BUILD: esbuild main.js byte count>
+-> test:  <PENDING_FINAL_BUILD: node scripts/run-tests.mjs suite summary and duration>
+
+$ wc -c main.js manifest.json styles.css versions.json package.json package-lock.json LICENSE src/control/LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md \
+  && sha256sum main.js manifest.json styles.css versions.json package.json package-lock.json LICENSE src/control/LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md
+```
+
+#### Exact dependency and artifact SHA-256 hashes (Section 6 final candidate placeholder)
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `main.js` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `manifest.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `styles.css` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `versions.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `package.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `package-lock.json` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `LICENSE` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `src/control/LICENSE` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `NOTICE` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `THIRD_PARTY_NOTICES.md` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |
+| `README.md` | `<PENDING_FINAL_BUILD>` | `<PENDING_FINAL_BUILD>` |

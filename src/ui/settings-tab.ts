@@ -289,6 +289,34 @@ export class HerdrSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: "Allow UI actions in protected areas",
+            desc: "Permit agent clicks, typing, keys, scrolling, and dragging inside Herdr terminal views, the Settings modal, and community plugin toggles.",
+            control: {
+              type: "toggle",
+              key: "allowUiInProtectedAreas",
+            },
+          },
+          {
+            name: "UI typing speed",
+            desc: "Visible animates agent typing word by word; Fast inserts text immediately with minimal action delays.",
+            control: {
+              type: "dropdown",
+              key: "uiTypingSpeed",
+              options: {
+                visible: "Visible (word by word)",
+                fast: "Fast (single insert, minimal delays)",
+              },
+            },
+          },
+          {
+            name: "Show live agent cursors",
+            desc: "Display color-coded animated cursors when agents click, type, drag, or edit visible notes in parallel.",
+            control: {
+              type: "toggle",
+              key: "showAgentCursors",
+            },
+          },
+          {
             name: "Notify when an agent becomes blocked",
             desc: "Show a notice when an agent stops for approval or a user answer.",
             control: {

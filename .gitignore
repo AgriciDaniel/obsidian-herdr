@@ -20,3 +20,9 @@ CREATOR_RECEIPT.json
 creator-brief.json
 docs/SESSION_HANDOFF.md
 docs/CHANGE_REQUEST.md
+
+# Local agent work records and live test notes (never published)
+/.agent/
+/Crew Test/
+/Images/
+/Untitled.base

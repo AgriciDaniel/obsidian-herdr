@@ -9,9 +9,17 @@ import {
   type ProvisionedRuntimeKit,
 } from "../bridge/runtime-kit";
 import { VaultBridgeServer } from "../bridge/vault-bridge-server";
-import { VaultOpsService } from "../bridge/vault-ops";
+import { BridgeRpcError, VaultOpsService, type VaultTextChange } from "../bridge/vault-ops";
+import { AgentCursorOverlay } from "../control/agent-cursor";
 import { getObsidianWebContents } from "../control/electron-host";
-import { UiControlService } from "../control/ui-control";
+import {
+  UiControlService,
+  type CodeMirrorViewLike,
+  type ElementLeafContext,
+  type MutationCompleteCallback,
+  type NoteLeafContext,
+  type UiMutationContext,
+} from "../control/ui-control";
 import { buildOfflinePreviewSnapshot } from "../domain/demo-fixture";
 import { deriveVaultSessionSlug } from "../domain/shell-quote";
 import type {
@@ -79,11 +87,19 @@ export class HerdrCoordinator {
   private readonly previousAgentStates = new Map<string, AgentStatus>();
   private unsubSocketEvent: (() => void) | null = null;
   private unsubSocketConn: (() => void) | null = null;
+  private readonly cursorOverlay: AgentCursorOverlay;
+  private readonly notePaneIds = new WeakMap<MarkdownView, string>();
+  private notePaneSeq = 0;
   private disposed = false;
 
   constructor(options: { app: App; getSettings: () => HerdrPluginSettings }) {
     this.app = options.app;
     this.getSettings = options.getSettings;
+
+    this.cursorOverlay = new AgentCursorOverlay({
+      win: window,
+      enabled: this.getSettings().showAgentCursors,
+    });
 
     this.vaultOps = new VaultOpsService({
       app: this.app,
@@ -92,8 +108,20 @@ export class HerdrCoordinator {
           ? this.getSettings().vaultPermissionMode
           : "off",
       getAllowHiddenReads: () => this.getSettings().allowHiddenConfigReads,
-      uiControl: new UiControlService({ win: window, getWebContents: getObsidianWebContents }),
+      uiControl: new UiControlService({
+        win: window,
+        getWebContents: getObsidianWebContents,
+        getUiTypingSpeed: () => this.getSettings().uiTypingSpeed,
+        getAllowUiInProtectedAreas: () => this.getSettings().allowUiInProtectedAreas,
+        cursorOverlay: this.cursorOverlay,
+        resolveAgentLabel: (caller) => this.resolveCallerLabel(caller),
+        resolveElementContext: (el) => this.resolveEditorContext(el),
+        resolveNoteLeaf: (notePath) => this.resolveOpenNoteLeaf(notePath),
+        beforeMutation: (context) => this.captureUiMutation(context),
+      }),
       getAllowUiControl: () => this.getSettings().allowUiControl,
+      onAgentActivity: (caller, targetPath, action, change) =>
+        this.notifyVaultCursorActivity(caller, targetPath, action, change),
     });
 
     const vaultKey =
@@ -176,6 +204,7 @@ export class HerdrCoordinator {
   async applySettingsUpdate(): Promise<void> {
     const settings = this.getSettings();
     this.cli.setConfiguredBinary(settings.herdrBinaryPath);
+    this.cursorOverlay.setEnabled(settings.showAgentCursors);
 
     if (settings.vaultBridgeEnabled && settings.vaultPermissionMode !== "off") {
       if (!this.bridgeServer?.isRunning()) {
@@ -345,6 +374,12 @@ export class HerdrCoordinator {
       if (status?.server?.running || this.socket.isSocketPresent()) {
         const snap = await this.socket.getSnapshot();
         this.detectAgentStateTransitions(snap.agents);
+        const openPanes = new Set(snap.panes.map((pane) => pane.pane_id));
+        this.cursorOverlay.reconcileLiveCallers(
+          snap.agents
+            .filter((agent) => openPanes.has(agent.pane_id))
+            .flatMap((agent) => agent.name ? [agent.pane_id, agent.name] : [agent.pane_id])
+        );
         this.snapshot = snap;
         this.socketReachable = true;
         this.lastError = null;
@@ -383,6 +418,9 @@ export class HerdrCoordinator {
         this.snapshot = null;
         this.socketReachable = false;
         this.socket.stopSubscription();
+        if (status?.server?.running === false) {
+          this.cursorOverlay.reconcileLiveCallers([]);
+        }
       }
     } catch (err) {
       this.snapshot = null;
@@ -447,6 +485,7 @@ export class HerdrCoordinator {
     this.socket.stopSubscription();
     this.socketReachable = false;
     this.snapshot = null;
+    this.cursorOverlay.reconcileLiveCallers([]);
     await new Promise((r) => window.setTimeout(r, 150));
     await this.refreshAll(true);
   }
@@ -462,19 +501,44 @@ export class HerdrCoordinator {
     await this.refreshAll(false);
   }
 
-  buildAgentSpawnArgs(agentKind: string, attachVaultMcp = true): string[] {
-    if (!attachVaultMcp || !this.bridgeServer?.isRunning()) {
+  buildAgentSpawnArgs(agentKind: string, attachVaultMcp = true, paneId?: string): string[] {
+    if (!this.bridgeServer?.isRunning()) {
       return [];
     }
     if (agentKind === "codex") {
-      return [
-        "-c",
-        `mcp_servers.obsidian_vault.command=${JSON.stringify(this.runtimeKit.cliScriptPath)}`,
-        "-c",
-        'mcp_servers.obsidian_vault.args=["mcp"]',
-      ];
+      const args = attachVaultMcp
+        ? [
+            "-c",
+            `mcp_servers.obsidian_vault.command=${JSON.stringify(this.runtimeKit.cliScriptPath)}`,
+            "-c",
+            'mcp_servers.obsidian_vault.args=["mcp"]',
+          ]
+        : [];
+      // Codex can replace the pane environment with a core set and its own PATH.
+      // Restore only bridge discovery paths and identity, never tokens or all inherited variables.
+      const bridgeEnv = this.getBridgeEnv();
+      const shellEnv: Record<string, string> = {};
+      for (const key of [
+        "PATH",
+        "OBSIDIAN_HERDR_CLI",
+        "OBSIDIAN_HERDR_CONNECTION_FILE",
+        "OBSIDIAN_HERDR_MCP_CONFIG",
+        "OBSIDIAN_VAULT_NAME",
+        "OBSIDIAN_VAULT_PATH",
+      ]) {
+        if (bridgeEnv[key]) {
+          shellEnv[key] = bridgeEnv[key];
+        }
+      }
+      if (paneId) {
+        shellEnv.HERDR_PANE_ID = paneId;
+      }
+      for (const [key, value] of Object.entries(shellEnv)) {
+        args.push("-c", `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+      }
+      return args;
     }
-    if (agentKind === "claude") {
+    if (agentKind === "claude" && attachVaultMcp) {
       return ["--mcp-config", this.runtimeKit.mcpConfigFilePath];
     }
     return [];
@@ -505,6 +569,7 @@ export class HerdrCoordinator {
     attachVaultMcp?: boolean;
     extraArgs?: string[];
   }): Promise<AgentInfo> {
+    await this.ensureBridgeReady();
     if (this.sessionStartInFlight) {
       await this.sessionStartInFlight;
     } else if (!this.socketReachable && !this.socket.isSocketPresent()) {
@@ -535,7 +600,7 @@ export class HerdrCoordinator {
     await this.waitForPaneShellReady(pane.pane_id);
 
     const spawnArgs = [
-      ...this.buildAgentSpawnArgs(options.agentKind, options.attachVaultMcp !== false),
+      ...this.buildAgentSpawnArgs(options.agentKind, options.attachVaultMcp !== false, pane.pane_id),
       ...(options.extraArgs || []),
     ];
 
@@ -732,8 +797,170 @@ export class HerdrCoordinator {
     this.unsubSocketEvent?.();
     this.unsubSocketConn?.();
     this.socket.dispose();
+    this.cursorOverlay.dispose();
     await this.stopVaultBridge();
     this.listeners.clear();
+  }
+
+  private resolveCallerLabel(caller: string): string {
+    const identity = caller.startsWith("herdr:") ? caller.slice(6) : caller;
+    const agent = this.snapshot?.agents.find((candidate) => candidate.pane_id === identity)
+      ?? this.snapshot?.agents.find((candidate) => candidate.name === identity);
+    if (agent) {
+      const name = agent.name || agent.display_agent || agent.agent || "agent";
+      return `${name} (${agent.pane_id})`;
+    }
+    const pane = this.snapshot?.panes.find((candidate) => candidate.pane_id === identity);
+    const label = pane?.label || pane?.display_agent || pane?.agent;
+    return label ? `${label} (${pane.pane_id})` : identity || caller;
+  }
+
+  private getNotePaneId(view: MarkdownView, leafId?: string): string {
+    if (leafId) {
+      return leafId;
+    }
+    let paneId = this.notePaneIds.get(view);
+    if (!paneId) {
+      paneId = `markdown-pane-${++this.notePaneSeq}`;
+      this.notePaneIds.set(view, paneId);
+    }
+    return paneId;
+  }
+
+  private resolveEditorContext(el: Element): ElementLeafContext | null {
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    let context: ElementLeafContext | null = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.containerEl.contains(el)) {
+        context = {
+          notePath: view.file?.path,
+          pane: this.getNotePaneId(view, (leaf as unknown as { id?: string }).id),
+          activePane: view === activeView,
+        };
+      }
+    });
+    return context;
+  }
+
+  private captureUiMutation(context: UiMutationContext): MutationCompleteCallback {
+    if (!context.notePath) return this.vaultOps.captureUiMutation(context);
+    if (context.targetView !== undefined) {
+      if (!(context.targetView instanceof MarkdownView) || context.targetView.file?.path !== context.notePath) {
+        throw new BridgeRpcError("ui_snapshot_unavailable", "The UI mutation's original Markdown view changed before capture.");
+      }
+      return this.vaultOps.captureUiMutation(context, context.targetView);
+    }
+    let targetView: MarkdownView | null = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView) || view.file?.path !== context.notePath) {
+        return;
+      }
+      const paneId = this.getNotePaneId(view, (leaf as unknown as { id?: string }).id);
+      if (context.paneId && paneId !== context.paneId) {
+        return;
+      }
+      if (!targetView) {
+        targetView = view;
+      }
+    });
+    return this.vaultOps.captureUiMutation(context, targetView);
+  }
+
+  private resolveOpenNoteLeaf(notePath: string): (NoteLeafContext & { view: MarkdownView }) | null {
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    let resolved: (NoteLeafContext & { view: MarkdownView }) | null = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView) || view.file?.path !== notePath || view.getMode() !== "source") {
+        return;
+      }
+      // This input host operates the main window, never a pop-out's coordinates.
+      if (view.containerEl.ownerDocument !== window.document) {
+        return;
+      }
+      const rect = view.containerEl.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 || (resolved && view !== activeView)) {
+        return;
+      }
+      resolved = {
+        view,
+        path: notePath,
+        pane: this.getNotePaneId(view, (leaf as unknown as { id?: string }).id),
+        activePane: view === activeView,
+        containerEl: view.containerEl,
+        cm: (view.editor as unknown as { cm?: CodeMirrorViewLike }).cm ?? null,
+        contentText: view.editor.getValue(),
+      };
+    });
+    return resolved;
+  }
+
+  private notifyVaultCursorActivity(
+    caller: string,
+    targetPath: string | undefined,
+    _action: string,
+    change?: VaultTextChange
+  ): void {
+    if (!this.getSettings().showAgentCursors) {
+      return;
+    }
+    // Remove any old document marker before attempting to attribute a new edit.
+    this.cursorOverlay.clearAgent(caller);
+    if (!targetPath || !change) {
+      return;
+    }
+    const leaf = this.resolveOpenNoteLeaf(targetPath);
+    const cm = leaf?.cm;
+    // Vault writes can precede the editor update. Never invent coordinates from stale text.
+    if (!leaf || !cm?.coordsAtPos || cm.state?.doc?.toString() !== change.after) {
+      return;
+    }
+    this.cursorOverlay.notifyNoteUpdated(targetPath);
+    let pos = change.from + change.insertLength;
+    if (!Number.isInteger(pos) || pos < 0 || pos > change.after.length) {
+      return;
+    }
+    // Show the last written text rather than the blank line after an appended newline.
+    while (pos > change.from && /[\r\n]/.test(change.after[pos - 1] ?? "")) {
+      pos--;
+    }
+    const caret = cm.coordsAtPos(pos);
+    if (!caret || !Number.isFinite(caret.left) || !Number.isFinite(caret.top) || !Number.isFinite(caret.bottom)) {
+      return;
+    }
+    const bounds = (cm.scrollDOM ?? leaf.containerEl).getBoundingClientRect();
+    const containerBounds = leaf.containerEl.getBoundingClientRect();
+    const left = Math.max(0, bounds.left, containerBounds.left);
+    const right = Math.min(window.innerWidth, bounds.right, containerBounds.right);
+    const top = Math.max(0, bounds.top, containerBounds.top);
+    const bottom = Math.min(window.innerHeight, bounds.bottom, containerBounds.bottom);
+    const caretRight = caret.right ?? caret.left;
+    const caretBottom = caret.bottom ?? caret.top;
+    if (caret.left < left || caretRight > right || caret.top < top || caretBottom > bottom) {
+      return;
+    }
+    const statusBar = window.document.querySelector<HTMLElement>(".status-bar")?.getBoundingClientRect();
+    if (
+      statusBar && statusBar.width > 0 && statusBar.height > 0 &&
+      caretRight >= statusBar.left && caret.left <= statusBar.right &&
+      caretBottom > statusBar.top && caret.top < statusBar.bottom
+    ) {
+      return;
+    }
+    const context = {
+      notePath: targetPath,
+      pane: leaf.pane,
+      leafId: leaf.pane,
+      pos,
+      cm,
+      containerEl: leaf.view.containerEl,
+      view: leaf.view,
+      getLeafNotePath: () => leaf.view.file?.path ?? null,
+    };
+    this.cursorOverlay.moveTo(caller, this.resolveCallerLabel(caller), caret.left, (caret.top + caretBottom) / 2, "note_update", context);
+    this.cursorOverlay.parkAgent(caller, context);
   }
 
   private detectAgentStateTransitions(agents: AgentInfo[]): void {

@@ -6,7 +6,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
-import type { App } from "obsidian";
+import { MarkdownView, type App } from "obsidian";
+import {
+  AgentCursorOverlay,
+  formatCursorDisplayLabel,
+  type CursorCodeMirrorLike,
+} from "../src/control/agent-cursor";
+import type { UiControlService } from "../src/control/ui-control";
 import {
   buildBridgeEnvForPanes,
   computeRuntimePaths,
@@ -14,7 +20,7 @@ import {
   readExistingBridgeToken,
 } from "../src/bridge/runtime-kit";
 import { VaultBridgeServer } from "../src/bridge/vault-bridge-server";
-import { VaultOpsService } from "../src/bridge/vault-ops";
+import { BridgeRpcError, VaultOpsService } from "../src/bridge/vault-ops";
 import { buildOfflinePreviewSnapshot } from "../src/domain/demo-fixture";
 import { OscStreamObserver, parseOsc7501, parseOsc7Path } from "../src/domain/osc-parser";
 import {
@@ -23,7 +29,7 @@ import {
   VaultPathGuardError,
 } from "../src/domain/path-guard";
 import { deriveVaultSessionSlug, quoteShellPathForPlatform } from "../src/domain/shell-quote";
-import { migrateSettings, type VaultPermissionMode } from "../src/domain/types";
+import { DEFAULT_SETTINGS, migrateSettings, type VaultPermissionMode } from "../src/domain/types";
 import { buildHostNormalizedEnv, HerdrCliClient } from "../src/herdr/cli-client";
 import { HerdrSocketClient } from "../src/herdr/socket-client";
 import { parseObsidianUriTarget } from "../src/terminal/link-provider";
@@ -135,10 +141,23 @@ describe("Domain: OSC stream observer, path guard, shell quoting, and settings m
       terminalFontSize: 99,
       terminalScrollback: 10,
       vaultPermissionMode: "invalid-tier",
+      uiTypingSpeed: "instant-bad",
+      allowUiInProtectedAreas: "yes",
     });
     assert.equal(migrated.terminalFontSize, 28);
     assert.equal(migrated.terminalScrollback, 500);
     assert.equal(migrated.vaultPermissionMode, "read-write");
+    assert.equal(migrated.uiTypingSpeed, DEFAULT_SETTINGS.uiTypingSpeed);
+    assert.equal(migrated.uiTypingSpeed, "visible");
+    assert.equal(migrated.allowUiInProtectedAreas, DEFAULT_SETTINGS.allowUiInProtectedAreas);
+    assert.equal(migrated.allowUiInProtectedAreas, false);
+
+    const migratedValid = migrateSettings({
+      uiTypingSpeed: "fast",
+      allowUiInProtectedAreas: true,
+    });
+    assert.equal(migratedValid.uiTypingSpeed, "fast");
+    assert.equal(migratedValid.allowUiInProtectedAreas, true);
 
     const preview = buildOfflinePreviewSnapshot("Demo Vault");
     assert.equal(preview.agents.length, 3);
@@ -463,7 +482,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(mcpResponses.length, 3);
       const toolsList = (mcpResponses[1].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(toolsList.length, 24, "Node MCP server should expose all 24 tools");
+      assert.equal(toolsList.length, 25, "Node MCP server should expose all 25 tools");
       assert.ok(toolsList.some((t) => t.name === "obsidian_read_note"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_patch_frontmatter"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_backlinks"));
@@ -545,11 +564,806 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(pyMcpResponses.length, 2);
       const pyTools = (pyMcpResponses[0].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(pyTools.length, 24, "Python MCP server must expose all 24 tools");
+      assert.equal(pyTools.length, 25, "Python MCP server must expose all 25 tools");
+
+      // 6. Verify concurrent multi-agent vault & canvas writes preserve all updates
+      await Promise.all([
+        vaultOps.dispatch("vault.create_note", { path: "ParallelA.md", content: "A0" }, "herdr:w1:p1"),
+        vaultOps.dispatch("vault.create_note", { path: "ParallelB.md", content: "B0" }, "herdr:w1:p2"),
+      ]);
+      await Promise.all([
+        vaultOps.dispatch("vault.update_note", { path: "ParallelA.md", mode: "append", content: "A1" }, "herdr:w1:p1"),
+        vaultOps.dispatch("vault.update_note", { path: "ParallelB.md", mode: "append", content: "B1" }, "herdr:w1:p2"),
+        vaultOps.dispatch("canvas.upsert_node", { path: "Parallel.canvas", id: "n1", text: "One" }, "herdr:w1:p1"),
+        vaultOps.dispatch("canvas.upsert_node", { path: "Parallel.canvas", id: "n2", text: "Two" }, "herdr:w1:p2"),
+      ]);
+      const canvasRaw = fs.readFileSync(path.join(vaultDir, "Parallel.canvas"), "utf8");
+      const canvasParsed = JSON.parse(canvasRaw) as { nodes: Array<{ id: string }> };
+      assert.equal(canvasParsed.nodes.length, 2, "Per-path lock must preserve concurrent canvas node upserts");
       const pyBacklinkCall = (
         pyMcpResponses[1].result as { content: Array<{ text: string }> }
       ).content[0].text;
       assert.ok(pyBacklinkCall.includes("Index.md"));
+    } finally {
+      await server.stop();
+      fs.rmSync(tmpBase, { recursive: true, force: true });
+    }
+  });
+
+  it("supports --help across groups/subcommands, derives MCP tool count, and implements ui locate/insert-line/anchor targets in Node and Python", async () => {
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-cli-help-test-"));
+    const vaultDir = path.join(tmpBase, "vault");
+    fs.mkdirSync(vaultDir, { recursive: true });
+    const kit = computeRuntimePaths(vaultDir, path.join(tmpBase, "runtime"));
+
+    const runWithStdin = (cmd: string, args: string[], stdinText: string, env: NodeJS.ProcessEnv): Promise<{ stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const child = spawn(cmd, args, { env, stdio: ["pipe", "pipe", "pipe"] });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d) => { stdout += d.toString("utf8"); });
+        child.stderr.on("data", (d) => { stderr += d.toString("utf8"); });
+        child.on("error", reject);
+        child.on("close", (code) => {
+          if (code === 0) resolve({ stdout, stderr });
+          else reject(new Error(`Exit ${code}: ${stderr || stdout}`));
+        });
+        child.stdin.write(stdinText);
+        child.stdin.end();
+      });
+
+    let scrollCount = 0;
+    let useNativeLocate = false;
+    let useNativeInsertLine = false;
+    let forceLocateDenied = false;
+    let stackedMode = false;
+    let blankMode = false;
+    let openNotesOverride: string[] | null = null;
+    const noteLines = [
+      "# Mission Board",
+      "",
+      "## agy2: How agents share one note",
+      "- Line one",
+      "- Target line to locate",
+    ];
+    const dispatcher = async (method: string, params: Record<string, unknown>) => {
+      if (method === "vault.read_note") {
+        const reqPath = String(params.path || "Crew Test/Mission Board.md");
+        if (reqPath === "Dup.md") {
+          return { path: reqPath, content: "same\nmiddle\nsame" };
+        }
+        if (reqPath === "Blank.md") {
+          return { path: reqPath, content: "\n\n" };
+        }
+        if (reqPath === "Bottom.md") {
+          return { path: reqPath, content: "# Bottom\n- Bottom body" };
+        }
+        if (reqPath === "A/Shared.md" || reqPath === "B/Shared.md") {
+          return { path: reqPath, content: "# Shared\nUnique body line" };
+        }
+        return { path: reqPath, content: noteLines.join("\n") };
+      }
+      if (method === "workspace.get_state") {
+        if (blankMode) {
+          return { activeFile: "Blank.md", openNotes: ["Blank.md"] };
+        }
+        if (stackedMode) {
+          return { activeFile: "Top.md", openNotes: ["Top.md", "Bottom.md"] };
+        }
+        if (openNotesOverride) {
+          return { activeFile: openNotesOverride[0], openNotes: openNotesOverride };
+        }
+        return {
+          activeFile: "Crew Test/Mission Board.md",
+          openNotes: ["Crew Test/Mission Board.md", "Crew Test/Crew Chat.md"],
+        };
+      }
+      if (method === "ui.scroll") {
+        scrollCount += 1;
+        return { dispatched: true, target: params.target, deltaX: params.deltaX, deltaY: params.deltaY };
+      }
+      if (method === "ui.click" || method === "ui.type" || method === "ui.drag") {
+        return { dispatched: true, method, params };
+      }
+      if (method === "ui.screenshot") {
+        return {
+          image: { data: Buffer.from("fake-png-bytes").toString("base64"), mimeType: "image/png" },
+          width: 120,
+          height: 80,
+          viewport: { width: 120, height: 80, devicePixelRatio: 1 },
+        };
+      }
+      if (method === "ui.insert_line") {
+        if (!useNativeInsertLine) {
+          throw new BridgeRpcError("unknown_method", "Unknown Vault Bridge method 'ui.insert_line'.");
+        }
+        return { inserted: true, via: "ui.insert_line", target: params.target, text: params.text };
+      }
+      if (method === "ui.batch") {
+        return { ok: true, via: "ui.batch", steps: params.steps };
+      }
+      if (
+        method === "ui.wait_for" ||
+        method === "vault.list_files" ||
+        method === "vault.search" ||
+        method === "workspace.open_note" ||
+        method === "canvas.upsert_node"
+      ) {
+        return { ok: true, method, params };
+      }
+      if (method === "ui.locate") {
+        if (forceLocateDenied) {
+          throw new BridgeRpcError("permission_denied", "Method 'ui.locate' requires a higher Vault Control Bridge permission tier.");
+        }
+        if (!useNativeLocate) {
+          throw new BridgeRpcError("unknown_method", "Unknown Vault Bridge method 'ui.locate'.");
+        }
+        return {
+          found: true,
+          path: params.note ?? params.path,
+          note: params.note,
+          heading: params.heading,
+          after: params.after,
+          at: params.at,
+          pane: "leaf-native",
+          line: params.line ?? 5,
+          text: "- Target line to locate",
+          point: { x: 1410, y: 412 },
+          rect: { x: 1086, y: 400, width: 357, height: 24 },
+          selector: ".native",
+          scrolled: false,
+        };
+      }
+      if (method === "ui.inspect") {
+        const sel = typeof params.selector === "string" ? params.selector : "";
+        const txt = typeof params.text === "string" ? params.text : "";
+        if (sel === ".view-header-title") {
+          if (blankMode) {
+            return {
+              viewport: { width: 1920, height: 1080, devicePixelRatio: 1 },
+              total: 1,
+              truncated: false,
+              elements: [
+                { selector: ".p1 .view-header-title", tag: "div", role: null, label: "", text: "Blank", disabled: false, rect: { x: 1086, y: 80, width: 357, height: 30 } },
+              ],
+            };
+          }
+          if (stackedMode) {
+            return {
+              viewport: { width: 1920, height: 1080, devicePixelRatio: 1 },
+              total: 2,
+              truncated: false,
+              elements: [
+                { selector: ".p1 .view-header-title", tag: "div", role: null, label: "", text: "Top", disabled: false, rect: { x: 1086, y: 80, width: 357, height: 30 } },
+                { selector: ".p2 .view-header-title", tag: "div", role: null, label: "", text: "Bottom", disabled: false, rect: { x: 1086, y: 520, width: 357, height: 30 } },
+              ],
+            };
+          }
+          if (openNotesOverride) {
+            return {
+              viewport: { width: 1920, height: 1080, devicePixelRatio: 1 },
+              total: 2,
+              truncated: false,
+              elements: [
+                { selector: ".p1 .view-header-title", tag: "div", role: null, label: "", text: "Shared", disabled: false, rect: { x: 1086, y: 80, width: 357, height: 30 } },
+                { selector: ".p2 .view-header-title", tag: "div", role: null, label: "", text: "Shared", disabled: false, rect: { x: 1519, y: 80, width: 357, height: 30 } },
+              ],
+            };
+          }
+          return {
+            viewport: { width: 1920, height: 1080, devicePixelRatio: 1 },
+            total: 2,
+            truncated: false,
+            elements: [
+              { selector: ".p1 .view-header-title", tag: "div", role: null, label: "", text: "Mission Board", disabled: false, rect: { x: 1086, y: 80, width: 357, height: 30 } },
+              { selector: ".p2 .view-header-title", tag: "div", role: null, label: "", text: "Crew Chat", disabled: false, rect: { x: 1519, y: 80, width: 357, height: 30 } },
+            ],
+          };
+        }
+        if (sel.includes(".cm-line")) {
+          if (blankMode) {
+            return {
+              viewport: { width: 1920, height: 1080, devicePixelRatio: 1 },
+              total: 2,
+              truncated: false,
+              elements: [
+                { selector: ".p1 .cm-line:nth-child(1)", tag: "div", role: null, label: "", text: "", disabled: false, rect: { x: 1086, y: 150, width: 357, height: 24 } },
+                { selector: ".p1 .cm-line:nth-child(2)", tag: "div", role: null, label: "", text: "", disabled: false, rect: { x: 1086, y: 174, width: 357, height: 24 } },
+              ],
+            };
+          }
+          if (stackedMode) {
+            const stackedEls = [
+              { selector: ".top .cm-line:nth-child(1)", tag: "div", role: null, label: "", text: "Top body", disabled: false, rect: { x: 1086, y: 150, width: 357, height: 24 } },
+              { selector: ".bottom .cm-line:nth-child(2)", tag: "div", role: null, label: "", text: "- Bottom body", disabled: false, rect: { x: 1086, y: 600, width: 357, height: 24 } },
+            ];
+            const filtered = txt ? stackedEls.filter((e) => e.text.includes(txt)) : stackedEls;
+            return { viewport: { width: 1920, height: 1080, devicePixelRatio: 1 }, total: filtered.length, truncated: false, elements: filtered };
+          }
+          const baseVisible = [
+            { selector: ".p1 .cm-line:nth-child(3)", tag: "div", role: null, label: "", text: "agy2: How agents share one note", disabled: false, rect: { x: 1086, y: 260, width: 357, height: 28 } },
+            { selector: ".p1 .cm-line:nth-child(4)", tag: "div", role: null, label: "", text: "- Line one", disabled: false, rect: { x: 1086, y: 288, width: 357, height: 24 } },
+            { selector: ".p2 .cm-line:nth-child(1)", tag: "div", role: null, label: "", text: "Crew Chat", disabled: false, rect: { x: 1519, y: 154, width: 357, height: 47 } },
+          ];
+          if (scrollCount > 0 || txt.includes("Target")) {
+            baseVisible.push({
+              selector: ".p1 .cm-line:nth-child(5)",
+              tag: "div",
+              role: null,
+              label: "",
+              text: "- Target line to locate",
+              disabled: false,
+              rect: { x: 1086, y: 312, width: 357, height: 24 },
+            });
+          }
+          const filtered = txt ? baseVisible.filter((e) => e.text.includes(txt)) : baseVisible;
+          return {
+            viewport: { width: 1920, height: 1080, devicePixelRatio: 1 },
+            total: filtered.length,
+            truncated: false,
+            elements: filtered,
+          };
+        }
+        return { viewport: { width: 1920, height: 1080, devicePixelRatio: 1 }, total: 0, truncated: false, elements: [] };
+      }
+      throw new Error(`Unexpected method ${method}`);
+    };
+
+    const server = new VaultBridgeServer({
+      socketPath: kit.socketPath,
+      dispatcher: (method, params) => dispatcher(method, params),
+    });
+    await server.start();
+    try {
+      provisionRuntimeKit({ kit, token: server.getAuthToken(), vaultName: "HelpVault", vaultPath: vaultDir });
+      const env = {
+        ...process.env,
+        ...buildBridgeEnvForPanes({ kit, token: server.getAuthToken(), vaultName: "HelpVault", vaultPath: vaultDir }),
+      };
+      const corePyPath = path.join(kit.binDir, "obs-herdr-core.py");
+
+      for (const [cmd, baseArgs] of [
+        [kit.cliScriptPath, []],
+        ["python3", [corePyPath]],
+      ] as Array<[string, string[]]>) {
+        useNativeLocate = false;
+        useNativeInsertLine = false;
+
+        const mainHelp = await execFileAsync(cmd, [...baseArgs, "--help"], { env });
+        assert.ok(mainHelp.stdout.includes("25 tools"), `${cmd} --help derives 25 tools`);
+        assert.ok(mainHelp.stdout.includes("press_key") && mainHelp.stdout.includes("insert_line"), `${cmd} --help includes ui batch schema with insert_line`);
+        assert.ok(
+          mainHelp.stdout.includes("obs-herdr ui insert-line") &&
+            mainHelp.stdout.includes("proof returned by `insert-line`") &&
+            mainHelp.stdout.includes("Do not run `ui inspect` or `ui locate` before anchored actions") &&
+            mainHelp.stdout.includes("screenshot` only on failure or when asked"),
+          `${cmd} --help documents lean multi-agent shared-note recipe`
+        );
+
+        const skillOut = await execFileAsync(cmd, [...baseArgs, "--skill"], { env });
+        assert.equal(skillOut.stdout, mainHelp.stdout, `${cmd} --skill and --help match`);
+
+        const uiHelp = await execFileAsync(cmd, [...baseArgs, "ui", "--help"], { env });
+        assert.ok(uiHelp.stdout.includes("obs-herdr ui locate") && uiHelp.stdout.includes("obs-herdr ui insert-line"), `${cmd} ui --help lists ui locate and ui insert-line`);
+        assert.ok(
+          uiHelp.stdout.includes("skip `ui inspect` before anchored actions") &&
+            uiHelp.stdout.includes("proof returned by `ui insert-line`") &&
+            uiHelp.stdout.includes("only on failure or when asked"),
+          `${cmd} ui --help documents lean UI recipe`
+        );
+
+        const batchHelp = await execFileAsync(cmd, [...baseArgs, "ui", "batch", "--help"], { env });
+        assert.ok(batchHelp.stdout.includes('"action":"insert_line"') && batchHelp.stdout.includes('"heading":"agy2: How agents share one note"'), `${cmd} ui batch --help shows worked insert_line + anchor example`);
+
+        const locateHelp = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "--help"], { env });
+        assert.ok(
+          locateHelp.stdout.includes("--note") && locateHelp.stdout.includes("--heading") && locateHelp.stdout.includes("--after") && locateHelp.stdout.includes("--at"),
+          `${cmd} ui locate --help documents anchor flags`
+        );
+
+        const insertLineHelp = await execFileAsync(cmd, [...baseArgs, "ui", "insert-line", "--help"], { env });
+        assert.ok(
+          insertLineHelp.stdout.includes("--note") &&
+            insertLineHelp.stdout.includes("--heading") &&
+            insertLineHelp.stdout.includes("--stdin") &&
+            insertLineHelp.stdout.includes("Returns proof") &&
+            insertLineHelp.stdout.includes("no separate read-back"),
+          `${cmd} ui insert-line --help documents flags and proof`
+        );
+
+        const screenshotHelp = await execFileAsync(cmd, [...baseArgs, "ui", "screenshot", "--help"], { env });
+        assert.ok(
+          screenshotHelp.stdout.includes("only on failure or when asked"),
+          `${cmd} ui screenshot --help documents lean screenshot guidance`
+        );
+
+        const inspectHelp = await execFileAsync(cmd, [...baseArgs, "ui", "inspect", "--help"], { env });
+        assert.ok(
+          inspectHelp.stdout.includes("Do not run before anchored note actions"),
+          `${cmd} ui inspect --help warns against running before anchored actions`
+        );
+
+        const dragHelp = await execFileAsync(cmd, [...baseArgs, "ui", "drag", "--help"], { env });
+        assert.ok(dragHelp.stdout.includes("--from-note") && dragHelp.stdout.includes("--to-note"), `${cmd} ui drag --help documents anchor targets`);
+
+        await assert.rejects(execFileAsync(cmd, [...baseArgs, "ui", "nope", "--help"], { env }), /Unknown obs-herdr command/);
+
+        const inspectOut = await execFileAsync(cmd, [...baseArgs, "ui", "inspect", "--text", "Target line"], { env });
+        const inspected = JSON.parse(inspectOut.stdout) as {
+          total: number;
+          elements: Array<{ text: string; notePath?: string; pane?: string }>;
+        };
+        assert.equal(inspected.total, 1);
+        assert.equal(inspected.elements[0].notePath, "Crew Test/Mission Board.md");
+        assert.equal(inspected.elements[0].pane, "pane-1");
+
+        scrollCount = 0;
+        const locateByLine = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "Crew Test/Mission Board.md", "--line", "5"], { env });
+        const locatedLine = JSON.parse(locateByLine.stdout) as {
+          found: boolean;
+          path: string;
+          pane: string;
+          point: { x: number; y: number };
+          scrolled: boolean;
+        };
+        assert.equal(locatedLine.found, true);
+        assert.equal(locatedLine.path, "Crew Test/Mission Board.md");
+        assert.equal(locatedLine.pane, "pane-1");
+        assert.equal(locatedLine.scrolled, true);
+        assert.equal(locatedLine.point.x, 1431);
+        assert.equal(locatedLine.point.y, 324);
+
+        const locateByHeadingStart = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--heading", "agy2: How agents share one note", "--at", "start"],
+          { env }
+        );
+        const locatedHeading = JSON.parse(locateByHeadingStart.stdout) as { found: boolean; line: number; point: { x: number; y: number } };
+        assert.equal(locatedHeading.found, true);
+        assert.equal(locatedHeading.line, 3);
+        assert.equal(locatedHeading.point.x, 1094);
+
+        const locateByAfter = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--after", "- Line one"],
+          { env }
+        );
+        const locatedAfter = JSON.parse(locateByAfter.stdout) as { found: boolean; line: number; point: { x: number; y: number } };
+        assert.equal(locatedAfter.found, true);
+        assert.equal(locatedAfter.line, 4);
+
+        const locateByText = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "Crew Test/Mission Board.md", "--text", "Line one"], { env });
+        const locatedText = JSON.parse(locateByText.stdout) as { found: boolean; line: number; point: { x: number; y: number } };
+        assert.equal(locatedText.found, true);
+        assert.equal(locatedText.line, 4);
+        assert.equal(locatedText.point.y, 300);
+
+        const clickOut = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "click", "--note", "Crew Test/Mission Board.md", "--heading", "## Findings", "--at", "end"],
+          { env }
+        );
+        const clicked = JSON.parse(clickOut.stdout) as { params: { target: Record<string, unknown> } };
+        assert.deepEqual(clicked.params.target, { note: "Crew Test/Mission Board.md", heading: "## Findings", at: "end" });
+
+        const typeTextOut = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "type", "--note", "Crew Test/Mission Board.md", "--after", "- Line one", "--text", "typed text"],
+          { env }
+        );
+        const typedText = JSON.parse(typeTextOut.stdout) as { params: { text: string; target: Record<string, unknown> } };
+        assert.equal(typedText.params.text, "typed text");
+        assert.deepEqual(typedText.params.target, { note: "Crew Test/Mission Board.md", after: "- Line one" });
+
+        const typeStdinOut = await runWithStdin(
+          cmd,
+          [...baseArgs, "ui", "type", "--note", "Crew Test/Mission Board.md", "--line", "4", "--at", "start", "--stdin"],
+          "stdin text",
+          env
+        );
+        const typedStdin = JSON.parse(typeStdinOut.stdout) as { params: { text: string; target: Record<string, unknown> } };
+        assert.equal(typedStdin.params.text, "stdin text");
+        assert.deepEqual(typedStdin.params.target, { note: "Crew Test/Mission Board.md", line: 4, at: "start" });
+
+        const scrollOut = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "scroll", "--note", "Crew Test/Mission Board.md", "--line", "5", "--dy", "120"],
+          { env }
+        );
+        const scrolledRes = JSON.parse(scrollOut.stdout) as { target: Record<string, unknown>; deltaY: number };
+        assert.deepEqual(scrolledRes.target, { note: "Crew Test/Mission Board.md", line: 5 });
+        assert.equal(scrolledRes.deltaY, 120);
+
+        const dragOut = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "drag", "--from-note", "A.md", "--from-line", "2", "--to-note", "B.md", "--to-heading", "## Done", "--to-at", "end"],
+          { env }
+        );
+        const dragged = JSON.parse(dragOut.stdout) as { params: { from: Record<string, unknown>; to: Record<string, unknown> } };
+        assert.deepEqual(dragged.params.from, { note: "A.md", line: 2 });
+        assert.deepEqual(dragged.params.to, { note: "B.md", heading: "## Done", at: "end" });
+
+        const insertFallbackOut = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "insert-line", "--note", "Crew Test/Mission Board.md", "--heading", "## agy2: How agents share one note", "--at", "end", "--text", "- Added line"],
+          { env }
+        );
+        const insertFallback = JSON.parse(insertFallbackOut.stdout) as { via: string; steps: Array<{ action: string; target: Record<string, unknown>; text: string }> };
+        assert.equal(insertFallback.via, "ui.batch");
+        assert.deepEqual(insertFallback.steps, [{
+          action: "insert_line",
+          target: { note: "Crew Test/Mission Board.md", heading: "## agy2: How agents share one note", at: "end" },
+          text: "- Added line",
+        }]);
+
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Dup.md", "--line", "3"], { env }),
+          /multiple lines/
+        );
+
+        blankMode = true;
+        try {
+          await assert.rejects(
+            execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Blank.md", "--line", "2"], { env }),
+            /Could not locate line 2/
+          );
+        } finally {
+          blankMode = false;
+        }
+
+        stackedMode = true;
+        try {
+          const stackedLocate = await execFileAsync(
+            cmd,
+            [...baseArgs, "ui", "locate", "--note", "Bottom.md", "--line", "2"],
+            { env }
+          );
+          const stackedJson = JSON.parse(stackedLocate.stdout) as { pane: string; point: { y: number } };
+          assert.equal(stackedJson.pane, "pane-2");
+          assert.equal(stackedJson.point.y, 612);
+        } finally {
+          stackedMode = false;
+        }
+
+        forceLocateDenied = true;
+        try {
+          await assert.rejects(
+            execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--line", "5"], { env }),
+            /permission_denied/
+          );
+        } finally {
+          forceLocateDenied = false;
+        }
+
+        openNotesOverride = ["A/Shared.md", "B/Shared.md"];
+        try {
+          await assert.rejects(
+            execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "B/Shared.md", "--line", "2"], { env }),
+            /ambiguous across multiple open notes/
+          );
+        } finally {
+          openNotesOverride = null;
+        }
+
+        useNativeLocate = true;
+        useNativeInsertLine = true;
+        const nativeOut = await execFileAsync(
+          cmd,
+          [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--line", "5", "--at", "start"],
+          { env }
+        );
+        const nativeJson = JSON.parse(nativeOut.stdout) as { pane: string; point: { x: number; y: number }; at: string };
+        assert.equal(nativeJson.pane, "leaf-native");
+        assert.equal(nativeJson.point.x, 1410);
+        assert.equal(nativeJson.at, "start");
+
+        const nativeInsertOut = await runWithStdin(
+          cmd,
+          [...baseArgs, "ui", "insert-line", "--note", "Crew Test/Mission Board.md", "--after", "- Line one", "--at", "end", "--stdin"],
+          "- Native stdin line",
+          env
+        );
+        const nativeInsert = JSON.parse(nativeInsertOut.stdout) as { via: string; target: Record<string, unknown>; text: string };
+        assert.equal(nativeInsert.via, "ui.insert_line");
+        assert.deepEqual(nativeInsert.target, { note: "Crew Test/Mission Board.md", after: "- Line one", at: "end" });
+        assert.equal(nativeInsert.text, "- Native stdin line");
+
+        // Round 4 CLI parity: --output alias works and unknown/incomplete ui flags fail cleanly
+        const aliasPath = path.join(tmpBase, `shot-${path.basename(cmd)}-1.png`);
+        const aliasEqPath = path.join(tmpBase, `shot-${path.basename(cmd)}-2.png`);
+        const aliasRes = await execFileAsync(cmd, [...baseArgs, "ui", "screenshot", "--output", aliasPath], { env });
+        const aliasJson = JSON.parse(aliasRes.stdout) as { path: string };
+        assert.equal(aliasJson.path, path.resolve(aliasPath));
+        assert.equal(fs.readFileSync(aliasPath, "utf8"), "fake-png-bytes");
+
+        const aliasEqRes = await execFileAsync(cmd, [...baseArgs, "ui", "screenshot", `--output=${aliasEqPath}`], { env });
+        const aliasEqJson = JSON.parse(aliasEqRes.stdout) as { path: string };
+        assert.equal(aliasEqJson.path, path.resolve(aliasEqPath));
+        assert.equal(fs.readFileSync(aliasEqPath, "utf8"), "fake-png-bytes");
+
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "screenshot", "--bogus", "val"], { env }),
+          /Unknown flag '--bogus'/
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "screenshot", "--output"], { env }),
+          /Missing value for flag '--output'/
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "screenshot", "-o", aliasPath], { env }),
+          /Unknown flag '-o'/
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "screenshot", "--out", aliasPath, "--output", aliasEqPath], { env }),
+          /Conflicting values/
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "inspect", "--bogus", "1"], { env }),
+          /Unknown flag '--bogus'/
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--line", "1", "--bogus", "1"], { env }),
+          /Unknown flag '--bogus'/
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "click", "--x", "10", "--y", "20", "--bogus", "1"], { env }),
+          /Unknown flag '--bogus'/
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "insert-line", "--note", "Crew Test/Mission Board.md", "--heading", "h", "--text", "t", "--bogus", "1"], { env }),
+          /Unknown flag '--bogus'/
+        );
+
+        // Round 6 P2-4: Node & Python numeric flag validation parity
+        useNativeLocate = true;
+        for (const badLine of ["0", "01", "+1", "1.0", "1e2", "0x1", "-1", "abc", ""]) {
+          await assert.rejects(
+            execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--line", badLine], { env }),
+            /--line must be a positive integer\./,
+            `${cmd} ui locate should reject noncanonical --line=${JSON.stringify(badLine)}`
+          );
+        }
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "drag", "--from-note", "Crew Test/Mission Board.md", "--from-line", "01", "--to-selector", ".cm-content"], { env }),
+          /--from-line must be a positive integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "drag", "--from-selector", ".cm-content", "--to-note", "Crew Test/Mission Board.md", "--to-line", "1.0"], { env }),
+          /--to-line must be a positive integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "inspect", "--limit", "01"], { env }),
+          /--limit must be a positive integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "click", "--x", "10", "--y", "20", "--count", "0"], { env }),
+          /--count must be a positive integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "drag", "--from-x", "10", "--from-y", "20", "--to-x", "30", "--to-y", "40", "--steps", "01"], { env }),
+          /--steps must be a positive integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "screenshot", "--max-width", "1e2"], { env }),
+          /--max-width must be a positive integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "wait", "Target", "--timeout", "-1"], { env }),
+          /--timeout must be a non-negative integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "wait", "Target", "--timeout", "01"], { env }),
+          /--timeout must be a non-negative integer\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "scroll", "--x", "abc", "--y", "10"], { env }),
+          /--x must be a finite number\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "scroll", "--x", "10", "--y", "10", "--dy", "NaN"], { env }),
+          /--dy must be a finite number\./
+        );
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "workspace", "open", "Crew Test/Mission Board.md", "--line", "01"], { env }),
+          /--line must be a positive integer\./
+        );
+
+        // Canonical forms succeed identically in Node and Python
+        const waitZero = JSON.parse((await execFileAsync(cmd, [...baseArgs, "ui", "wait", "Target", "--timeout", "0"], { env })).stdout) as { params: { timeoutMs: number } };
+        assert.equal(waitZero.params.timeoutMs, 0);
+        const scrollNeg = JSON.parse((await execFileAsync(cmd, [...baseArgs, "ui", "scroll", "--x", "10.5", "--y", "20", "--dx", "-2.5", "--dy", "120"], { env })).stdout) as { target: { x: number; y: number }; deltaX: number; deltaY: number };
+        assert.deepEqual(scrollNeg.target, { x: 10.5, y: 20 });
+        assert.equal(scrollNeg.deltaX, -2.5);
+        assert.equal(scrollNeg.deltaY, 120);
+        const canonicalSteps = JSON.parse((await execFileAsync(cmd, [...baseArgs, "ui", "drag", "--from-note", "Crew Test/Mission Board.md", "--from-line", "5", "--to-selector", ".cm-content", "--steps", "4"], { env })).stdout) as { params: { from: { note: string; line: number }; steps: number } };
+        assert.equal(canonicalSteps.params.from.line, 5);
+        assert.equal(canonicalSteps.params.steps, 4);
+
+        // Round 6 P2-5: help/skill text uses real insert-line proof field names (path, pane, line, text, heading) and documents protected areas + typing speed
+        const skillText = (await execFileAsync(cmd, [...baseArgs, "--skill"], { env })).stdout;
+        assert.ok(!skillText.includes("returns proof (text, line, heading, notePath)"), `${cmd} --skill must not cite stale notePath proof field`);
+        assert.ok(skillText.includes("returns proof (path, pane, line, text, heading, durationMs)"), `${cmd} --skill must cite real insert-line proof fields`);
+        assert.ok(skillText.includes("allowUiInProtectedAreas") && skillText.includes("uiTypingSpeed"), `${cmd} --skill must mention protected-area and typing-speed settings`);
+        const insertLineHelpText = (await execFileAsync(cmd, [...baseArgs, "ui", "insert-line", "--help"], { env })).stdout;
+        assert.ok(insertLineHelpText.includes("path, pane, line, text, heading, durationMs"), `${cmd} ui insert-line --help must cite exact proof fields`);
+      }
+
+      const readme = fs.readFileSync(path.resolve("README.md"), "utf8");
+      assert.ok(readme.includes("obs-herdr mcp   # stdio MCP server, 25 tools"), "README.md must list 25 MCP tools");
+      assert.ok(!readme.includes("24 tools"), "README.md must not contain stale 24 tools count");
+      assert.ok(readme.includes("allowUiInProtectedAreas") || readme.includes("protected areas"), "README.md must document protected-area limits");
+      assert.ok(readme.includes("uiTypingSpeed") || readme.includes("Visible") && readme.includes("Fast"), "README.md must document typing speed setting");
+      assert.ok(readme.includes("insert-line") && readme.includes("path") && readme.includes("pane") && readme.includes("heading"), "README.md must document insert-line proof fields");
+    } finally {
+      await server.stop();
+      fs.rmSync(tmpBase, { recursive: true, force: true });
+    }
+  });
+
+  it("serves fresh live-editor vault.read_note buffers and enforces ui.locate/ui.insert_line/waitFor tiers and caller labels", async () => {
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-freshness-routing-"));
+    const vaultDir = path.join(tmpBase, "vault");
+    fs.mkdirSync(vaultDir, { recursive: true });
+    fs.writeFileSync(path.join(vaultDir, "Shared.md"), "disk copy α", "utf8");
+    fs.writeFileSync(path.join(vaultDir, "DiskOnly.md"), "only on disk β", "utf8");
+
+    const mockApp = createMockObsidianApp(vaultDir, "FreshVault");
+    const sharedFile = mockApp.vault.getAbstractFileByPath("Shared.md");
+    const diskOnlyFile = mockApp.vault.getAbstractFileByPath("DiskOnly.md");
+
+    const activeSourceView = Object.assign(new MarkdownView(), {
+      file: sharedFile,
+      getMode: () => "source",
+      editor: {
+        ...new MarkdownView().editor,
+        getValue: () => "active split edit γ",
+      },
+    });
+    const staleSplitView = Object.assign(new MarkdownView(), {
+      file: sharedFile,
+      getMode: () => "source",
+      editor: {
+        ...new MarkdownView().editor,
+        getValue: () => "older split buffer",
+      },
+    });
+    const previewOnlyView = Object.assign(new MarkdownView(), {
+      file: diskOnlyFile,
+      getMode: () => "preview",
+      editor: {
+        ...new MarkdownView().editor,
+        getValue: () => "ignored preview buffer",
+      },
+    });
+
+    (mockApp.workspace as unknown as {
+      getActiveViewOfType: () => MarkdownView | null;
+      iterateAllLeaves: (cb: (leaf: { view: unknown }) => void) => void;
+    }).getActiveViewOfType = () => activeSourceView;
+    (mockApp.workspace as unknown as {
+      iterateAllLeaves: (cb: (leaf: { view: unknown }) => void) => void;
+    }).iterateAllLeaves = (cb) => {
+      cb({ view: staleSplitView });
+      cb({ view: activeSourceView });
+      cb({ view: previewOnlyView });
+    };
+
+    const recordedCalls: Array<{ method: string; caller?: string; params: Record<string, unknown> }> = [];
+    const uiStub = {
+      isAvailable: () => true,
+      locate: async (params: Record<string, unknown>, caller?: string) => {
+        recordedCalls.push({ method: "ui.locate", caller, params });
+        return { found: true, caller };
+      },
+      insertLine: async (params: Record<string, unknown>, caller?: string) => {
+        recordedCalls.push({ method: "ui.insert_line", caller, params });
+        return { inserted: true, caller };
+      },
+      waitFor: async (params: Record<string, unknown>, caller?: string) => {
+        recordedCalls.push({ method: "ui.wait_for", caller, params });
+        return { matched: true, caller };
+      },
+    };
+
+    let mode: VaultPermissionMode = "read-only";
+    let allowUiControl = true;
+    const vaultOps = new VaultOpsService({
+      app: mockApp as unknown as App,
+      getPermissionMode: () => mode,
+      getAllowHiddenReads: () => false,
+      uiControl: uiStub as unknown as UiControlService,
+      getAllowUiControl: () => allowUiControl,
+    });
+    const kit = computeRuntimePaths(vaultDir, path.join(tmpBase, "runtime"));
+    const server = new VaultBridgeServer({
+      socketPath: kit.socketPath,
+      dispatcher: (method, params, caller) => vaultOps.dispatch(method, params, caller),
+    });
+    await server.start();
+
+    try {
+      provisionRuntimeKit({
+        kit,
+        token: server.getAuthToken(),
+        vaultName: "FreshVault",
+        vaultPath: vaultDir,
+      });
+      const env = {
+        ...process.env,
+        ...buildBridgeEnvForPanes({
+          kit,
+          token: server.getAuthToken(),
+          vaultName: "FreshVault",
+          vaultPath: vaultDir,
+        }),
+        HERDR_PANE_ID: "pane-cli",
+      };
+      const corePyPath = path.join(kit.binDir, "obs-herdr-core.py");
+
+      const liveRead = (await vaultOps.dispatch("vault.read_note", { path: "Shared.md" }, "agy2")) as {
+        content: string;
+        size: number;
+        source: string;
+        conflictingBuffers: boolean;
+        metadataSource: string;
+      };
+      assert.equal(liveRead.content, "active split edit γ");
+      assert.equal(liveRead.source, "editor");
+      assert.equal(liveRead.conflictingBuffers, true);
+      assert.equal(liveRead.metadataSource, "cache");
+      assert.equal(liveRead.size, Buffer.byteLength("active split edit γ", "utf8"));
+
+      const previewFallback = (await vaultOps.dispatch("vault.read_note", { path: "DiskOnly.md" }, "agy2")) as {
+        content: string;
+        source: string;
+        conflictingBuffers: boolean;
+      };
+      assert.equal(previewFallback.content, "only on disk β");
+      assert.equal(previewFallback.source, "vault");
+      assert.equal(previewFallback.conflictingBuffers, false);
+
+      // Real permission dispatcher + runtime CLI end-to-end (R1-2): ui locate succeeds natively at read-only tier
+      for (const [cmd, baseArgs] of [
+        [kit.cliScriptPath, []],
+        ["python3", [corePyPath]],
+      ] as Array<[string, string[]]>) {
+        const cliLocate = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Shared.md", "--line", "1"], { env });
+        const cliLocateJson = JSON.parse(cliLocate.stdout) as { found: boolean; caller: string };
+        assert.equal(cliLocateJson.found, true);
+        assert.equal(cliLocateJson.caller, "herdr:pane-cli");
+      }
+
+      // Disabled UI control must fail honestly without silently entering locate fallback
+      allowUiControl = false;
+      for (const [cmd, baseArgs] of [
+        [kit.cliScriptPath, []],
+        ["python3", [corePyPath]],
+      ] as Array<[string, string[]]>) {
+        await assert.rejects(
+          execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Shared.md", "--line", "1"], { env }),
+          /ui_control_disabled/
+        );
+      }
+      allowUiControl = true;
+
+      await vaultOps.dispatch("ui.locate", { note: "Shared.md", line: 1 }, "agy2-pane");
+      await vaultOps.dispatch("ui.wait_for", { text: "gamma" }, "agy2-wait");
+
+      mode = "read-write";
+      await assert.rejects(
+        () => vaultOps.dispatch("ui.insert_line", { target: { note: "Shared.md", line: 1 }, text: "x" }, "agy2"),
+        /requires a higher Vault Control Bridge permission tier/
+      );
+
+      mode = "full";
+      await vaultOps.dispatch("ui.insert_line", { target: { note: "Shared.md", line: 1 }, text: "ok" }, "agy2-writer");
+      assert.deepEqual(recordedCalls, [
+        { method: "ui.locate", caller: "herdr:pane-cli", params: { note: "Shared.md", path: "Shared.md", line: 1 } },
+        { method: "ui.locate", caller: "herdr:pane-cli", params: { note: "Shared.md", path: "Shared.md", line: 1 } },
+        { method: "ui.locate", caller: "agy2-pane", params: { note: "Shared.md", line: 1 } },
+        { method: "ui.wait_for", caller: "agy2-wait", params: { text: "gamma" } },
+        { method: "ui.insert_line", caller: "agy2-writer", params: { target: { note: "Shared.md", line: 1 }, text: "ok" } },
+      ]);
     } finally {
       await server.stop();
       fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -743,6 +1557,770 @@ describe("Live Herdr 0.8.2 Daemon Integration (isolated config & session)", () =
       await cli.stopNamedSession(sessionName).catch(() => undefined);
       await bridgeServer.stop();
       fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+interface MockCursorElement {
+  cls: string;
+  classes: Set<string>;
+  textContent: string;
+  style: {
+    transform: string;
+    props: Record<string, string>;
+    setProperty(name: string, val: string): void;
+  };
+  children: MockCursorElement[];
+  parent: MockCursorElement[] | null;
+  removed: boolean;
+  readonly isConnected: boolean;
+  classList: {
+    add(...names: string[]): void;
+    remove(...names: string[]): void;
+    toggle(name: string, force?: boolean): boolean;
+    contains(name: string): boolean;
+  };
+  createDiv(opts?: { cls?: string; text?: string }): MockCursorElement;
+  createSpan(opts?: { cls?: string; text?: string }): MockCursorElement;
+  appendChild(child: MockCursorElement): MockCursorElement;
+  setAttribute(name: string, val: string): void;
+  remove(): void;
+}
+
+function makeCursorMockEl(opts?: { cls?: string; text?: string }): MockCursorElement {
+  const classes = new Set((opts?.cls ?? "").split(/\s+/).filter(Boolean));
+  const children: MockCursorElement[] = [];
+  const props: Record<string, string> = {};
+  const el: MockCursorElement = {
+    cls: opts?.cls ?? "",
+    classes,
+    textContent: opts?.text ?? "",
+    style: {
+      transform: "",
+      props,
+      setProperty(name: string, val: string) {
+        props[name] = val;
+      },
+    },
+    children,
+    parent: null,
+    removed: false,
+    get isConnected() {
+      return !el.removed;
+    },
+    classList: {
+      add(...names: string[]) {
+        for (const n of names) {
+          classes.add(n);
+        }
+      },
+      remove(...names: string[]) {
+        for (const n of names) {
+          classes.delete(n);
+        }
+      },
+      toggle(name: string, force?: boolean) {
+        const shouldAdd = force !== undefined ? force : !classes.has(name);
+        if (shouldAdd) {
+          classes.add(name);
+        } else {
+          classes.delete(name);
+        }
+        return shouldAdd;
+      },
+      contains(name: string) {
+        return classes.has(name);
+      },
+    },
+    createDiv(childOpts?: { cls?: string; text?: string }) {
+      const child = makeCursorMockEl(childOpts);
+      child.parent = children;
+      children.push(child);
+      return child;
+    },
+    createSpan(childOpts?: { cls?: string; text?: string }) {
+      const child = makeCursorMockEl(childOpts);
+      child.parent = children;
+      children.push(child);
+      return child;
+    },
+    appendChild(child: MockCursorElement) {
+      child.parent = children;
+      children.push(child);
+      return child;
+    },
+    setAttribute() {
+      // No-op stub for SVG attributes in Node tests
+    },
+    remove() {
+      el.removed = true;
+      if (el.parent) {
+        const idx = el.parent.indexOf(el);
+        if (idx >= 0) {
+          el.parent.splice(idx, 1);
+        }
+      }
+    },
+  };
+  return el;
+}
+
+function makeCursorMockWin(reducedMotion = true) {
+  const body = makeCursorMockEl({ cls: "body" });
+  return {
+    body,
+    win: {
+      innerWidth: 1280,
+      innerHeight: 800,
+      document: {
+        body,
+        createElementNS: () => makeCursorMockEl({ cls: "svg" }),
+      },
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      requestAnimationFrame: (cb: (t: number) => void) =>
+        globalThis.setTimeout(() => cb(Date.now()), 8) as unknown as number,
+      cancelAnimationFrame: (id: number) => globalThis.clearTimeout(id),
+      matchMedia: () => ({ matches: reducedMotion }),
+    } as unknown as Window,
+  };
+}
+
+describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and lifecycle", () => {
+  it("keeps parked agent dimmed at its note caret and re-anchors when lines are inserted above", async () => {
+    const { win, body } = makeCursorMockWin(true);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 30 });
+
+    let docText = "# Title\nLine one here\nLine two here\n";
+    let scrollOffset = 0;
+    const listeners = new Map<string, Array<() => void>>();
+    const scrollDom = {
+      addEventListener(type: string, fn: () => void) {
+        const arr = listeners.get(type) ?? [];
+        arr.push(fn);
+        listeners.set(type, arr);
+      },
+      removeEventListener(type: string, fn: () => void) {
+        const arr = listeners.get(type) ?? [];
+        listeners.set(
+          type,
+          arr.filter((item) => item !== fn)
+        );
+      },
+      getBoundingClientRect() {
+        return { top: 100, bottom: 320, left: 0, right: 900, width: 900, height: 220 };
+      },
+    } as unknown as HTMLElement;
+
+    const lineCoordsForPos = (pos: number) => {
+      const before = docText.slice(0, pos);
+      const lineIndex = before.split("\n").length - 1;
+      const top = 120 + lineIndex * 24 - scrollOffset;
+      return { left: 260, right: 262, top, bottom: top + 20 };
+    };
+
+    const cm: CursorCodeMirrorLike = {
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+      },
+      coordsAtPos: lineCoordsForPos,
+      scrollDOM: scrollDom,
+    };
+
+    try {
+      const lineTwoStart = docText.indexOf("Line two here");
+      const startCoords = lineCoordsForPos(lineTwoStart);
+
+      overlay.setTyping("herdr:w1:p4#agy2", "agy2 (w1:p4)", startCoords.left, startCoords.top, {
+        notePath: "Notes/Plan.md",
+        pane: "w1:p4",
+        pos: lineTwoStart,
+        cm,
+      });
+
+      const layer = body.children[0];
+      const cursorEl = layer.children[0];
+      const pillEl = cursorEl.children[2];
+      const labelEl = pillEl.children[0];
+      const actionEl = pillEl.children[1];
+
+      assert.equal(labelEl.textContent, "agy2");
+      assert.equal(actionEl.textContent, "typing");
+      assert.equal(cursorEl.classes.has("is-typing"), true);
+
+      overlay.finishTyping("herdr:w1:p4#agy2");
+      assert.equal(actionEl.textContent, "");
+      assert.equal(actionEl.classes.has("is-visible"), false);
+      assert.equal(cursorEl.classes.has("is-typing"), false);
+      assert.equal(cursorEl.classes.has("is-idle"), true);
+      assert.equal(cursorEl.style.transform, `translate3d(260px, ${startCoords.top}px, 0)`);
+
+      // Wait beyond idleAfterMs and verify long-idle parked presence persists across turns
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(overlay.getActiveCount(), 1);
+      assert.equal(cursorEl.classes.has("is-idle"), true);
+
+      // Another agent inserts two lines above agy2's caret
+      docText = "# Title\nInserted line A\nInserted line B\nLine one here\nLine two here\n";
+      overlay.notifyNoteUpdated("Notes/Plan.md");
+
+      const expectedNewPos = docText.indexOf("Line two here");
+      const expectedCoords = lineCoordsForPos(expectedNewPos);
+      assert.equal(
+        cursorEl.style.transform,
+        `translate3d(260px, ${expectedCoords.top}px, 0)`,
+        "Parked cursor should follow its anchored text line down when lines are inserted above"
+      );
+      // Re-anchoring must not falsely mark the idle collaborator as typing
+      assert.equal(cursorEl.classes.has("is-idle"), true);
+      assert.equal(cursorEl.classes.has("is-typing"), false);
+      assert.equal(actionEl.textContent, "");
+
+      // Scrolling anchored caret out of view adds is-offscreen, scrolling back removes it
+      scrollOffset = 400;
+      for (const fn of listeners.get("scroll") ?? []) {
+        fn();
+      }
+      assert.equal(cursorEl.classes.has("is-offscreen"), true);
+
+      scrollOffset = 0;
+      for (const fn of listeners.get("scroll") ?? []) {
+        fn();
+      }
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("shows honest transient state labels: clicking/key briefly, typing only during insertion, otherwise name only", async () => {
+    const { win, body } = makeCursorMockWin(true);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 120, hideAfterMs: 5000 });
+
+    try {
+      overlay.pulseClick("herdr:w1:p1#agy1", "agy1 (w1:p1)", 100, 140, "click");
+      const cursorEl = body.children[0].children[0];
+      const pillEl = cursorEl.children[2];
+      const actionEl = pillEl.children[1];
+
+      assert.equal(actionEl.textContent, "clicking");
+      assert.equal(actionEl.classes.has("is-visible"), true);
+
+      // Key action appears briefly then clears back to name only
+      overlay.moveTo("herdr:w1:p1#agy1", "agy1 (w1:p1)", 110, 140, "Enter");
+      assert.equal(actionEl.textContent, "Enter");
+      assert.equal(actionEl.classes.has("is-visible"), true);
+
+      await new Promise((r) => setTimeout(r, 145));
+      assert.equal(actionEl.textContent, "");
+      assert.equal(actionEl.classes.has("is-visible"), false);
+      assert.equal(cursorEl.classes.has("is-idle"), true);
+
+      // Silent move actions (hover/scroll) leave just the agent name
+      overlay.moveTo("herdr:w1:p1#agy1", "agy1 (w1:p1)", 150, 180, "scroll");
+      assert.equal(actionEl.textContent, "");
+      assert.equal(actionEl.classes.has("is-visible"), false);
+      assert.equal(cursorEl.classes.has("is-typing"), false);
+
+      overlay.moveTo("herdr:w1:p1#agy1", "agy1 (w1:p1)", 160, 190, "hover");
+      assert.equal(actionEl.textContent, "");
+      assert.equal(actionEl.classes.has("is-visible"), false);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("fades out exited agents and closed panes via exitAgent and reconcileLiveCallers", async () => {
+    const { win, body } = makeCursorMockWin(false);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1000, hideAfterMs: 10000 });
+
+    try {
+      overlay.moveTo("herdr:w1:p4#agy2", "agy2 (w1:p4)", 200, 220);
+      overlay.moveTo("herdr:w1:p6#agy1", "agy1 (w1:p6)", 400, 260);
+      assert.equal(overlay.getActiveCount(), 2);
+
+      const layer = body.children[0];
+      const cursorAgy2 = layer.children[0];
+      const cursorAgy1 = layer.children[1];
+
+      // Both are live right now
+      overlay.reconcileLiveCallers(["w1:p4", "agy2", "w1:p6", "agy1"]);
+      assert.equal(overlay.getActiveCount(), 2);
+
+      // Pane w1:p4 closes / agy2 exits
+      overlay.reconcileLiveCallers(["w1:p6", "agy1"]);
+      assert.equal(overlay.getActiveCount(), 1);
+      assert.equal(cursorAgy2.classes.has("is-exiting"), true);
+      assert.equal(cursorAgy1.classes.has("is-exiting"), false);
+
+      // Re-activating the same caller clears any stale fading node without waiting
+      overlay.moveTo("herdr:w1:p4#agy2", "agy2 (w1:p4)", 240, 240);
+      assert.equal(overlay.getActiveCount(), 2);
+      assert.equal(cursorAgy2.removed, true);
+
+      // Explicit exitAgent fades and removes the element after transition delay
+      const replacementEl = layer.children.find((child) => !child.removed && child !== cursorAgy1)!;
+      overlay.exitAgent("herdr:w1:p4#agy2");
+      assert.equal(overlay.getActiveCount(), 1);
+      assert.equal(replacementEl.classes.has("is-exiting"), true);
+      assert.equal(replacementEl.removed, false);
+
+      await new Promise((r) => setTimeout(r, 275));
+      assert.equal(replacementEl.removed, true);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("defines CSS states for typing, exiting, offscreen, and dimmed idle cursors in styles.css", () => {
+    const css = fs.readFileSync(path.resolve("styles.css"), "utf8");
+    assert.ok(css.includes(".herdr-cursor.is-typing"));
+    assert.ok(css.includes(".herdr-cursor.is-exiting"));
+    assert.ok(css.includes(".herdr-cursor.is-offscreen"));
+    assert.ok(css.includes(".herdr-cursor.is-idle"));
+  });
+
+  it("recomputes parked cursor immediately via ResizeObserver and MutationObserver and keeps pill inside pane/above status bar", () => {
+    const resizeCallbacks: Array<(entries: Array<{ target: unknown }>) => void> = [];
+    const mutationCallbacks: Array<() => void> = [];
+    const observedResizeTargets = new Set<unknown>();
+    const observedMutationTargets = new Set<unknown>();
+
+    class FakeResizeObserver {
+      constructor(cb: (entries: Array<{ target: unknown }>) => void) {
+        resizeCallbacks.push(cb);
+      }
+      observe(target: unknown) {
+        observedResizeTargets.add(target);
+      }
+      unobserve(target: unknown) {
+        observedResizeTargets.delete(target);
+      }
+      disconnect() {
+        observedResizeTargets.clear();
+      }
+    }
+
+    class FakeMutationObserver {
+      constructor(cb: () => void) {
+        mutationCallbacks.push(cb);
+      }
+      observe(target: unknown) {
+        observedMutationTargets.add(target);
+      }
+      disconnect() {
+        observedMutationTargets.clear();
+      }
+    }
+
+    const body = makeCursorMockEl({ cls: "body" });
+    const statusBar = {
+      getBoundingClientRect: () => ({ left: 0, top: 760, right: 1280, bottom: 790, width: 1280, height: 30 }),
+    };
+    const win = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      document: {
+        body,
+        createElementNS: () => makeCursorMockEl({ cls: "svg" }),
+        querySelector: (sel: string) => (sel === ".status-bar" ? statusBar : null),
+      },
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      requestAnimationFrame: (cb: (t: number) => void) =>
+        globalThis.setTimeout(() => cb(Date.now()), 8) as unknown as number,
+      cancelAnimationFrame: (id: number) => globalThis.clearTimeout(id),
+      matchMedia: () => ({ matches: false }),
+      ResizeObserver: FakeResizeObserver,
+      MutationObserver: FakeMutationObserver,
+    } as unknown as Window;
+
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 5000, hideAfterMs: 30000 });
+    let docText = "Line A\nLine B anchored\n";
+    let paneRight = 820;
+    let wrappedExtraPx = 0;
+
+    const scrollDom = {
+      isConnected: true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({
+        left: 200,
+        top: 100,
+        right: paneRight,
+        bottom: 780,
+        width: paneRight - 200,
+        height: 680,
+      }),
+    } as unknown as HTMLElement;
+
+    const contentDom = {
+      isConnected: true,
+    } as unknown as HTMLElement;
+
+    const coordsForPos = (pos: number) => {
+      const before = docText.slice(0, pos);
+      const lineIdx = before.split("\n").length - 1;
+      const top = 735 + wrappedExtraPx + (lineIdx - 1) * 24;
+      const left = Math.min(paneRight - 20, 770);
+      return { left, right: left + 2, top, bottom: top + 18 };
+    };
+
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      contentDOM: contentDom,
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+      },
+      coordsAtPos: coordsForPos,
+    };
+
+    try {
+      const pos = docText.indexOf("Line B anchored");
+      const initialCoords = coordsForPos(pos);
+      overlay.setTyping("herdr:w1:p4#agy2", "agy2 (w1:p4)", initialCoords.left, initialCoords.top, {
+        notePath: "Notes/Plan.md",
+        pane: "w1:p4",
+        pos,
+        cm,
+      });
+      overlay.finishTyping("herdr:w1:p4#agy2");
+
+      const cursorEl = body.children[0].children[0];
+      const pillEl = cursorEl.children[2];
+
+      assert.equal(observedResizeTargets.has(scrollDom), true);
+      assert.equal(observedResizeTargets.has(contentDom), true);
+      assert.equal(observedMutationTargets.has(contentDom), true);
+
+      // Pill sits near bottom-right corner above .status-bar (top=760): must flip UP and LEFT inside pane
+      const pillX1 = Number.parseFloat(pillEl.style.props["--herdr-pill-x"]);
+      const pillY1 = Number.parseFloat(pillEl.style.props["--herdr-pill-y"]);
+      assert.ok(pillY1 < 0, `Expected pill above pointer near status bar, got ${pillY1}`);
+      assert.ok(pillX1 < 0, `Expected pill shifted left inside pane edge, got ${pillX1}`);
+
+      // Sidebar opens -> pane narrows & line wraps down; ResizeObserver snaps transform immediately even with reducedMotion=false
+      paneRight = 680;
+      wrappedExtraPx = -60;
+      for (const cb of resizeCallbacks) {
+        cb([{ target: scrollDom }]);
+      }
+      const afterResizeCoords = coordsForPos(pos);
+      assert.equal(cursorEl.style.transform, `translate3d(${afterResizeCoords.left}px, ${afterResizeCoords.top}px, 0)`);
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+
+      // CodeMirror DOM mutates with a line inserted above without calling notifyNoteUpdated
+      docText = "Inserted top line\nLine A\nLine B anchored\n";
+      for (const cb of mutationCallbacks) {
+        cb();
+      }
+      const afterMutCoords = coordsForPos(docText.indexOf("Line B anchored"));
+      assert.equal(cursorEl.style.transform, `translate3d(${afterMutCoords.left}px, ${afterMutCoords.top}px, 0)`);
+      assert.equal(cursorEl.classes.has("is-idle"), true);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("binds parked cursors to one note leaf and hides them when closed, collapsed, or switched to another note", () => {
+    const resizeCallbacks: Array<(entries: Array<{ target: unknown }>) => void> = [];
+    const mutationCallbacks: Array<() => void> = [];
+    class FakeResizeObserver {
+      constructor(cb: (entries: Array<{ target: unknown }>) => void) {
+        resizeCallbacks.push(cb);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    class FakeMutationObserver {
+      constructor(cb: () => void) {
+        mutationCallbacks.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+    }
+    const baseWin = makeCursorMockWin(true);
+    const body = baseWin.body;
+    const win = Object.assign(baseWin.win as unknown as Record<string, unknown>, {
+      ResizeObserver: FakeResizeObserver,
+      MutationObserver: FakeMutationObserver,
+    }) as unknown as Window;
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1000, hideAfterMs: 30000 });
+
+    let viewPath = "Notes/A.md";
+    let leafConnected = true;
+    let paneWidth = 600;
+    const scrollDom = {
+      get isConnected() {
+        return leafConnected;
+      },
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({
+        left: 100,
+        top: 80,
+        right: 100 + paneWidth,
+        bottom: 680,
+        width: paneWidth,
+        height: 600,
+      }),
+    } as unknown as HTMLElement;
+
+    let docText = "First\nSecond line in A\n";
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+      },
+      coordsAtPos: (pos: number) => ({ left: 220, right: 222, top: 180 + Math.min(pos, 40), bottom: 200 + Math.min(pos, 40) }),
+    };
+
+    try {
+      const view = {
+        get file() {
+          return { path: viewPath };
+        },
+      };
+
+      overlay.setTyping("herdr:w1:p4#agy2", "agy2 (w1:p4)", 220, 186, {
+        notePath: "Notes/A.md",
+        pane: "w1:p4",
+        leafId: "leaf-1",
+        pos: 6,
+        cm,
+        view,
+      });
+      overlay.finishTyping("herdr:w1:p4#agy2");
+
+      const cursorEl = body.children[0].children[0];
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+
+      // Collapsed/background tab (zero box width) must stay hidden, never clear is-offscreen
+      paneWidth = 0;
+      for (const cb of resizeCallbacks) {
+        cb([{ target: scrollDom }]);
+      }
+      assert.equal(cursorEl.classes.has("is-offscreen"), true);
+
+      // Restored tab becomes visible again via ResizeObserver
+      paneWidth = 600;
+      for (const cb of resizeCallbacks) {
+        cb([{ target: scrollDom }]);
+      }
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+
+      // Virtualized offscreen line returning null from coordsAtPos must hide stale marker
+      const origCoordsAtPos = cm.coordsAtPos;
+      cm.coordsAtPos = () => null;
+      overlay.notifyNoteUpdated("Notes/A.md");
+      assert.equal(cursorEl.classes.has("is-offscreen"), true);
+      cm.coordsAtPos = origCoordsAtPos;
+      for (const cb of resizeCallbacks) {
+        cb([{ target: scrollDom }]);
+      }
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+
+      // Leaf switches in-place from Notes/A.md to Notes/B.md: cursor must hide and never redraw in B
+      viewPath = "Notes/B.md";
+      docText = "Completely different note B\n";
+      overlay.notifyNoteUpdated("Notes/A.md");
+      assert.equal(cursorEl.classes.has("is-offscreen"), true);
+      for (const cb of mutationCallbacks) {
+        cb();
+      }
+      assert.equal(cursorEl.classes.has("is-offscreen"), true);
+
+      // When Notes/A.md leaf closes (isConnected=false), observer detects disconnect and clears cursor
+      viewPath = "Notes/A.md";
+      leafConnected = false;
+      for (const cb of resizeCallbacks) {
+        cb([{ target: scrollDom }]);
+      }
+      assert.equal(overlay.getActiveCount(), 0);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("clears typing immediately and snaps parked caret on finishTyping even with reducedMotion=false (R3-3) and hides when coords are null then recovers (R3-4)", () => {
+    const { win, body } = makeCursorMockWin(false);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+
+    const scrollDom = {
+      isConnected: true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({ left: 50, top: 50, right: 900, bottom: 700, width: 850, height: 650 }),
+    } as unknown as HTMLElement;
+
+    let docText = "Hello world\n";
+    let coordsReturn: { left: number; right: number; top: number; bottom: number } | null = {
+      left: 200,
+      right: 202,
+      top: 160,
+      bottom: 180,
+    };
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+      },
+      coordsAtPos: () => coordsReturn,
+    };
+
+    try {
+      overlay.setTyping("herdr:w1:p6#agy1", "agy1 (w1:p6)", 200, 160, {
+        notePath: "Notes/R3.md",
+        pane: "w1:p6",
+        pos: 5,
+        cm,
+      });
+
+      const cursorEl = body.children[0].children[0];
+      const actionEl = cursorEl.children[2].children[1];
+      assert.equal(actionEl.textContent, "typing");
+      assert.equal(cursorEl.classes.has("is-typing"), true);
+
+      docText = "Hello world updated!\n";
+      coordsReturn = { left: 264, right: 266, top: 184, bottom: 204 };
+      overlay.finishTyping("herdr:w1:p6#agy1", {
+        notePath: "Notes/R3.md",
+        pane: "w1:p6",
+        pos: docText.length - 1,
+        cm,
+      });
+
+      assert.equal(actionEl.textContent, "");
+      assert.equal(actionEl.classes.has("is-visible"), false);
+      assert.equal(cursorEl.classes.has("is-typing"), false);
+      assert.equal(cursorEl.classes.has("is-idle"), true);
+      assert.equal(cursorEl.style.transform, "translate3d(264px, 184px, 0)");
+
+      // R3-4: projection returns null -> marker hides cleanly without clearing anchor, then recovers when coords return
+      coordsReturn = null;
+      overlay.notifyNoteUpdated("Notes/R3.md");
+      assert.equal(cursorEl.classes.has("is-offscreen"), true);
+
+      coordsReturn = { left: 264, right: 266, top: 210, bottom: 230 };
+      overlay.notifyNoteUpdated("Notes/R3.md");
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+      assert.equal(cursorEl.style.transform, "translate3d(264px, 210px, 0)");
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("shows only agent name when known and falls back to pane id (Round 5 item 3)", () => {
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p6", "agy1 (w1:p6)"), "agy1");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p4#agy2", "agy2 (w1:p4)"), "agy2");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p1", "claude (herdr:w1:p1)"), "claude");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p7#agy2", ""), "agy2");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p7#agy2", "herdr:w1:p7#agy2"), "agy2");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p7", "w1:p7"), "w1:p7");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p7", "herdr:w1:p7"), "w1:p7");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:p7", ""), "w1:p7");
+    assert.equal(formatCursorDisplayLabel("custom", "Agent (beta)"), "Agent (beta)");
+
+    const { win, body } = makeCursorMockWin(true);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+    try {
+      overlay.pulseClick("herdr:w1:p6", "agy1 (w1:p6)", 120, 140, "click");
+      overlay.pulseClick("herdr:w1:p9", "w1:p9", 220, 140, "click");
+      const layer = body.children[0];
+      assert.equal(layer.children[0].children[2].children[0].textContent, "agy1");
+      assert.equal(layer.children[1].children[2].children[0].textContent, "w1:p9");
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("strips alphanumeric pane ids like w1:pA, manages their lifecycle, and drops unused overlay helpers (Round 6 P2-3)", () => {
+    assert.equal(formatCursorDisplayLabel("sol3", "sol3 (w1:pA)"), "sol3");
+    assert.equal(formatCursorDisplayLabel("herdr:sol3", "sol3 (w1:pA)"), "sol3");
+    assert.equal(formatCursorDisplayLabel("herdr:w1:pA", "w1:pA"), "w1:pA");
+    assert.equal(formatCursorDisplayLabel("w1:pA", ""), "w1:pA");
+    assert.equal(formatCursorDisplayLabel("custom", "Agent (beta)"), "Agent (beta)");
+    assert.equal("setDocumentAnchor" in AgentCursorOverlay.prototype, false);
+    assert.equal("reconcileVisibleNotes" in AgentCursorOverlay.prototype, false);
+
+    const { win, body } = makeCursorMockWin(false);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+    try {
+      overlay.pulseClick("w1:pA", "w1:pA", 140, 160, "click");
+      const layer = body.children[0];
+      assert.equal(layer.children.length, 1);
+      assert.equal(layer.children[0].children[2].children[0].textContent, "w1:pA");
+      overlay.reconcileLiveCallers([]);
+      assert.equal(overlay.getActiveCount(), 0);
+      assert.equal(layer.children[0].classes.has("is-exiting"), true);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("exposes uiTypingSpeed and allowUiInProtectedAreas in HerdrSettingTab settings UI", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-settings-test-"));
+    try {
+      const stubPath = path.join(tmpDir, "obsidian-settings-stub.js");
+      fs.writeFileSync(
+        stubPath,
+        [
+          "exports.Notice = class Notice { constructor(m) { this.message = m; } };",
+          "exports.PluginSettingTab = class PluginSettingTab { constructor(app, plugin) { this.app = app; this.plugin = plugin; } update() {} };",
+          "exports.Modal = class Modal { constructor(app) { this.app = app; } open() {} close() {} };",
+        ].join("\n"),
+        "utf8"
+      );
+      const outPath = path.join(tmpDir, "settings-tab.cjs");
+      const runnerScript = [
+        'const esbuild = require("esbuild");',
+        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/ui/settings-tab.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(outPath)}, alias: { obsidian: ${JSON.stringify(stubPath)} } });`,
+        `const { HerdrSettingTab } = require(${JSON.stringify(outPath)});`,
+        "const saved = [];",
+        'const settings = { profiles: [{ id: "herdr-vault", name: "Herdr", kind: "herdr-vault", cwdMode: "vault-root" }], uiTypingSpeed: "visible", allowUiInProtectedAreas: false };',
+        "const tab = new HerdrSettingTab({}, { settings, async saveAndApplySettings(patch) { Object.assign(settings, patch); saved.push(patch); } });",
+        "const defs = tab.getSettingDefinitions();",
+        'const group = defs.find((d) => d.heading === "Vault Control Bridge and notifications");',
+        'const speedItem = group.items.find((i) => i.control && i.control.key === "uiTypingSpeed");',
+        'const protItem = group.items.find((i) => i.control && i.control.key === "allowUiInProtectedAreas");',
+        "Promise.all([tab.setControlValue('uiTypingSpeed', 'fast'), tab.setControlValue('allowUiInProtectedAreas', true)]).then(() => {",
+        "  process.stdout.write(JSON.stringify({ speedItem, protItem, settings, saved }));",
+        "});",
+      ].join("\n");
+      const out = await execFileAsync(process.execPath, ["-e", runnerScript], { cwd: process.cwd() });
+      const parsed = JSON.parse(out.stdout) as {
+        speedItem?: { control?: { type: string; key: string; options: Record<string, string> } };
+        protItem?: { control?: { type: string; key: string } };
+        settings: { uiTypingSpeed: string; allowUiInProtectedAreas: boolean };
+      };
+      assert.equal(parsed.speedItem?.control?.type, "dropdown");
+      assert.deepEqual(Object.keys(parsed.speedItem?.control?.options ?? {}), ["visible", "fast"]);
+      assert.equal(parsed.protItem?.control?.type, "toggle");
+      assert.equal(parsed.settings.uiTypingSpeed, "fast");
+      assert.equal(parsed.settings.allowUiInProtectedAreas, true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
