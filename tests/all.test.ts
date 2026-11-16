@@ -2458,6 +2458,412 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
     }
   });
 
+  it("switches to window-clamped screen mode on non-note actions and re-enters doc mode on next note action", () => {
+    const { win, body } = makeCursorMockWin(true);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+
+    const scrollDom = {
+      isConnected: true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({ left: 44, top: 40, right: 900, bottom: 700, width: 856, height: 660 }),
+    } as unknown as HTMLElement;
+    const mcLeafEl = {
+      isConnected: true,
+      getBoundingClientRect: () => ({ left: 950, top: 40, right: 1280, bottom: 760, width: 330, height: 720 }),
+    } as unknown as HTMLElement;
+
+    let docText = "Line 1\nLine 2\n";
+    let lineTop = 140;
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+      },
+      coordsAtPos: () => ({ left: 180, right: 182, top: lineTop, bottom: lineTop + 20 }),
+    };
+
+    try {
+      const caller = "herdr:w1:p7#agy2";
+      overlay.setTyping(caller, "agy2", 180, 150, {
+        notePath: "Notes/A.md",
+        pane: "w1:p7",
+        pos: 7,
+        cm,
+      });
+      const cursorEl = body.children[0].children[0];
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+
+      // Clicking a tab header outside the note pane (no docContext) drops old docAnchor and shows cursor.
+      overlay.pulseClick(caller, "agy2", 552, 23, "click");
+      assert.equal(cursorEl.classes.has("is-offscreen"), false, "Tab header click above paneBounds.top must not be marked offscreen");
+      assert.equal(cursorEl.style.transform, "translate3d(552px, 23px, 0)");
+
+      // Clicking a non-note leaf (sidebar/Mission Control with containerEl only) stays in screen mode.
+      overlay.pulseClick(caller, "agy2", 21, 120, "click", { containerEl: mcLeafEl });
+      assert.equal(cursorEl.classes.has("is-offscreen"), false, "Ribbon/sidebar click must stay visible in screen mode");
+      assert.equal(cursorEl.style.transform, "translate3d(21px, 120px, 0)");
+
+      // Stale note update from Notes/A.md must not hide or pull back the screen-mode cursor.
+      lineTop = 10;
+      overlay.notifyNoteUpdated("Notes/A.md");
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+      assert.equal(cursorEl.style.transform, "translate3d(21px, 120px, 0)");
+
+      // Next note action re-enters doc mode cleanly.
+      lineTop = 200;
+      overlay.setTyping(caller, "agy2", 180, 210, {
+        notePath: "Notes/A.md",
+        pane: "w1:p7",
+        pos: 7,
+        cm,
+      });
+      lineTop = 230;
+      docText = "Above\nLine 1\nLine 2\n";
+      overlay.notifyNoteUpdated("Notes/A.md", { from: 0, to: 0, insertLength: 6 });
+      assert.equal(cursorEl.style.transform, "translate3d(180px, 240px, 0)");
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("caps long jumps to <= 180ms glide and resolves whenSettled(caller) on arrival", async () => {
+    const body = makeCursorMockEl({ cls: "body" });
+    let nowMs = 1000;
+    const rafQueue: Array<(t: number) => void> = [];
+    const win = {
+      innerWidth: 1920,
+      innerHeight: 1080,
+      document: {
+        body,
+        createElementNS: () => makeCursorMockEl({ cls: "svg" }),
+      },
+      performance: { now: () => nowMs },
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      requestAnimationFrame: (cb: (t: number) => void) => {
+        rafQueue.push(cb);
+        return rafQueue.length;
+      },
+      cancelAnimationFrame: () => undefined,
+      matchMedia: () => ({ matches: false }),
+    } as unknown as Window;
+
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+    try {
+      const caller = "herdr:w1:p7#agy2";
+      assert.equal(typeof (overlay as unknown as { whenSettled?: unknown }).whenSettled, "function");
+      await overlay.whenSettled(caller);
+
+      overlay.pulseClick(caller, "agy2", 60, 80, "click");
+      await overlay.whenSettled(caller);
+      const cursorEl = body.children[0].children[0];
+      assert.equal(cursorEl.style.transform, "translate3d(60px, 80px, 0)");
+
+      // Long jump (> 1400px diagonal) must finish within 180ms of RAF time and resolve whenSettled.
+      overlay.pulseClick(caller, "agy2", 1420, 820, "click");
+      let settledResolved = false;
+      const settlePromise = overlay.whenSettled(caller, 500).then(() => {
+        settledResolved = true;
+      });
+
+      for (let i = 0; i < 12; i += 1) {
+        nowMs += 16;
+        const batch = rafQueue.splice(0, rafQueue.length);
+        for (const cb of batch) {
+          cb(nowMs);
+        }
+      }
+      await settlePromise;
+      assert.equal(settledResolved, true, "Long jump must settle within <= 180ms RAF steps");
+      assert.equal(cursorEl.style.transform, "translate3d(1420px, 820px, 0)");
+
+      // Mid-glide exit/clear must also resolve whenSettled without waiting for timeout.
+      overlay.pulseClick(caller, "agy2", 100, 120, "click");
+      const abortWait = overlay.whenSettled(caller, 5000);
+      overlay.clearAgent(caller);
+      await abortWait;
+
+      // Throttled/stalled RAF (e.g. unfocused Electron window): cap timeout snaps cursor to target.
+      overlay.pulseClick(caller, "agy2", 40, 50, "click");
+      overlay.pulseClick(caller, "agy2", 800, 500, "click");
+      await overlay.whenSettled(caller, 25);
+      const snappedEl = body.children[0].children[0];
+      assert.equal(snappedEl.style.transform, "translate3d(800px, 500px, 0)");
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("hides anchor if its host element belongs to another window ownerDocument", () => {
+    const { win, body } = makeCursorMockWin(true);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+    const foreignDoc = {} as Document;
+    let currentOwnerDoc: Document = win.document;
+    const scrollDom = {
+      isConnected: true,
+      get ownerDocument() {
+        return currentOwnerDoc;
+      },
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({ left: 44, top: 40, right: 900, bottom: 700, width: 856, height: 660 }),
+    } as unknown as HTMLElement;
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      state: { doc: { toString: () => "Popout line\n", get length() { return 12; } } },
+      coordsAtPos: () => ({ left: 160, right: 162, top: 140, bottom: 160 }),
+    };
+    try {
+      overlay.setTyping("herdr:w1:p7#agy2", "agy2", 160, 150, {
+        notePath: "Notes/Pop.md",
+        pane: "w1:p7",
+        pos: 0,
+        cm,
+      });
+      const cursorEl = body.children[0].children[0];
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+
+      currentOwnerDoc = foreignDoc;
+      overlay.notifyNoteUpdated("Notes/Pop.md");
+      assert.equal(cursorEl.classes.has("is-offscreen"), true);
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("keeps cursor visible when clicked task checkbox or Mission Control row re-renders", () => {
+    const mutationCallbacks: Array<() => void> = [];
+    class FakeMutationObserver {
+      constructor(cb: () => void) {
+        mutationCallbacks.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+    }
+    const baseWin = makeCursorMockWin(true);
+    const body = baseWin.body;
+    const win = Object.assign(baseWin.win as unknown as Record<string, unknown>, {
+      MutationObserver: FakeMutationObserver,
+    }) as unknown as Window;
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+
+    const scrollDom = {
+      isConnected: true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({ left: 44, top: 40, right: 1200, bottom: 760, width: 1156, height: 720 }),
+    } as unknown as HTMLElement;
+    const contentDom = { isConnected: true } as unknown as HTMLElement;
+    const docText = "# Heading\n\n- [ ] Unchecked task\n";
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      contentDOM: contentDom,
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+        selection: { main: { head: 0 } },
+      },
+      // Selection head at line 1 is virtualized/scrolled offscreen (null) while checkbox is on screen.
+      coordsAtPos: () => null,
+    };
+
+    try {
+      const caller = "herdr:w1:pA#agy3";
+      // Clicking task checkbox inside pane when selection.head is offscreen must not hide cursor on re-render.
+      overlay.pulseClick(caller, "agy3", 641, 578, "click", {
+        notePath: "Notes/Lists.md",
+        pane: "w1:pA",
+        pos: 0,
+        cm,
+      });
+      const cursorEl = body.children[0].children[0];
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+
+      for (const cb of mutationCallbacks) {
+        cb();
+      }
+      overlay.notifyNoteUpdated("Notes/Lists.md");
+      assert.equal(overlay.getActiveCount(), 1, "Checkbox re-render must not remove cursor");
+      assert.equal(cursorEl.classes.has("is-offscreen"), false, "Checkbox re-render must not hide cursor");
+      assert.equal(cursorEl.style.transform, "translate3d(641px, 578px, 0)");
+
+      // Clicking Mission Control row whose containerEl later detaches on re-render stays visible in screen mode.
+      let mcLeafConnected = true;
+      const mcLeaf = {
+        get isConnected() {
+          return mcLeafConnected;
+        },
+        getBoundingClientRect: () => ({ left: 1000, top: 40, right: 1280, bottom: 760, width: 280, height: 720 }),
+      } as unknown as HTMLElement;
+      overlay.pulseClick(caller, "agy3", 1180, 612, "click", { containerEl: mcLeaf });
+      mcLeafConnected = false;
+      overlay.notifyNoteUpdated();
+      assert.equal(overlay.getActiveCount(), 1, "Mission Control row re-render must not clear cursor");
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+      assert.equal(cursorEl.style.transform, "translate3d(1180px, 612px, 0)");
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("does not pull a checkbox click cursor to an unrelated caret on the same visual row (P2-2)", () => {
+    const mutationCallbacks: Array<() => void> = [];
+    class FakeMutationObserver {
+      constructor(cb: () => void) {
+        mutationCallbacks.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+    }
+    const baseWin = makeCursorMockWin(true);
+    const body = baseWin.body;
+    const win = Object.assign(baseWin.win as unknown as Record<string, unknown>, {
+      MutationObserver: FakeMutationObserver,
+    }) as unknown as Window;
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+
+    const scrollDom = {
+      isConnected: true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({ left: 44, top: 40, right: 1200, bottom: 760, width: 1156, height: 720 }),
+    } as unknown as HTMLElement;
+    const contentDom = { isConnected: true } as unknown as HTMLElement;
+    let docText = "- [ ] Unchecked task with text to the right\n";
+    const selectionPos = docText.length - 1;
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      contentDOM: contentDom,
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+        selection: { main: { head: selectionPos } },
+      },
+      // Unrelated caret on the exact same row (y=578) far to the right (x=900) of checkbox (x=641).
+      coordsAtPos: () => ({ left: 900, right: 902, top: 568, bottom: 588 }),
+    };
+
+    try {
+      const caller = "herdr:w1:pA#agy3";
+      overlay.pulseClick(caller, "agy3", 641, 578, "click", {
+        notePath: "Notes/Lists.md",
+        pane: "w1:pA",
+        pos: selectionPos,
+        cm,
+      });
+      const cursorEl = body.children[0].children[0];
+      assert.equal(cursorEl.style.transform, "translate3d(641px, 578px, 0)");
+
+      docText = "- [x] Unchecked task with text to the right\n";
+      for (const cb of mutationCallbacks) {
+        cb();
+      }
+      overlay.notifyNoteUpdated("Notes/Lists.md");
+      assert.equal(cursorEl.classes.has("is-offscreen"), false);
+      assert.equal(
+        cursorEl.style.transform,
+        "translate3d(641px, 578px, 0)",
+        "Checkbox click cursor must not jump horizontally to unrelated same-row caret"
+      );
+    } finally {
+      overlay.dispose();
+    }
+  });
+
+  it("lands rename-abort cursor on the current partial streamed line in the renamed note", () => {
+    const { win, body } = makeCursorMockWin(true);
+    const overlay = new AgentCursorOverlay({ win, idleAfterMs: 1500, hideAfterMs: 60000 });
+
+    const scrollDom = {
+      isConnected: true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      getBoundingClientRect: () => ({ left: 44, top: 40, right: 1200, bottom: 760, width: 1156, height: 720 }),
+    } as unknown as HTMLElement;
+
+    let viewPath = "Crew Test/Audit/agy5 renamed.md";
+    const docText = "# Heading\n## Section 1\n- Initial\nLong streaming rerun line designed";
+    const sectionPos = docText.indexOf("## Section 1");
+    const partialPos = docText.length;
+    const cm: CursorCodeMirrorLike = {
+      scrollDOM: scrollDom,
+      state: {
+        doc: {
+          toString: () => docText,
+          get length() {
+            return docText.length;
+          },
+        },
+        selection: { main: { head: sectionPos } },
+      },
+      coordsAtPos: (pos: number) =>
+        pos >= docText.indexOf("Long streaming")
+          ? { left: 420, right: 422, top: 335, bottom: 355 }
+          : { left: 180, right: 182, top: 190, bottom: 210 },
+    };
+    const view = {
+      get file() {
+        return { path: viewPath };
+      },
+    };
+
+    try {
+      const caller = "herdr:w1:pA#agy4";
+      overlay.setTyping(caller, "agy4", 420, 345, {
+        notePath: "Crew Test/Audit/agy5 renamed.md",
+        pane: "w1:pA",
+        pos: partialPos,
+        cm,
+        view,
+      });
+
+      // Rename occurs mid-write; insert_line aborts and finishes typing with old path.
+      viewPath = "Crew Test/Audit/agy5 renamed2.md";
+      overlay.finishTyping(caller, {
+        notePath: "Crew Test/Audit/agy5 renamed.md",
+        pane: "w1:pA",
+        pos: partialPos,
+        cm,
+        view,
+      });
+      const abortedEl = body.children[0].children[0];
+      assert.equal(abortedEl.classes.has("is-offscreen"), false, "Cross-caller rename abort must keep partial line visible");
+      assert.equal(abortedEl.style.transform, "translate3d(420px, 345px, 0)");
+
+      // Same-caller vault.rename_note clears old marker then calls pointAtResult ("rename") with stale selection.head.
+      overlay.clearAgent(caller);
+      overlay.moveTo(caller, "agy4", 180, 200, "rename", {
+        notePath: "Crew Test/Audit/agy5 renamed2.md",
+        pane: "w1:pA",
+        cm,
+        view,
+      });
+      const renamedEl = body.children[0].children[0];
+      assert.equal(renamedEl.classes.has("is-offscreen"), false);
+      assert.equal(
+        renamedEl.style.transform,
+        "translate3d(420px, 345px, 0)",
+        "Rename result cursor must sit on partial streamed line, not previous selection line"
+      );
+    } finally {
+      overlay.dispose();
+    }
+  });
+
   it("exposes uiTypingSpeed and allowUiInProtectedAreas in HerdrSettingTab settings UI", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-settings-test-"));
     try {
@@ -2498,6 +2904,103 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       assert.equal(parsed.protItem?.control?.type, "toggle");
       assert.equal(parsed.settings.uiTypingSpeed, "fast");
       assert.equal(parsed.settings.allowUiInProtectedAreas, true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("renders HerdrSettingTab.display() cleanly against a DOM mock with full migrated settings", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-settings-dom-"));
+    try {
+      const stubPath = path.join(tmpDir, "obsidian-dom-stub.js");
+      fs.writeFileSync(
+        stubPath,
+        [
+          "function makeEl(tag) {",
+          "  const el = {",
+          "    tagName: tag.toUpperCase(),",
+          "    children: [],",
+          "    textContent: '',",
+          "    empty() { this.children = []; this.textContent = ''; },",
+          "    createEl(childTag, opts) { const c = makeEl(childTag); if (opts && opts.text) c.textContent = opts.text; this.children.push(c); return c; },",
+          "    createDiv(opts) { return this.createEl('div', opts); },",
+          "    addClass() {},",
+          "  };",
+          "  return el;",
+          "}",
+          "class SettingMock {",
+          "  constructor(containerEl) { this.containerEl = containerEl; this.row = containerEl.createDiv(); this.buttons = []; }",
+          "  setName(name) { this.name = name; return this; }",
+          "  setDesc(desc) { this.desc = desc; return this; }",
+          "  addButton(cb) { const btn = { setButtonText(t) { this.text = t; return this; }, onClick(fn) { this.click = fn; return this; } }; cb(btn); this.buttons.push(btn); return this; }",
+          "}",
+          "exports.Notice = class Notice { constructor(m) { this.message = m; } };",
+          "exports.Modal = class Modal { constructor(app) { this.app = app; } open() {} close() {} };",
+          "exports.PluginSettingTab = class PluginSettingTab {",
+          "  constructor(app, plugin) { this.app = app; this.plugin = plugin; this.id = plugin.manifest?.id || 'herdr-obs'; this.name = plugin.manifest?.name || 'Herdr'; this.containerEl = makeEl('div'); }",
+          "  update() { this.settingItems = this.getSettingDefinitions(); }",
+          "  display() {",
+          "    this.containerEl.empty();",
+          "    const defs = this.getSettingDefinitions();",
+          "    this.settingItems = defs;",
+          "    const renderItem = (item) => {",
+          "      if (item.visible === false || (typeof item.visible === 'function' && !item.visible())) return;",
+          "      if (item.items) { for (const child of item.items) renderItem(child); return; }",
+          "      const setting = new SettingMock(this.containerEl);",
+          "      if (item.render) { item.render(setting, this.containerEl); return; }",
+          "      setting.setName(item.name); if (item.desc) setting.setDesc(item.desc);",
+          "      if (item.control) {",
+          "        const val = this.getControlValue(item.control.key);",
+          "        if (item.control.type === 'dropdown' && !(String(val) in item.control.options)) {",
+          "          throw new Error(`Invalid dropdown value ${String(val)} for ${item.control.key}`);",
+          "        }",
+          "      }",
+          "    };",
+          "    for (const def of defs) renderItem(def);",
+          "  }",
+          "};",
+        ].join("\n"),
+        "utf8"
+      );
+      const typesOut = path.join(tmpDir, "types.cjs");
+      const tabOut = path.join(tmpDir, "tab.cjs");
+      const runnerScript = [
+        'const esbuild = require("esbuild");',
+        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/domain/types.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(typesOut)} });`,
+        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/ui/settings-tab.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(tabOut)}, alias: { obsidian: ${JSON.stringify(stubPath)} } });`,
+        `const { migrateSettings } = require(${JSON.stringify(typesOut)});`,
+        `const { HerdrSettingTab } = require(${JSON.stringify(tabOut)});`,
+        'const settings = migrateSettings({ vaultPermissionMode: "full", allowUiControl: true, showAgentCursors: true });',
+        'const plugin = { manifest: { id: "herdr-obs", name: "Herdr Mission Control" }, settings, async saveAndApplySettings(patch) { Object.assign(settings, patch); } };',
+        "const tab = new HerdrSettingTab({}, plugin);",
+        "tab.update();",
+        "tab.display();",
+        "const values = {",
+        '  uiTypingSpeed: tab.getControlValue("uiTypingSpeed"),',
+        '  allowUiInProtectedAreas: tab.getControlValue("allowUiInProtectedAreas"),',
+        '  showAgentCursors: tab.getControlValue("showAgentCursors"),',
+        "};",
+        "Promise.resolve(tab.setControlValue('showAgentCursors', false)).then(() => {",
+        "  process.stdout.write(JSON.stringify({ renderedRows: tab.containerEl.children.length, defCount: tab.settingItems.length, values, updatedShowAgentCursors: settings.showAgentCursors, icon: tab.icon }));",
+        "});",
+      ].join("\n");
+      const out = await execFileAsync(process.execPath, ["-e", runnerScript], { cwd: process.cwd() });
+      const parsed = JSON.parse(out.stdout) as {
+        renderedRows: number;
+        defCount: number;
+        values: { uiTypingSpeed: string; allowUiInProtectedAreas: boolean; showAgentCursors: boolean };
+        updatedShowAgentCursors: boolean;
+        icon: string;
+      };
+      assert.equal(parsed.icon, "cpu");
+      assert.equal(parsed.defCount, 4);
+      assert.ok(parsed.renderedRows >= 20);
+      assert.deepEqual(parsed.values, {
+        uiTypingSpeed: "visible",
+        allowUiInProtectedAreas: false,
+        showAgentCursors: true,
+      });
+      assert.equal(parsed.updatedShowAgentCursors, false);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

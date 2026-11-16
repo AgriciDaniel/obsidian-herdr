@@ -6,6 +6,7 @@ import {
   TFile,
   TFolder,
   normalizePath,
+  type EventRef,
 } from "obsidian";
 import {
   UiControlError,
@@ -14,7 +15,10 @@ import {
   type UiControlService,
   type UiMutationContext,
 } from "../control/ui-control";
+import { commitCanvasCardModel, findCanvasCardNode } from "../control/nested-editors";
 import { guardVaultRelativePath, VaultPathGuardError } from "../domain/path-guard";
+import { isDeepStrictEqual } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import type {
   VaultAuditEntry,
   VaultMutationSnapshot,
@@ -107,7 +111,7 @@ const WRITE_METHODS = new Set<string>([
 const FULL_METHODS = new Set<string>(["commands.execute"]);
 
 /** Seeing the window: any bridge tier, plus the separate UI control setting. */
-const UI_OBSERVE_METHODS = new Set<string>(["ui.screenshot", "ui.inspect", "ui.wait_for", "ui.locate"]);
+const UI_OBSERVE_METHODS = new Set<string>(["ui.screenshot", "ui.inspect", "ui.wait_for", "ui.locate", "ui.hover"]);
 
 /** Operating the window can do anything a person can, so it needs Full plus the UI control setting. */
 const UI_INPUT_METHODS = new Set<string>([
@@ -162,16 +166,42 @@ interface UiSnapshotSession {
   path: string;
   before: string;
   revision: number;
-  commandRevision: number;
   conflicted: boolean;
   depth: number;
 }
 
 interface SnapshotGuard {
   revision: number;
-  commandRevision: number;
   postContent: string | null | undefined;
   conflicted: boolean;
+  fileView?: WeakRef<UiFileView>;
+}
+
+interface FileUiSnapshotSession {
+  context: UiMutationContext;
+  path: string;
+  view: UiFileView | null;
+  viewPath: string | null;
+  before: string;
+  revision: number;
+  conflicted: boolean;
+  depth: number;
+}
+
+interface UiFileView {
+  file?: TFile | null;
+  getViewType?: () => string;
+  getViewData?: () => string;
+  setViewData?: (data: string, clear: boolean) => void;
+  save?: (clear?: boolean) => Promise<void>;
+  canvas?: { getData?: () => unknown; setData?: (data: unknown) => void; requestSave?: (history?: boolean) => void };
+  containerEl?: HTMLElement;
+}
+
+interface CommandFileState {
+  file: TFile | null;
+  content: string | null;
+  disk: string | null;
 }
 
 export class VaultOpsService {
@@ -180,6 +210,7 @@ export class VaultOpsService {
   private readonly getAllowHiddenReads: () => boolean;
   private readonly uiControl: UiControlService | null;
   private readonly getAllowUiControl: () => boolean;
+  private readonly getAllowUiInProtectedAreas: () => boolean;
   private readonly onAgentActivity:
     | ((caller: string, targetPath: string | undefined, action: string, change?: VaultTextChange) => void)
     | null;
@@ -187,12 +218,12 @@ export class VaultOpsService {
   private readonly auditListeners = new Set<() => void>();
   private readonly pathQueues = new Map<string, Promise<unknown>>();
   private readonly pendingUiSnapshots = new Set<UiSnapshotSession>();
+  private readonly pendingFileSnapshots = new Set<FileUiSnapshotSession>();
   private readonly noteRevisions = new Map<string, number>();
   private readonly nativeWrites = new Map<string, number>();
   private readonly snapshotGuards = new WeakMap<VaultMutationSnapshot, SnapshotGuard>();
   private readonly destructiveUndoPaths = new Set<string>();
-  private commandRevision = 0;
-  private commandsInFlight = 0;
+  private readonly commandWrites = new Map<string, number>();
   private auditSeq = 0;
 
   constructor(options: {
@@ -201,6 +232,7 @@ export class VaultOpsService {
     getAllowHiddenReads: () => boolean;
     uiControl?: UiControlService | null;
     getAllowUiControl?: () => boolean;
+    getAllowUiInProtectedAreas?: () => boolean;
     onAgentActivity?: (caller: string, targetPath: string | undefined, action: string, change?: VaultTextChange) => void;
   }) {
     this.app = options.app;
@@ -208,6 +240,7 @@ export class VaultOpsService {
     this.getAllowHiddenReads = options.getAllowHiddenReads;
     this.uiControl = options.uiControl ?? null;
     this.getAllowUiControl = options.getAllowUiControl ?? (() => false);
+    this.getAllowUiInProtectedAreas = options.getAllowUiInProtectedAreas ?? (() => false);
     this.onAgentActivity = options.onAgentActivity ?? null;
   }
 
@@ -328,7 +361,6 @@ export class VaultOpsService {
       }
       const guard = this.snapshotGuards.get(snap);
       if (guard && (guard.conflicted || guard.revision !== this.noteRevision(snap.path) ||
-        guard.commandRevision !== this.commandRevision ||
         this.hasPendingWrite(snap.path))) {
         throw this.undoConflict(snap.path);
       }
@@ -393,15 +425,19 @@ export class VaultOpsService {
   }
 
   private hasPendingWrite(path: string): boolean {
-    return this.commandsInFlight > 0 || (this.nativeWrites.get(path) ?? 0) > 0 ||
-      [...this.pendingUiSnapshots].some((session) => session.path === path);
+    return (this.commandWrites.get(path) ?? 0) > 0 || (this.nativeWrites.get(path) ?? 0) > 0 ||
+      this.activeUiSnapshots().some((session) => session.path === path);
+  }
+
+  private activeUiSnapshots(): Array<{ path: string; conflicted: boolean }> {
+    return [...this.pendingUiSnapshots, ...this.pendingFileSnapshots];
   }
 
   private beginNativeWrite(paths: string[]): () => void {
     for (const path of paths) this.assertNoDestructiveUndo(path);
     for (const path of paths) {
       this.nativeWrites.set(path, (this.nativeWrites.get(path) ?? 0) + 1);
-      for (const session of this.pendingUiSnapshots) {
+      for (const session of this.activeUiSnapshots()) {
         if (session.path === path) {
           session.conflicted = true;
         }
@@ -419,14 +455,7 @@ export class VaultOpsService {
   private trackNativeWrite(method: string, params: Record<string, unknown>): () => void {
     if (method === "commands.execute") {
       this.assertNoDestructiveUndo();
-      // Arbitrary commands have unknown write scope, so invalidate all existing captures and guards.
-      this.commandRevision++;
-      this.commandsInFlight++;
-      for (const session of this.pendingUiSnapshots) session.conflicted = true;
-      return () => {
-        this.commandsInFlight--;
-        this.commandRevision++;
-      };
+      return () => undefined;
     }
     if (!WRITE_METHODS.has(method) || method.startsWith("workspace.")) {
       return () => undefined;
@@ -451,6 +480,90 @@ export class VaultOpsService {
     }
   }
 
+  private fileContentsEqual(path: string, a: string | null | undefined, b: string | null | undefined): boolean {
+    if (a === b) return true;
+    if (!path.endsWith(".canvas") || typeof a !== "string" || typeof b !== "string") return false;
+    try {
+      const left: unknown = JSON.parse(a);
+      const right: unknown = JSON.parse(b);
+      return isDeepStrictEqual(left, right);
+    } catch {
+      return false;
+    }
+  }
+
+  private viewFileData(view: unknown, path: string): string | undefined {
+    const target = view as UiFileView | null;
+    if (target?.file?.path !== path) return undefined;
+    if (view instanceof MarkdownView && view.getMode() === "source") return view.editor.getValue();
+    if (path.endsWith(".canvas") && typeof target.canvas?.getData === "function") {
+      return JSON.stringify(target.canvas.getData());
+    }
+    if (typeof target.getViewData === "function") return target.getViewData();
+    return undefined;
+  }
+
+  private async commandFileState(path: string): Promise<CommandFileState> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return { file: null, content: null, disk: null };
+    const disk = await this.app.vault.read(file);
+    let content: string | undefined;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      content ??= this.viewFileData(leaf.view, path);
+    });
+    return { file, content: content ?? disk, disk };
+  }
+
+  private async trackCommandChanges(): Promise<() => Promise<void>> {
+    const paths = new Set<string>();
+    for (const entry of this.auditEntries) if (entry.snapshot) paths.add(entry.snapshot.path);
+    for (const session of this.activeUiSnapshots()) paths.add(session.path);
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const file = (leaf.view as UiFileView).file;
+      if (file instanceof TFile) paths.add(file.path);
+    });
+    const changed = new Set<string>();
+    const refs: EventRef[] = [];
+    const observe = (file: { path: string }): void => { changed.add(file.path); };
+    if (typeof this.app.vault.on === "function") {
+      refs.push(this.app.vault.on("modify", observe), this.app.vault.on("create", observe),
+        this.app.vault.on("delete", observe), this.app.vault.on("rename", (file, oldPath) => {
+          changed.add(oldPath); changed.add(file.path);
+        }));
+    }
+    for (const path of paths) this.commandWrites.set(path, (this.commandWrites.get(path) ?? 0) + 1);
+    const before = new Map<string, CommandFileState | null>();
+    await Promise.all([...paths].map(async (path) => {
+      before.set(path, await this.commandFileState(path).catch(() => null));
+    }));
+    let completed = false;
+    return async () => {
+      if (completed) return;
+      completed = true;
+      try {
+        for (const path of new Set([...paths, ...changed])) {
+          const previous = before.get(path);
+          const current = await this.commandFileState(path).catch(() => null);
+          const sameLogicalContent = previous && current &&
+            this.fileContentsEqual(path, previous.content, current.content);
+          const ownBufferFlushed = current && this.fileContentsEqual(path, current.disk, current.content);
+          if (!previous || !current || previous.file !== current.file || !sameLogicalContent ||
+            (!this.fileContentsEqual(path, previous.disk, current.disk) && !ownBufferFlushed)) {
+            this.noteRevisions.set(path, this.noteRevision(path) + 1);
+            for (const session of this.activeUiSnapshots()) if (session.path === path) session.conflicted = true;
+          }
+        }
+      } finally {
+        for (const ref of refs) this.app.vault.offref(ref);
+        for (const path of paths) {
+          const count = (this.commandWrites.get(path) ?? 1) - 1;
+          if (count <= 0) this.commandWrites.delete(path);
+          else this.commandWrites.set(path, count);
+        }
+      }
+    };
+  }
+
   private liveSourceViews(path: string): MarkdownView[] {
     const views: MarkdownView[] = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
@@ -462,9 +575,9 @@ export class VaultOpsService {
   }
 
   private assertUndoStillCurrent(path: string, guard: SnapshotGuard): void {
-    if (guard.revision !== this.noteRevision(path) || guard.commandRevision !== this.commandRevision ||
-      this.commandsInFlight > 0 || (this.nativeWrites.get(path) ?? 0) > 1 ||
-      [...this.pendingUiSnapshots].some((session) => session.path === path)) {
+    if (guard.revision !== this.noteRevision(path) || (this.commandWrites.get(path) ?? 0) > 0 ||
+      (this.nativeWrites.get(path) ?? 0) > 1 ||
+      this.activeUiSnapshots().some((session) => session.path === path)) {
       throw this.undoConflict(path);
     }
   }
@@ -475,6 +588,12 @@ export class VaultOpsService {
       throw this.undoConflict(snap.path);
     }
     const existing = this.app.vault.getAbstractFileByPath(snap.path);
+    const fileView = guard.fileView?.deref();
+    if (existing instanceof TFile && fileView?.file?.path === snap.path &&
+      fileView.containerEl?.isConnected !== false && typeof guard.postContent === "string") {
+      await this.restoreFileViewSnapshot(snap, guard, existing, fileView);
+      return;
+    }
     if (guard.postContent === null) {
       if (existing) throw this.undoConflict(snap.path);
       await this.ensureParentFolders(snap.path);
@@ -495,12 +614,47 @@ export class VaultOpsService {
       } else {
         await this.app.vault.process(existing, (current) => {
           this.assertUndoStillCurrent(snap.path, guard);
-          if (current !== guard.postContent || this.liveSourceViews(snap.path).length > 0) {
+          if (!this.fileContentsEqual(snap.path, current, guard.postContent) || this.liveSourceViews(snap.path).length > 0) {
             throw this.undoConflict(snap.path);
           }
           return restored;
         });
       }
+    }
+  }
+
+  private async restoreFileViewSnapshot(
+    snap: VaultMutationSnapshot, guard: SnapshotGuard, file: TFile, view: UiFileView
+  ): Promise<void> {
+    const restored = snap.previousContent;
+    if (typeof restored !== "string" || (!view.setViewData && !view.canvas?.setData)) throw this.undoConflict(snap.path);
+    const persisted = await this.app.vault.read(file);
+    this.assertUndoStillCurrent(snap.path, guard);
+    if (this.app.vault.getAbstractFileByPath(snap.path) !== file || view.file?.path !== snap.path ||
+      !this.fileContentsEqual(snap.path, this.viewFileData(view, snap.path), guard.postContent) ||
+      (!this.fileContentsEqual(snap.path, persisted, guard.postContent) &&
+        !this.fileContentsEqual(snap.path, persisted, restored))) throw this.undoConflict(snap.path);
+    this.destructiveUndoPaths.add(snap.path);
+    try {
+      await this.app.vault.process(file, (current) => {
+        this.assertUndoStillCurrent(snap.path, guard);
+        if (!this.fileContentsEqual(snap.path, current, persisted) || view.file?.path !== snap.path ||
+          !this.fileContentsEqual(snap.path, this.viewFileData(view, snap.path), guard.postContent)) {
+          throw this.undoConflict(snap.path);
+        }
+        return restored;
+      });
+      if (view.file?.path !== snap.path) throw this.undoConflict(snap.path);
+      const current = this.viewFileData(view, snap.path);
+      if (!this.fileContentsEqual(snap.path, current, restored)) {
+        if (!this.fileContentsEqual(snap.path, current, guard.postContent)) throw this.undoConflict(snap.path);
+        if (snap.path.endsWith(".canvas") && view.canvas?.setData) {
+          const data: unknown = JSON.parse(restored);
+          view.canvas.setData(data);
+        } else if (view.setViewData) view.setViewData(restored, false);
+      }
+    } finally {
+      this.destructiveUndoPaths.delete(snap.path);
     }
   }
 
@@ -561,6 +715,9 @@ export class VaultOpsService {
     if (method === "ui.locate") {
       return ui.locate(params, caller);
     }
+    if (method === "ui.hover") {
+      return ui.hover(params, caller);
+    }
 
     let result: unknown;
     let summary: string;
@@ -599,8 +756,15 @@ export class VaultOpsService {
   }
 
   /** Called by the UI service inside its input lock, with the actual target editor. */
-  captureUiMutation(context: UiMutationContext, targetView?: MarkdownView | null): MutationCompleteCallback {
+  captureUiMutation(context: UiMutationContext, targetView?: unknown): MutationCompleteCallback | Promise<MutationCompleteCallback> {
     this.assertNoDestructiveUndo();
+    if (context.expectedFileOperation?.kind === "trash") return this.captureFileUiMutation(context, null, true);
+    const supplied = context.targetView ?? targetView;
+    if (supplied && !(supplied instanceof MarkdownView)) {
+      if ((supplied as UiFileView).file) return this.captureFileUiMutation(context, supplied);
+      if (context.notePath) throw new BridgeRpcError("ui_snapshot_unavailable", "The original file view is no longer available.");
+      return () => undefined;
+    }
     const notePath = context.notePath;
     if (!notePath) {
       return () => undefined;
@@ -609,7 +773,7 @@ export class VaultOpsService {
     if (suppliedView !== undefined && !(suppliedView instanceof MarkdownView)) {
       throw new BridgeRpcError("ui_snapshot_unavailable", "The original Markdown view cannot be verified.");
     }
-    let view = suppliedView instanceof MarkdownView ? suppliedView : targetView ?? null;
+    let view = suppliedView instanceof MarkdownView ? suppliedView : targetView instanceof MarkdownView ? targetView : null;
     if (!view) {
       this.app.workspace.iterateAllLeaves((leaf) => {
         if (view) {
@@ -647,11 +811,10 @@ export class VaultOpsService {
         context, view: editorView, editor: editorView.editor, cm: context.targetCm, path: notePath,
         before: editorView.getMode() === "source" ? editorView.editor.getValue() : editorView.getViewData(),
         revision: this.noteRevision(notePath),
-        commandRevision: this.commandRevision,
-        conflicted: this.commandsInFlight > 0 || (this.nativeWrites.get(notePath) ?? 0) > 0,
+        conflicted: (this.nativeWrites.get(notePath) ?? 0) > 0,
         depth: 1,
       };
-      for (const pending of this.pendingUiSnapshots) {
+      for (const pending of this.activeUiSnapshots()) {
         if (pending.path === notePath) {
           pending.conflicted = true;
           session.conflicted = true;
@@ -708,11 +871,102 @@ export class VaultOpsService {
           summary: `${completion?.ok === false ? "Partially changed" : "Changed"} '${notePath}' via ${context.action}${context.paneId ? ` in pane '${context.paneId}'` : ""}.${unverifiedPartial ? ` ${completion?.insertedChars ?? 0} characters reported; final content unverified.` : ""}`,
           snapshot: { kind: "modified", path: notePath, previousContent: captured.before },
           postContent,
-          snapshotConflicted: captured.conflicted || captured.revision !== this.noteRevision(notePath) ||
-            captured.commandRevision !== this.commandRevision,
+          snapshotConflicted: captured.conflicted || captured.revision !== this.noteRevision(notePath),
         });
       } finally {
         this.pendingUiSnapshots.delete(captured);
+      }
+    };
+  }
+
+  private async captureFileUiMutation(
+    context: UiMutationContext, view: UiFileView | null, trash = false
+  ): Promise<MutationCompleteCallback> {
+    const viewPath = view?.file?.path ?? null;
+    const isBases = viewPath?.endsWith(".base") || view?.getViewType?.() === "bases";
+    const path = this.safePath(trash ? context.expectedFileOperation?.path : context.targetFilePath ?? viewPath, true);
+    if (isBases && (!context.targetFilePath || path === viewPath || !path.endsWith(".md"))) {
+      throw new BridgeRpcError("ui_snapshot_unavailable", "Cannot verify the Bases row note for this edit.");
+    }
+    if (view && context.notePath && viewPath !== context.notePath) {
+      throw new BridgeRpcError("ui_snapshot_unavailable", "The original file view changed before capture.");
+    }
+    const file = this.requireFile(path);
+    const revision = this.noteRevision(path);
+    const card = path === viewPath && path.endsWith(".canvas") &&
+      (context.action === "type" || context.action === "press_key") ? findCanvasCardNode(context.targetElement) : null;
+    const flushCard = (): void => {
+      if (view && card && card.isConnected !== false && view.file?.path === viewPath &&
+        findCanvasCardNode(context.targetElement) === card) {
+        commitCanvasCardModel(view, context.targetElement, context.targetCm);
+      }
+    };
+    // Keep pre-existing child-editor text in the preimage, even before its debounce saves.
+    flushCard();
+    const before = this.viewFileData(view, path) ?? await this.app.vault.read(file);
+    if (this.app.vault.getAbstractFileByPath(path) !== file || view?.file?.path !== viewPath && view) {
+      throw new BridgeRpcError("ui_snapshot_unavailable", "The target file changed before capture.");
+    }
+    this.assertNoDestructiveUndo();
+    const session: FileUiSnapshotSession = { context, path, view, viewPath, before, revision,
+      conflicted: revision !== this.noteRevision(path) || this.hasPendingWrite(path), depth: 1 };
+    for (const pending of this.activeUiSnapshots()) if (pending.path === path) pending.conflicted = true;
+    this.pendingFileSnapshots.add(session);
+    let completed = false;
+    return async (completion) => {
+      if (completed) return;
+      completed = true;
+      try {
+        if (!session.conflicted && revision === this.noteRevision(path)) flushCard();
+        let postContent: string | null = before;
+        const deadline = Date.now() + (trash ? 1000 : 350);
+        do {
+          const current = this.app.vault.getAbstractFileByPath(path);
+          if (!current) postContent = null;
+          else if (current === file) postContent = this.viewFileData(view, path) ?? await this.app.vault.read(file);
+          else { session.conflicted = true; break; }
+          if (trash ? postContent === null : postContent !== before) break;
+          if (completion?.ok === false || (!trash && context.action === "click")) break;
+          if (Date.now() >= deadline) break;
+          await delay(20);
+        } while (Date.now() < deadline);
+        if (trash && completion?.ok !== false && postContent !== null) {
+          throw new BridgeRpcError("ui_effect_failed", `Deletion of '${path}' was not confirmed: the file is still present. Obsidian may have failed to move it to the configured trash.`);
+        }
+        if (postContent === before) return;
+        if (view && view.file?.path !== viewPath) session.conflicted = true;
+        let effectError: BridgeRpcError | undefined;
+        if (view && path === viewPath && path.endsWith(".canvas") && postContent !== null) {
+          try {
+            // A live card model can lead the debounced TextFileView save.
+            if (session.conflicted || revision !== this.noteRevision(path)) {
+              throw new Error("Another write overlaps this Canvas edit.");
+            }
+            view.canvas?.requestSave?.(false);
+            if (view.save) await view.save(false);
+            const persisted = await this.app.vault.read(file);
+            if (this.app.vault.getAbstractFileByPath(path) !== file || view.file?.path !== viewPath ||
+              !this.fileContentsEqual(path, this.viewFileData(view, path), postContent) ||
+              revision !== this.noteRevision(path)) {
+              session.conflicted = true;
+              throw new Error("The Canvas target changed while saving.");
+            }
+            if (!this.fileContentsEqual(path, persisted, postContent)) {
+              throw new Error("The Canvas model has not been persisted.");
+            }
+          } catch {
+            effectError = new BridgeRpcError("ui_effect_failed", `The edit to '${path}' could not be verified as saved. Partial changes are retained in the audit log.`);
+          }
+        }
+        this.pendingFileSnapshots.delete(session);
+        this.recordAudit({ method: `ui.${context.action}`, caller: context.caller, targetPath: path, allowed: true,
+          summary: `${trash ? "Deleted" : "Changed"} '${path}' via ${context.action}.`,
+          snapshot: { kind: "modified", path, previousContent: before }, postContent,
+          snapshotConflicted: session.conflicted || revision !== this.noteRevision(path),
+          fileView: view && viewPath === path ? view : undefined });
+        if (effectError && completion?.ok !== false) throw effectError;
+      } finally {
+        this.pendingFileSnapshots.delete(session);
       }
     };
   }
@@ -1540,31 +1794,33 @@ export class VaultOpsService {
           throw new BridgeRpcError("invalid_params", "Provide a non-empty 'commandId'.");
         }
         const lower = commandId.toLowerCase();
+        if (["app:quit", "app:exit", "app:close-window", "workspace:close-window", "app:open-settings"].includes(lower) &&
+          !this.getAllowUiInProtectedAreas()) {
+          throw new BridgeRpcError("ui_protected_area", "Settings, application quit and window controls are protected.");
+        }
         if (BLOCKED_COMMAND_SUBSTRINGS.some((sub) => lower.includes(sub))) {
           throw new BridgeRpcError(
             "command_blocked",
             `Command '${commandId}' is restricted by safety policy.`
           );
         }
-        const executed = this.executeCommandById(commandId);
-        if (!executed) {
-          throw new BridgeRpcError("command_not_found", `Command '${commandId}' was not found.`);
+        const complete = await this.trackCommandChanges();
+        try {
+          this.assertNoDestructiveUndo();
+          const executed = this.executeCommandById(commandId);
+          if (!executed) {
+            throw new BridgeRpcError("command_not_found", `Command '${commandId}' was not found.`);
+          }
+          this.recordAudit({ method, caller, targetPath: commandId, allowed: true,
+            summary: `Executed Obsidian command '${commandId}'.` });
+          const commandName = this.getCommandRegistry()[commandId]?.name?.trim() || commandId;
+          const activePath = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
+          await this.pointAtUiResult(caller,
+            { ...(activePath ? { notePath: activePath } : {}), prefer: "modal" }, `command: ${commandName}`);
+          return { executed: true, commandId };
+        } finally {
+          await complete();
         }
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: commandId,
-          allowed: true,
-          summary: `Executed Obsidian command '${commandId}'.`,
-        });
-        const commandName = this.getCommandRegistry()[commandId]?.name?.trim() || commandId;
-        const activePath = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
-        await this.pointAtUiResult(
-          caller,
-          { ...(activePath ? { notePath: activePath } : {}), prefer: "modal" },
-          `command: ${commandName}`
-        );
-        return { executed: true, commandId };
       }
 
       default:
@@ -1634,6 +1890,7 @@ export class VaultOpsService {
     snapshot?: VaultMutationSnapshot;
     postContent?: string | null;
     snapshotConflicted?: boolean;
+    fileView?: UiFileView;
   }): void {
     if (entry.snapshot) {
       const path = entry.snapshot.path;
@@ -1641,19 +1898,19 @@ export class VaultOpsService {
       this.noteRevisions.set(path, revision);
       this.snapshotGuards.set(entry.snapshot, {
         revision,
-        commandRevision: this.commandRevision,
         postContent: entry.postContent,
-        conflicted: Boolean(entry.snapshotConflicted) || this.commandsInFlight > 0 ||
+        fileView: entry.fileView ? new WeakRef(entry.fileView) : undefined,
+        conflicted: Boolean(entry.snapshotConflicted) ||
           (this.nativeWrites.get(path) ?? 0) > 1 ||
-          [...this.pendingUiSnapshots].some((pending) => pending.path === path),
+          this.activeUiSnapshots().some((pending) => pending.path === path),
       });
-      for (const pending of this.pendingUiSnapshots) {
+      for (const pending of this.activeUiSnapshots()) {
         if (pending.path === path) pending.conflicted = true;
       }
     } else if (entry.allowed && entry.targetPath && WRITE_METHODS.has(entry.method) &&
       !entry.method.startsWith("workspace.")) {
       this.noteRevisions.set(entry.targetPath, this.noteRevision(entry.targetPath) + 1);
-      for (const pending of this.pendingUiSnapshots) {
+      for (const pending of this.activeUiSnapshots()) {
         if (pending.path === entry.targetPath) pending.conflicted = true;
       }
     }

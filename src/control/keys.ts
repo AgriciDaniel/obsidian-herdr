@@ -28,7 +28,35 @@ const NAMED_KEYS: Record<string, { keyCode: string; text: string | null }> = {
   PageUp: { keyCode: "PageUp", text: null },
   PageDown: { keyCode: "PageDown", text: null },
   Space: { keyCode: "Space", text: " " },
+  F1: { keyCode: "F1", text: null },
+  F2: { keyCode: "F2", text: null },
+  F3: { keyCode: "F3", text: null },
+  F4: { keyCode: "F4", text: null },
+  F5: { keyCode: "F5", text: null },
+  F6: { keyCode: "F6", text: null },
+  F7: { keyCode: "F7", text: null },
+  F8: { keyCode: "F8", text: null },
+  F9: { keyCode: "F9", text: null },
+  F10: { keyCode: "F10", text: null },
+  F11: { keyCode: "F11", text: null },
+  F12: { keyCode: "F12", text: null },
 };
+
+const PUNCTUATION_SHIFTED: Record<string, string> = {
+  "=": "+",
+  "-": "_",
+  "[": "{",
+  "]": "}",
+  ";": ":",
+  "'": "\"",
+  ",": "<",
+  ".": ">",
+  "/": "?",
+  "\\": "|",
+  "`": "~",
+};
+
+const SHIFTED_PUNCTUATION_KEYS = new Set(Object.values(PUNCTUATION_SHIFTED));
 
 export const SUPPORTED_KEY_NAMES = Object.keys(NAMED_KEYS);
 
@@ -75,6 +103,13 @@ export function buildKeyPress(
     return { keyCode: upper, text: producesText ? ch : null, modifiers: ordered };
   }
   if (/^[0-9]$/.test(key)) {
+    return { keyCode: key, text: producesText ? key : null, modifiers: ordered };
+  }
+  if (Object.prototype.hasOwnProperty.call(PUNCTUATION_SHIFTED, key)) {
+    const ch = mods.has("shift") ? PUNCTUATION_SHIFTED[key] : key;
+    return { keyCode: key, text: producesText ? ch : null, modifiers: ordered };
+  }
+  if (SHIFTED_PUNCTUATION_KEYS.has(key)) {
     return { keyCode: key, text: producesText ? key : null, modifiers: ordered };
   }
   throw new Error(

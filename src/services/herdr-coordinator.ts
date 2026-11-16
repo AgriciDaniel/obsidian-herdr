@@ -12,11 +12,11 @@ import { VaultBridgeServer } from "../bridge/vault-bridge-server";
 import { BridgeRpcError, VaultOpsService, type VaultTextChange } from "../bridge/vault-ops";
 import { AgentCursorOverlay } from "../control/agent-cursor";
 import { getObsidianWebContents } from "../control/electron-host";
+import { resolveTopLevelElement } from "../control/nested-editors";
 import {
   UiControlService,
   type CodeMirrorViewLike,
   type ElementLeafContext,
-  type MutationCompleteCallback,
   type NoteLeafContext,
   type UiMutationContext,
 } from "../control/ui-control";
@@ -38,7 +38,7 @@ import type {
 } from "../domain/types";
 import { HerdrCliClient } from "../herdr/cli-client";
 import { HerdrSocketClient } from "../herdr/socket-client";
-import { resolveDefaultShell } from "../terminal/pty-host";
+import { deliverToTerminal, resolveDefaultShell } from "../terminal/pty-host";
 
 export interface CoordinatorState {
   binaryPath: string | null;
@@ -118,8 +118,10 @@ export class HerdrCoordinator {
         resolveElementContext: (el) => this.resolveEditorContext(el),
         resolveNoteLeaf: (notePath) => this.resolveOpenNoteLeaf(notePath),
         beforeMutation: (context) => this.captureUiMutation(context),
+        deliverToTerminal: (element, data) => this.deliverCapturedTerminalInput(element, data),
       }),
       getAllowUiControl: () => this.getSettings().allowUiControl,
+      getAllowUiInProtectedAreas: () => this.getSettings().allowUiInProtectedAreas,
       onAgentActivity: (caller, targetPath, action, change) =>
         this.notifyVaultCursorActivity(caller, targetPath, action, change),
     });
@@ -828,14 +830,18 @@ export class HerdrCoordinator {
   }
 
   private resolveEditorContext(el: Element): ElementLeafContext | null {
+    const hostElement = resolveTopLevelElement(el) ?? el;
     const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
     let context: ElementLeafContext | null = null;
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view;
-      if (view instanceof MarkdownView && view.containerEl.contains(el)) {
+      if (view.containerEl.contains(hostElement)) {
+        const file = (view as unknown as { file?: TFile | null }).file;
+        if (!file) return;
         context = {
-          notePath: view.file?.path,
-          pane: this.getNotePaneId(view, (leaf as unknown as { id?: string }).id),
+          notePath: file.path,
+          pane: view instanceof MarkdownView ? this.getNotePaneId(view, (leaf as unknown as { id?: string }).id)
+            : (leaf as unknown as { id?: string }).id,
           activePane: view === activeView,
         };
       }
@@ -843,29 +849,105 @@ export class HerdrCoordinator {
     return context;
   }
 
-  private captureUiMutation(context: UiMutationContext): MutationCompleteCallback {
-    if (!context.notePath) return this.vaultOps.captureUiMutation(context);
-    if (context.targetView !== undefined) {
-      if (!(context.targetView instanceof MarkdownView) || context.targetView.file?.path !== context.notePath) {
-        throw new BridgeRpcError("ui_snapshot_unavailable", "The UI mutation's original Markdown view changed before capture.");
-      }
-      return this.vaultOps.captureUiMutation(context, context.targetView);
+  private deliverCapturedTerminalInput(element: Element, data: string): boolean {
+    const leaves: Array<{ view: unknown }> = [];
+    this.app.workspace.iterateAllLeaves((leaf) => { leaves.push(leaf); });
+    return deliverToTerminal(element, data, leaves);
+  }
+
+  private resolveBasesRowPath(element: Element | null, targetView: unknown): string | undefined {
+    if (!element) return undefined;
+    const view = targetView as {
+      file?: TFile | null;
+      controller?: { view?: { getCellFromDom?: (element: Element) => unknown } };
+    } | null;
+    const table = view?.controller?.view;
+    const cellElement = element.closest(".bases-td");
+    if (table?.getCellFromDom && cellElement) {
+      const cell = table.getCellFromDom(element) as {
+        el?: Element; renderer?: { entry?: { file?: TFile } };
+      } | null;
+      const file = cell?.renderer?.entry?.file;
+      // The live cell lookup also works when the filename column is virtualized away.
+      if (cell?.el === cellElement && file instanceof TFile && file.extension === "md" &&
+        this.app.vault.getAbstractFileByPath(file.path) === file) return file.path;
+      return undefined;
     }
-    let targetView: MarkdownView | null = null;
+    let row = element.closest(".bases-tr, .bases-table-row, [role='row']");
+    for (let current: Element | null = element, depth = 0; !row && current && depth < 20; current = current.parentElement, depth++) {
+      if (current.parentElement?.classList?.contains("bases-tbody")) row = current;
+    }
+    if (!row) return undefined;
+    const nameCell = row.querySelector?.('.bases-td[data-property="file.name"]') ?? row.querySelector?.(".bases-td");
+    const paths = new Set<string>();
+    const nodes = [row, ...Array.from(nameCell?.querySelectorAll("[data-href], a.internal-link") ?? []),
+      ...Array.from(row.querySelectorAll("[data-path], [data-file], [data-file-path]"))];
+    for (const node of nodes) {
+      for (const attribute of ["data-path", "data-file", "data-file-path", "data-href"]) {
+        const path = node.getAttribute(attribute);
+        if (!path) continue;
+        const file = this.app.vault.getAbstractFileByPath(path) ?? (attribute === "data-href"
+          ? this.app.metadataCache.getFirstLinkpathDest(path, view?.file?.path ?? "") : null);
+        if (file instanceof TFile && file.extension === "md") paths.add(file.path);
+      }
+    }
+    return paths.size === 1 ? [...paths][0] : undefined;
+  }
+
+  private captureUiMutation(context: UiMutationContext): ReturnType<VaultOpsService["captureUiMutation"]> {
+    const element = context.targetElement;
+    const hostElement = resolveTopLevelElement(element);
+    if (!context.notePath && !element && !context.targetView) return this.vaultOps.captureUiMutation(context);
+    let targetView: unknown = context.targetView;
+    const suppliedFile = (targetView as { file?: TFile | null } | null)?.file;
     this.app.workspace.iterateAllLeaves((leaf) => {
       const view = leaf.view;
-      if (!(view instanceof MarkdownView) || view.file?.path !== context.notePath) {
+      const file = (view as unknown as { file?: TFile | null }).file;
+      // Card editors can be temporary MarkdownViews with no owning file.
+      if (hostElement && file?.extension === "canvas" &&
+        (file.path === context.notePath || (!context.notePath && !suppliedFile)) && view.containerEl?.contains(hostElement)) {
+        targetView = view;
         return;
       }
-      const paneId = this.getNotePaneId(view, (leaf as unknown as { id?: string }).id);
-      if (context.paneId && paneId !== context.paneId) {
-        return;
-      }
-      if (!targetView) {
+      if (targetView) return;
+      if (hostElement && view.containerEl?.contains(hostElement)) targetView = view;
+      else if (!element && view instanceof MarkdownView && view.file?.path === context.notePath &&
+        (!context.paneId || this.getNotePaneId(view, (leaf as unknown as { id?: string }).id) === context.paneId)) {
         targetView = view;
       }
     });
-    return this.vaultOps.captureUiMutation(context, targetView);
+    const fileView = targetView as { file?: TFile | null; getViewType?: () => string } | undefined;
+    const bound = { ...context, ...(targetView ? { targetView } : {}) };
+    const isBases = fileView?.file?.extension === "base" || fileView?.getViewType?.() === "bases";
+    const rowPath = isBases ? this.resolveBasesRowPath(element ?? null, targetView) : undefined;
+    if (rowPath && bound.targetFilePath && rowPath !== bound.targetFilePath) {
+      throw new BridgeRpcError("ui_snapshot_unavailable", "The Bases cell no longer belongs to the requested row note.");
+    }
+    if (fileView?.file) {
+      bound.notePath ??= fileView.file.path;
+      if (isBases && !bound.targetFilePath) bound.targetFilePath = rowPath;
+    }
+    // Only a Delete confirmation inside a modal establishes an expected deletion.
+    const button = element?.closest("button, [role='button']");
+    const modal = button?.closest(".modal");
+    if (!bound.expectedFileOperation && modal && /^(delete|move to trash)$/i.test(button?.textContent?.trim() ?? "")) {
+      const text = modal.textContent ?? "";
+      const names = [...text.matchAll(/["“]([^"”]+)["”]/g)].map((match) => match[1]);
+      const files = this.app.vault.getFiles().filter((file) => names.includes(file.path) || names.includes(file.name));
+      if (files.length !== 1) {
+        throw new BridgeRpcError("ui_snapshot_unavailable", "Cannot uniquely verify the file named by this Delete confirmation.");
+      }
+      bound.expectedFileOperation = { kind: "trash", path: files[0].path };
+    }
+    const captured = this.vaultOps.captureUiMutation(bound, targetView);
+    if (!rowPath) return captured;
+    return Promise.resolve(captured).then(async (complete) => {
+      if (this.resolveBasesRowPath(element ?? null, targetView) !== rowPath) {
+        await complete({ ok: false, errorCode: "ui_snapshot_unavailable" });
+        throw new BridgeRpcError("ui_snapshot_unavailable", "The Bases row changed while its preimage was being captured.");
+      }
+      return complete;
+    });
   }
 
   private resolveOpenNoteLeaf(notePath: string): (NoteLeafContext & { view: MarkdownView }) | null {

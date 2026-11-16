@@ -57,6 +57,20 @@ interface DocumentAnchor {
   docSnapshot: string | null;
 }
 
+interface RecentTextAnchor {
+  cm: CursorCodeMirrorLike;
+  notePath?: string;
+  pos: number;
+  docSnapshot: string | null;
+}
+
+interface CursorGlide {
+  startX: number;
+  startY: number;
+  elapsedMs: number;
+  durationMs: number;
+}
+
 interface CursorInstance {
   caller: string;
   label: string;
@@ -68,10 +82,10 @@ interface CursorInstance {
   ringEl: HTMLElement;
   x: number;
   y: number;
-  vx: number;
-  vy: number;
   targetX: number;
   targetY: number;
+  glide: CursorGlide | null;
+  settleWaiters: Array<() => void>;
   initialized: boolean;
   actionTimer: number | null;
   idleTimer: number | null;
@@ -171,13 +185,27 @@ function mapAnchoredPos(oldText: string | null, newText: string | null, pos: num
   }
   return Math.max(0, Math.min(newLen ?? nextPos, nextPos));
 }
-const SPRING_STIFFNESS = 280;
-const SPRING_DAMPING = 26;
+const MAX_GLIDE_MS = 180;
+const MIN_GLIDE_MS = 45;
+const DEFAULT_SETTLE_WAIT_MS = 250;
+const MAX_SETTLE_WAIT_MS = 500;
 const SETTLE_EPSILON = 0.35;
+const CLICK_POS_TOLERANCE_X = 24;
+const CLICK_POS_TOLERANCE_Y = 24;
 const HUE_BUCKETS = 12;
 const PILL_DEFAULT_X = 10;
 const PILL_DEFAULT_Y = 5;
 const PILL_ROW_STEP = 20;
+
+function hasDocumentAnchorTarget(docContext: DocumentCursorContext): boolean {
+  return Boolean(
+    docContext.cm ||
+      (typeof docContext.notePath === "string" && docContext.notePath.trim() !== "") ||
+      (typeof docContext.pos === "number" && Number.isFinite(docContext.pos)) ||
+      (typeof docContext.view?.file?.path === "string" && docContext.view.file.path.trim() !== "") ||
+      docContext.getLeafNotePath
+  );
+}
 
 function formatCssPx(value: number): string {
   const rounded = Math.round(value * 100) / 100;
@@ -303,7 +331,7 @@ export class AgentCursorOverlay {
   private readonly cursors = new Map<string, CursorInstance>();
   private readonly assignedHues = new Map<string, number>();
   private rafId: number | null = null;
-  private lastFrameMs = 0;
+  private lastFrameMs: number | null = null;
 
   constructor(options: AgentCursorOptions) {
     this.win = options.win;
@@ -330,9 +358,68 @@ export class AgentCursorOverlay {
   private resizeObserver: ResizeObserver | null = null;
   private winScrollListener: (() => void) | null = null;
   private readonly knownLiveCallers = new Set<string>();
+  private readonly pendingSettleTimers = new Set<number>();
+  private readonly recentTextAnchors = new Map<string, RecentTextAnchor>();
 
   getActiveCount(): number {
     return this.cursors.size;
+  }
+
+  /**
+   * Resolves once the caller's cursor finishes gliding to its current target,
+   * or immediately when disabled, reduced-motion, missing, or already settled.
+   */
+  whenSettled(caller: string, maxWaitMs = DEFAULT_SETTLE_WAIT_MS): Promise<void> {
+    if (this.disposed || !this.enabled) {
+      return Promise.resolve();
+    }
+    const cursor = this.cursors.get(caller);
+    if (!cursor || this.prefersReducedMotion() || this.isCursorSettled(cursor)) {
+      return Promise.resolve();
+    }
+    const capMs =
+      typeof maxWaitMs === "number" && Number.isFinite(maxWaitMs)
+        ? Math.max(0, Math.min(MAX_SETTLE_WAIT_MS, maxWaitMs))
+        : DEFAULT_SETTLE_WAIT_MS;
+    if (capMs === 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      let timer: number | null = null;
+      const finish = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer !== null) {
+          this.win.clearTimeout(timer);
+          this.pendingSettleTimers.delete(timer);
+          timer = null;
+        }
+        const idx = cursor.settleWaiters.indexOf(finish);
+        if (idx >= 0) {
+          cursor.settleWaiters.splice(idx, 1);
+        }
+        resolve();
+      };
+      cursor.settleWaiters.push(finish);
+      if (typeof this.win.setTimeout === "function") {
+        timer = this.win.setTimeout(() => {
+          const timerId = timer;
+          timer = null;
+          if (timerId !== null) {
+            this.pendingSettleTimers.delete(timerId);
+          }
+          if (!this.disposed && this.cursors.get(caller) === cursor && !this.isCursorSettled(cursor)) {
+            this.setCursorMotionTarget(cursor, cursor.targetX, cursor.targetY, true);
+          } else {
+            finish();
+          }
+        }, capMs);
+        this.pendingSettleTimers.add(timer);
+      }
+    });
   }
 
   moveTo(
@@ -347,10 +434,20 @@ export class AgentCursorOverlay {
       return;
     }
     this.cancelExitingForCaller(caller);
+    const renameOverride = this.resolveRenamePartialTarget(caller, action, docContext);
+    const effectiveCtx = renameOverride ? renameOverride.docContext : docContext;
+    const targetX = renameOverride ? renameOverride.point.x : x;
+    const targetY = renameOverride ? renameOverride.point.y : y;
     const cursor = this.ensureCursor(caller, label);
     const honest = normalizeHonestAction("move", action);
-    this.updateDocumentAnchor(cursor, docContext);
-    this.updateCursorTarget(cursor, x, y, honest.text, { isTyping: honest.isTyping, transientMs: honest.text ? Math.min(this.idleAfterMs, BRIEF_ACTION_MS) : 0 });
+    this.updateDocumentAnchor(cursor, effectiveCtx, {
+      clearOnEmpty: true,
+      matchPoint: { x: targetX, y: targetY },
+    });
+    this.updateCursorTarget(cursor, targetX, targetY, honest.text, {
+      isTyping: honest.isTyping,
+      transientMs: honest.text ? Math.min(this.idleAfterMs, BRIEF_ACTION_MS) : 0,
+    });
   }
 
   pulseClick(
@@ -359,7 +456,7 @@ export class AgentCursorOverlay {
     x: number,
     y: number,
     action = "clicking",
-    docContext?: DocumentCursorContext
+    docContext?: DocumentCursorContext | null
   ): void {
     if (this.disposed || !this.enabled) {
       return;
@@ -367,7 +464,7 @@ export class AgentCursorOverlay {
     this.cancelExitingForCaller(caller);
     const cursor = this.ensureCursor(caller, label);
     const honest = normalizeHonestAction("click", action);
-    this.updateDocumentAnchor(cursor, docContext);
+    this.updateDocumentAnchor(cursor, docContext, { clearOnEmpty: true, matchPoint: { x, y } });
     this.updateCursorTarget(cursor, x, y, honest.text, { isTyping: false, transientMs: Math.min(this.idleAfterMs, BRIEF_ACTION_MS) });
     this.triggerRing(cursor);
   }
@@ -377,14 +474,14 @@ export class AgentCursorOverlay {
     label: string,
     x: number,
     y: number,
-    docContext?: DocumentCursorContext
+    docContext?: DocumentCursorContext | null
   ): void {
     if (this.disposed || !this.enabled) {
       return;
     }
     this.cancelExitingForCaller(caller);
     const cursor = this.ensureCursor(caller, label);
-    this.updateDocumentAnchor(cursor, docContext);
+    this.updateDocumentAnchor(cursor, docContext, { clearOnEmpty: true });
     this.updateCursorTarget(cursor, x, y, "typing", { isTyping: true, transientMs: Math.min(this.idleAfterMs, TYPING_SAFETY_MS) });
     cursor.el.classList.add("is-typing");
   }
@@ -393,7 +490,7 @@ export class AgentCursorOverlay {
     this.parkAgent(caller, docContext);
   }
 
-  parkAgent(caller: string, docContext?: DocumentCursorContext): void {
+  parkAgent(caller: string, docContext?: DocumentCursorContext | null): void {
     if (this.disposed || !this.enabled) {
       return;
     }
@@ -411,11 +508,16 @@ export class AgentCursorOverlay {
     }
     this.clearActionLabel(cursor);
     cursor.el.classList.add("is-idle");
-    if (docContext) {
-      this.updateDocumentAnchor(cursor, docContext);
+    if (docContext !== undefined) {
+      this.updateDocumentAnchor(cursor, docContext, {
+        clearOnEmpty: true,
+        adoptInPlaceRename: true,
+      });
       this.reprojectCursor(cursor, true);
     } else if (cursor.docAnchor && this.isAnchorSameNoteAndConnected(cursor.docAnchor)) {
       this.syncAnchorFromDoc(cursor.docAnchor);
+      this.recentTextAnchors.delete(caller);
+      this.recordRecentTextAnchor(caller, cursor.docAnchor);
       this.reprojectCursor(cursor, true);
     }
     this.resetHideTimer(cursor);
@@ -438,6 +540,7 @@ export class AgentCursorOverlay {
         continue;
       }
       this.syncAnchorFromDoc(anchor, change);
+      this.recordRecentTextAnchor(cursor.caller, anchor);
       this.reprojectCursor(cursor, true);
     }
   }
@@ -445,10 +548,12 @@ export class AgentCursorOverlay {
   exitAgent(caller: string): void {
     const cursor = this.cursors.get(caller);
     this.knownLiveCallers.delete(caller);
+    this.recentTextAnchors.delete(caller);
     if (!cursor) {
       return;
     }
     this.clearTimers(cursor);
+    this.resolveSettleWaiters(cursor);
     this.cursors.delete(caller);
     if (this.cursors.size === 0) {
       this.stopLoop();
@@ -532,6 +637,7 @@ export class AgentCursorOverlay {
       return;
     }
     this.clearTimers(cursor);
+    this.resolveSettleWaiters(cursor);
     cursor.el.remove();
     this.cursors.delete(caller);
     if (this.cursors.size === 0) {
@@ -547,6 +653,10 @@ export class AgentCursorOverlay {
     for (const caller of Array.from(this.cursors.keys())) {
       this.clearAgent(caller);
     }
+    for (const timerId of this.pendingSettleTimers) {
+      this.win.clearTimeout(timerId);
+    }
+    this.pendingSettleTimers.clear();
     for (const [el, entry] of Array.from(this.fadingEls.entries())) {
       if (entry.timer !== null) {
         this.win.clearTimeout(entry.timer);
@@ -555,6 +665,7 @@ export class AgentCursorOverlay {
       this.fadingEls.delete(el);
     }
     this.knownLiveCallers.clear();
+    this.recentTextAnchors.clear();
     this.detachAllListeners();
     if (this.layerEl) {
       this.layerEl.remove();
@@ -681,10 +792,10 @@ export class AgentCursorOverlay {
       ringEl,
       x: startX,
       y: startY,
-      vx: 0,
-      vy: 0,
       targetX: startX,
       targetY: startY,
+      glide: null,
+      settleWaiters: [],
       initialized: false,
       actionTimer: null,
       idleTimer: null,
@@ -807,6 +918,48 @@ export class AgentCursorOverlay {
     }
   }
 
+  private isCursorSettled(cursor: CursorInstance): boolean {
+    return (
+      !cursor.glide &&
+      Math.hypot(cursor.targetX - cursor.x, cursor.targetY - cursor.y) <= SETTLE_EPSILON
+    );
+  }
+
+  private resolveSettleWaiters(cursor: CursorInstance): void {
+    if (cursor.settleWaiters.length === 0) {
+      return;
+    }
+    const waiters = cursor.settleWaiters.splice(0, cursor.settleWaiters.length);
+    for (const resolve of waiters) {
+      resolve();
+    }
+  }
+
+  private setCursorMotionTarget(cursor: CursorInstance, x: number, y: number, immediate: boolean): void {
+    cursor.targetX = x;
+    cursor.targetY = y;
+    const dist = Math.hypot(x - cursor.x, y - cursor.y);
+    if (immediate || this.prefersReducedMotion() || !cursor.initialized || dist <= SETTLE_EPSILON) {
+      cursor.x = x;
+      cursor.y = y;
+      cursor.glide = null;
+      cursor.initialized = true;
+      cursor.el.style.transform = `translate3d(${formatCssPx(x)}, ${formatCssPx(y)}, 0)`;
+      this.resolveSettleWaiters(cursor);
+      return;
+    }
+    const durationMs = Math.round(
+      Math.min(MAX_GLIDE_MS, Math.max(MIN_GLIDE_MS, MIN_GLIDE_MS + dist * 0.135))
+    );
+    cursor.glide = {
+      startX: cursor.x,
+      startY: cursor.y,
+      elapsedMs: 0,
+      durationMs,
+    };
+    this.startLoop();
+  }
+
   private updateCursorTarget(
     cursor: CursorInstance,
     x: number,
@@ -839,9 +992,6 @@ export class AgentCursorOverlay {
       this.clearActionLabel(cursor);
     }
 
-    cursor.targetX = clampedX;
-    cursor.targetY = clampedY;
-
     if (cursor.docAnchor) {
       if (!this.isAnchorSameNoteAndConnected(cursor.docAnchor)) {
         cursor.paneBounds = null;
@@ -864,16 +1014,7 @@ export class AgentCursorOverlay {
       cursor.paneBounds = null;
     }
 
-    if (this.prefersReducedMotion() || !cursor.initialized) {
-      cursor.x = clampedX;
-      cursor.y = clampedY;
-      cursor.vx = 0;
-      cursor.vy = 0;
-      cursor.initialized = true;
-      cursor.el.style.transform = `translate3d(${formatCssPx(clampedX)}, ${formatCssPx(clampedY)}, 0)`;
-    } else {
-      this.startLoop();
-    }
+    this.setCursorMotionTarget(cursor, clampedX, clampedY, false);
 
     this.updateLabelOffsets();
     this.resetActivityTimers(cursor);
@@ -959,39 +1100,169 @@ export class AgentCursorOverlay {
     }
   }
 
-  private updateDocumentAnchor(cursor: CursorInstance, docContext?: DocumentCursorContext | null): void {
-    if (docContext === null) {
-      cursor.docAnchor = null;
-      cursor.paneBounds = null;
-      cursor.el.classList.remove("is-offscreen");
-      this.pruneUnusedObservers();
+  private recordRecentTextAnchor(caller: string, anchor: DocumentAnchor | null): void {
+    if (
+      !anchor?.cm ||
+      typeof anchor.pos !== "number" ||
+      !Number.isFinite(anchor.pos) ||
+      anchor.docSnapshot === null
+    ) {
+      return;
+    }
+    this.recentTextAnchors.set(caller, {
+      cm: anchor.cm,
+      notePath: anchor.notePath,
+      pos: anchor.pos,
+      docSnapshot: anchor.docSnapshot,
+    });
+  }
+
+  /**
+   * When a mid-write rename aborts typing and vault.rename_note immediately follows with
+   * pointAtResult(..., "rename") (which reads the stale editor selection), keep the cursor
+   * anchored on the partial streamed line inside the renamed buffer.
+   */
+  private resolveRenamePartialTarget(
+    caller: string,
+    action: string | undefined,
+    docContext?: DocumentCursorContext | null
+  ): { docContext: DocumentCursorContext; point: { x: number; y: number } } | null {
+    if (action?.trim() !== "rename" || !docContext?.cm || typeof docContext.pos === "number") {
+      return null;
+    }
+    const cm = docContext.cm;
+    if (cm.scrollDOM?.isConnected === false || cm.dom?.isConnected === false) {
+      return null;
+    }
+    const existingAnchor = this.cursors.get(caller)?.docAnchor ?? null;
+    const recent =
+      existingAnchor?.cm === cm && typeof existingAnchor.pos === "number"
+        ? {
+            cm,
+            notePath: existingAnchor.notePath,
+            pos: existingAnchor.pos,
+            docSnapshot: existingAnchor.docSnapshot,
+          }
+        : this.recentTextAnchors.get(caller) ?? null;
+    if (!recent || recent.cm !== cm || !Number.isFinite(recent.pos)) {
+      return null;
+    }
+    const currentDoc = cm.state?.doc ? cm.state.doc.toString() : null;
+    if (currentDoc === null || recent.docSnapshot === null) {
+      return null;
+    }
+    const sameText = currentDoc === recent.docSnapshot;
+    const renamedInPlace = Boolean(
+      recent.notePath && docContext.notePath && recent.notePath !== docContext.notePath
+    );
+    if (!sameText && !renamedInPlace) {
+      return null;
+    }
+    const targetPos = sameText
+      ? Math.max(0, Math.min(currentDoc.length, recent.pos))
+      : Math.max(
+          0,
+          Math.min(currentDoc.length, mapAnchoredPos(recent.docSnapshot, currentDoc, recent.pos))
+        );
+    const coords = cm.coordsAtPos?.(targetPos) ?? cm.coordsAtPos?.(targetPos, -1);
+    if (!coords || !Number.isFinite(coords.left) || !Number.isFinite(coords.top)) {
+      return null;
+    }
+    return {
+      docContext: { ...docContext, pos: targetPos },
+      point: caretPointFromCoords(coords),
+    };
+  }
+
+  private clearDocumentAnchor(cursor: CursorInstance): void {
+    cursor.docAnchor = null;
+    cursor.paneBounds = null;
+    cursor.el.classList.remove("is-offscreen");
+    this.pruneUnusedObservers();
+  }
+
+  private updateDocumentAnchor(
+    cursor: CursorInstance,
+    docContext?: DocumentCursorContext | null,
+    opts?: { clearOnEmpty?: boolean; matchPoint?: { x: number; y: number }; adoptInPlaceRename?: boolean }
+  ): void {
+    if (docContext === null || (!docContext && opts?.clearOnEmpty)) {
+      this.clearDocumentAnchor(cursor);
       return;
     }
     if (!docContext) {
       return;
     }
+    if (!hasDocumentAnchorTarget(docContext)) {
+      if (opts?.clearOnEmpty) {
+        this.clearDocumentAnchor(cursor);
+      }
+      return;
+    }
+
     const prev = cursor.docAnchor;
-    const cm = docContext.cm !== undefined ? docContext.cm : prev?.cm ?? null;
-    const notePath = docContext.notePath !== undefined ? docContext.notePath : prev?.notePath;
-    const pane = docContext.pane !== undefined ? docContext.pane : prev?.pane;
-    const leafId = docContext.leafId !== undefined ? docContext.leafId : prev?.leafId;
-    const containerEl = docContext.containerEl !== undefined ? docContext.containerEl : prev?.containerEl ?? null;
-    const view = docContext.view !== undefined ? docContext.view : prev?.view ?? null;
-    const getLeafNotePath =
-      docContext.getLeafNotePath !== undefined ? docContext.getLeafNotePath : prev?.getLeafNotePath;
-    const isVisible = docContext.isVisible !== undefined ? docContext.isVisible : prev?.isVisible;
-    const sameTargetDoc =
+    const sameNote =
+      prev !== null &&
+      (docContext.notePath === undefined || prev.notePath === undefined || prev.notePath === docContext.notePath);
+    const sameCm =
+      prev !== null &&
+      (docContext.cm === undefined || docContext.cm === null || prev.cm === null || prev.cm === docContext.cm);
+    const sameTargetDoc = Boolean(prev && sameNote && sameCm);
+
+    const cm = docContext.cm !== undefined ? docContext.cm : sameTargetDoc ? prev?.cm ?? null : null;
+    const view = docContext.view !== undefined ? docContext.view : sameTargetDoc ? prev?.view ?? null : null;
+    const docSnapshot = cm?.state?.doc ? cm.state.doc.toString() : sameTargetDoc ? prev?.docSnapshot ?? null : null;
+    let notePath =
+      docContext.notePath !== undefined ? docContext.notePath : sameCm ? prev?.notePath : undefined;
+    if (
+      opts?.adoptInPlaceRename &&
       prev &&
-      (notePath === undefined || prev.notePath === undefined || prev.notePath === notePath) &&
-      (cm === null || prev.cm === null || prev.cm === cm);
+      cm &&
+      prev.cm === cm &&
+      view?.file?.path &&
+      notePath !== undefined &&
+      view.file.path !== notePath &&
+      prev.docSnapshot !== null &&
+      docSnapshot === prev.docSnapshot
+    ) {
+      notePath = view.file.path;
+    }
+    const pane = docContext.pane !== undefined ? docContext.pane : sameTargetDoc ? prev?.pane : undefined;
+    const leafId = docContext.leafId !== undefined ? docContext.leafId : sameTargetDoc ? prev?.leafId : undefined;
+    const containerEl =
+      docContext.containerEl !== undefined ? docContext.containerEl : sameTargetDoc ? prev?.containerEl ?? null : null;
+    const getLeafNotePath =
+      docContext.getLeafNotePath !== undefined
+        ? docContext.getLeafNotePath
+        : sameTargetDoc
+          ? prev?.getLeafNotePath
+          : undefined;
+    const isVisible =
+      docContext.isVisible !== undefined ? docContext.isVisible : sameTargetDoc ? prev?.isVisible : undefined;
 
     const explicitPos = typeof docContext.pos === "number" && Number.isFinite(docContext.pos) ? docContext.pos : null;
     const selectionPos =
       typeof cm?.state?.selection?.main?.head === "number" && Number.isFinite(cm.state.selection.main.head)
         ? cm.state.selection.main.head
         : null;
-    const pos = explicitPos ?? selectionPos ?? (sameTargetDoc ? prev?.pos ?? null : null);
-    const docSnapshot = cm?.state?.doc ? cm.state.doc.toString() : sameTargetDoc ? prev?.docSnapshot ?? null : null;
+    let pos = explicitPos ?? selectionPos ?? (sameTargetDoc ? prev?.pos ?? null : null);
+
+    // Visual widget clicks/moves (e.g. task checkboxes) may inherit an unrelated CM selection
+    // head that lies offscreen; keep the anchor unpinned to text pos so DOM re-renders stay put.
+    if (pos !== null && opts?.matchPoint && cm?.coordsAtPos) {
+      const coords = cm.coordsAtPos(pos) ?? cm.coordsAtPos(pos, -1);
+      if (!coords || !Number.isFinite(coords.left) || !Number.isFinite(coords.top)) {
+        pos = null;
+      } else {
+        const pt = caretPointFromCoords(coords);
+        if (
+          Math.abs(pt.x - opts.matchPoint.x) > CLICK_POS_TOLERANCE_X ||
+          Math.abs(pt.y - opts.matchPoint.y) > CLICK_POS_TOLERANCE_Y
+        ) {
+          pos = null;
+        }
+      }
+    }
 
     cursor.docAnchor = {
       notePath,
@@ -1005,6 +1276,7 @@ export class AgentCursorOverlay {
       pos,
       docSnapshot,
     };
+    this.recordRecentTextAnchor(cursor.caller, cursor.docAnchor);
 
     if (cm?.scrollDOM) {
       this.attachScrollDom(cm.scrollDOM);
@@ -1021,6 +1293,13 @@ export class AgentCursorOverlay {
   private isAnchorSameNoteAndConnected(anchor: DocumentAnchor): boolean {
     if (anchor.isVisible && !anchor.isVisible()) {
       return false;
+    }
+    const hostDoc = this.win.document;
+    for (const el of [anchor.cm?.scrollDOM, anchor.cm?.dom, anchor.containerEl]) {
+      const ownerDoc = (el as { ownerDocument?: Document | null } | null | undefined)?.ownerDocument;
+      if (ownerDoc && hostDoc && ownerDoc !== hostDoc) {
+        return false;
+      }
     }
     if (anchor.view && anchor.notePath !== undefined && anchor.view.file?.path !== anchor.notePath) {
       return false;
@@ -1111,8 +1390,6 @@ export class AgentCursorOverlay {
         anchor.pos,
         change && textChanged ? change : undefined
       );
-    } else if (anchor.cm?.state?.selection?.main?.head !== undefined) {
-      anchor.pos = anchor.cm.state.selection.main.head;
     }
     if (nextText !== null) {
       anchor.docSnapshot = nextText;
@@ -1142,8 +1419,18 @@ export class AgentCursorOverlay {
       return;
     }
     if (anchor.pos === null) {
-      cursor.paneBounds = null;
-      cursor.el.classList.add("is-offscreen");
+      if (paneBounds && this.hasMeasurableHostBox(anchor)) {
+        const outOfBounds =
+          cursor.targetX < paneBounds.left - 2 ||
+          cursor.targetX > paneBounds.right + 2 ||
+          cursor.targetY < paneBounds.top - 2 ||
+          cursor.targetY > paneBounds.bottom + 2;
+        cursor.el.classList.toggle("is-offscreen", outOfBounds);
+        cursor.paneBounds = outOfBounds ? null : paneBounds;
+      } else {
+        cursor.paneBounds = paneBounds;
+        cursor.el.classList.remove("is-offscreen");
+      }
       this.updateLabelOffsets();
       return;
     }
@@ -1181,24 +1468,12 @@ export class AgentCursorOverlay {
     const caretPt = caretPointFromCoords(coords);
     const clampedX = Math.max(0, Math.min(this.win.innerWidth || caretPt.x, caretPt.x));
     const clampedY = Math.max(0, Math.min(this.win.innerHeight || caretPt.y, caretPt.y));
-    cursor.targetX = clampedX;
-    cursor.targetY = clampedY;
-
-    if (
+    const snap =
       immediate ||
       this.prefersReducedMotion() ||
       !cursor.initialized ||
-      cursor.el.classList.contains("is-idle")
-    ) {
-      cursor.x = clampedX;
-      cursor.y = clampedY;
-      cursor.vx = 0;
-      cursor.vy = 0;
-      cursor.initialized = true;
-      cursor.el.style.transform = `translate3d(${formatCssPx(clampedX)}, ${formatCssPx(clampedY)}, 0)`;
-    } else {
-      this.startLoop();
-    }
+      cursor.el.classList.contains("is-idle");
+    this.setCursorMotionTarget(cursor, clampedX, clampedY, snap);
     this.updateLabelOffsets();
   }
 
@@ -1406,7 +1681,7 @@ export class AgentCursorOverlay {
     if (this.disposed || this.rafId !== null) {
       return;
     }
-    this.lastFrameMs = this.win.performance?.now?.() ?? Date.now();
+    this.lastFrameMs = null;
     this.rafId = this.win.requestAnimationFrame((now) => this.tick(now));
   }
 
@@ -1422,30 +1697,37 @@ export class AgentCursorOverlay {
     if (this.disposed || this.cursors.size === 0) {
       return;
     }
-    const rawDt = (now - this.lastFrameMs) / 1000;
-    this.lastFrameMs = now;
-    const dt = Math.min(0.05, Math.max(0.004, Number.isFinite(rawDt) ? rawDt : 0.016));
+    const rawDtMs =
+      this.lastFrameMs !== null && Number.isFinite(now - this.lastFrameMs)
+        ? now - this.lastFrameMs
+        : 16;
+    this.lastFrameMs = Number.isFinite(now) ? now : null;
+    const dtMs = Math.min(MAX_GLIDE_MS, Math.max(4, rawDtMs));
 
     let anyMoving = false;
     for (const cursor of this.cursors.values()) {
-      const dx = cursor.targetX - cursor.x;
-      const dy = cursor.targetY - cursor.y;
-      const dist = Math.hypot(dx, dy);
-      const speed = Math.hypot(cursor.vx, cursor.vy);
-
-      if (dist <= SETTLE_EPSILON && speed <= SETTLE_EPSILON) {
+      if (cursor.glide) {
+        cursor.glide.elapsedMs += dtMs;
+        const progress =
+          cursor.glide.durationMs > 0
+            ? Math.min(1, cursor.glide.elapsedMs / cursor.glide.durationMs)
+            : 1;
+        const dist = Math.hypot(cursor.targetX - cursor.x, cursor.targetY - cursor.y);
+        if (progress >= 1 || dist <= SETTLE_EPSILON) {
+          cursor.x = cursor.targetX;
+          cursor.y = cursor.targetY;
+          cursor.glide = null;
+          this.resolveSettleWaiters(cursor);
+        } else {
+          const eased = 1 - (1 - progress) ** 3;
+          cursor.x = cursor.glide.startX + (cursor.targetX - cursor.glide.startX) * eased;
+          cursor.y = cursor.glide.startY + (cursor.targetY - cursor.glide.startY) * eased;
+          anyMoving = true;
+        }
+      } else {
         cursor.x = cursor.targetX;
         cursor.y = cursor.targetY;
-        cursor.vx = 0;
-        cursor.vy = 0;
-      } else {
-        const ax = SPRING_STIFFNESS * dx - SPRING_DAMPING * cursor.vx;
-        const ay = SPRING_STIFFNESS * dy - SPRING_DAMPING * cursor.vy;
-        cursor.vx += ax * dt;
-        cursor.vy += ay * dt;
-        cursor.x += cursor.vx * dt;
-        cursor.y += cursor.vy * dt;
-        anyMoving = true;
+        this.resolveSettleWaiters(cursor);
       }
       cursor.el.style.transform = `translate3d(${formatCssPx(cursor.x)}, ${formatCssPx(cursor.y)}, 0)`;
     }

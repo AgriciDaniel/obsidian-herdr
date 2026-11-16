@@ -272,6 +272,21 @@ export class PtySession {
     this.proc.stdin.write(data, "utf8");
   }
 
+  /** Accept captured user bytes without focusing xterm or silently targeting a closed input. */
+  tryWrite(data: string): boolean {
+    const input = this.proc?.stdin;
+    if (!data || !this.isRunning() || !input || input.destroyed || input.writableEnded || !input.writable) {
+      return false;
+    }
+    try {
+      input.write(data, "utf8");
+      // A false stream.write return indicates backpressure; the bytes were still accepted.
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   resize(cols: number, rows: number): void {
     const nextCols = Math.max(10, Math.round(cols));
     const nextRows = Math.max(3, Math.round(rows));
@@ -325,4 +340,28 @@ export class PtySession {
       }
     }
   }
+}
+
+/** Deliver to the original xterm input's current session, without changing DOM focus. */
+export function deliverToTerminal(
+  element: Element,
+  data: string,
+  leaves: Iterable<{ view: unknown }>
+): boolean {
+  if (!data || !element.isConnected || !element.matches(".xterm-helper-textarea")) return false;
+  const host = element.closest(".herdr-terminal-host");
+  if (!host) return false;
+  for (const leaf of leaves) {
+    // HerdrTerminalView owns this runtime session; sendTextToPty also focuses its view.
+    const view = leaf.view as {
+      getViewType?: () => string;
+      contentEl?: HTMLElement;
+      pty?: unknown;
+    } | null;
+    if (view?.getViewType?.() !== "herdr-terminal-view" ||
+      view.contentEl?.ownerDocument !== element.ownerDocument ||
+      !view.contentEl.contains(element) || !view.contentEl.contains(host)) continue;
+    return view.pty instanceof PtySession ? view.pty.tryWrite(data) : false;
+  }
+  return false;
 }

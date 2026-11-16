@@ -3442,7 +3442,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     await ui.pressKey({ key: "Escape" });
     await ui.scroll({ target: { x: 40, y: 40 }, deltaY: 120 });
     await ui.drag({ from: { x: 30, y: 30 }, to: { x: 80, y: 80 }, steps: 2 });
-    assert.deepEqual(sleepCalls, [10, 10, 30, 4, 4, 10]);
+    assert.deepEqual(sleepCalls, [10, 10, 30, 4, 4, 4, 4, 10]);
   });
 
   it("returns verified path, line, text, and fenced-aware section heading proof from insertLine", async () => {
@@ -5861,5 +5861,2109 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       assert.equal(h.palette.value, "", "Modal input must not be polluted by user's pre-modal typing");
       assert.equal(h.user.value, "jk", "Captured user typing during modal open must not be dropped");
     }
+  });
+
+  it("writes selector and pixel ui.type targets on Markdown editors via CM transactions without borrowing focus, and expires expected ledger entries after 500ms (Phase 1 1a, 1b)", async () => {
+    let noteText = "alpha";
+    const dispatches: Array<Record<string, unknown>> = [];
+    let focusChanges = 0;
+
+    const userField = {
+      tagName: "INPUT",
+      value: "user",
+      selectionStart: 4,
+      selectionEnd: 4,
+      selectionDirection: "none",
+      disabled: false,
+      readOnly: false,
+      isConnected: true,
+      matches: (s: string) => s.includes("input") && !s.includes("password"),
+      closest: () => null,
+      getAttribute: () => null,
+      focus: () => {
+        focusChanges += 1;
+        doc.activeElement = userField;
+      },
+      setSelectionRange: (a: number, b: number) => {
+        userField.selectionStart = a;
+        userField.selectionEnd = b;
+      },
+      setRangeText: (rep: string, start: number, end: number) => {
+        userField.value = userField.value.slice(0, start) + rep + userField.value.slice(end);
+        userField.selectionStart = start + rep.length;
+        userField.selectionEnd = start + rep.length;
+      },
+      dispatchEvent: () => true,
+      getBoundingClientRect: () => ({ left: 500, top: 450, right: 800, bottom: 485, width: 300, height: 35 }),
+    };
+
+    const leafEl = {
+      tagName: "DIV",
+      isConnected: true,
+      classList: { contains: (c: string) => c === "workspace-leaf" || c === "mod-active" },
+      contains: (o: unknown) => o === leafEl || o === cmContent,
+      closest: (s: string) => (s.includes(".workspace-leaf") ? leafEl : null),
+      matches: (s: string) => s.includes(".workspace-leaf"),
+      getAttribute: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 450, height: 500, right: 450, bottom: 500 }),
+    };
+    const cmContent = {
+      tagName: "DIV",
+      isConnected: true,
+      isContentEditable: true,
+      classList: { contains: (c: string) => c === "cm-content" },
+      parentElement: leafEl,
+      matches: (s: string) => s.includes(".cm-content"),
+      closest: (s: string) =>
+        s.includes(".workspace-leaf")
+          ? leafEl
+          : s.includes(".cm-content") || s.includes(".cm-editor")
+            ? cmContent
+            : null,
+      contains: (o: unknown) => o === cmContent,
+      getAttribute: () => null,
+      getBoundingClientRect: () => ({ left: 20, top: 40, width: 400, height: 420, right: 420, bottom: 460 }),
+    };
+    let cmHead = 5;
+    const cm = {
+      dom: leafEl as unknown as Element,
+      contentDOM: cmContent as unknown as Element,
+      scrollDOM: leafEl as unknown as HTMLElement,
+      cmView: undefined as unknown,
+      state: {
+        doc: {
+          toString: () => noteText,
+          get length() {
+            return noteText.length;
+          },
+          get lines() {
+            return noteText.split("\n").length;
+          },
+          line: () => ({ number: 1, from: 0, to: noteText.length, text: noteText }),
+        },
+        selection: {
+          main: {
+            get head() {
+              return cmHead;
+            },
+          },
+        },
+      },
+      coordsAtPos: (pos: number) => ({ left: 40 + pos * 7, top: 80, right: 42 + pos * 7, bottom: 100 }),
+      posAtCoords: () => noteText.length,
+      focus: () => {
+        focusChanges += 1;
+        doc.activeElement = cmContent;
+      },
+      dispatch: (spec: Record<string, unknown>) => {
+        dispatches.push(spec);
+        const ch = spec.changes as { from: number; insert: string } | undefined;
+        if (ch && typeof ch.insert === "string") {
+          noteText = noteText.slice(0, ch.from) + ch.insert + noteText.slice(ch.from);
+          cmHead += ch.insert.length;
+        }
+      },
+    };
+    (cmContent as Record<string, unknown>).cmView = { view: cm };
+
+    const listeners = new Map<string, Array<(ev: unknown) => void>>();
+    const nonEditorBtn = {
+      tagName: "BUTTON",
+      isConnected: true,
+      disabled: false,
+      getAttribute: () => null,
+      matches: (s: string) => s.includes(".non-editor-btn"),
+      closest: () => null,
+      contains: (o: unknown) => o === nonEditorBtn,
+      getBoundingClientRect: () => ({ left: 460, top: 60, width: 100, height: 30, right: 560, bottom: 90 }),
+    };
+    const doc: Record<string, unknown> = {
+      body: { innerText: "" },
+      documentElement: {},
+      activeElement: userField,
+      querySelectorAll: (s: string) =>
+        s.includes(".cm-content") ? [cmContent] : s.includes(".non-editor-btn") ? [nonEditorBtn] : [],
+      elementFromPoint: (x: number) => (x < 450 ? cmContent : nonEditorBtn),
+      addEventListener: (t: string, fn: (ev: unknown) => void) => {
+        const list = listeners.get(t) ?? [];
+        list.push(fn);
+        listeners.set(t, list);
+      },
+      removeEventListener: (t: string, fn: (ev: unknown) => void) => {
+        listeners.set(t, (listeners.get(t) ?? []).filter((f) => f !== fn));
+      },
+    };
+    const win = {
+      innerWidth: 1000,
+      innerHeight: 600,
+      document: doc,
+      getComputedStyle: () => ({ visibility: "visible", display: "block" }),
+      requestAnimationFrame: (cb: () => void) => {
+        cb();
+        return 1;
+      },
+      setTimeout,
+      clearTimeout,
+    } as unknown as Window;
+
+    const webEvents: Array<Record<string, unknown>> = [];
+    const ui = new UiControlService({
+      win,
+      getUiTypingSpeed: () => "fast",
+      resolveElementContext: (el) =>
+        el === leafEl || el === cmContent ? { notePath: "SelectorNote.md", pane: "main", activePane: true } : null,
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          webEvents.push(ev);
+          if (ev.type === "mouseDown") doc.activeElement = nonEditorBtn;
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => undefined,
+    });
+
+    await ui.type({ target: { selector: ".cm-content" }, text: " beta" }, "A");
+    await ui.type({ target: { x: 100, y: 120 }, text: " gamma" }, "A");
+    assert.equal(noteText, "alpha beta gamma");
+    assert.equal(focusChanges, 0, "Selector and pixel editor targets must never touch DOM focus");
+    assert.equal(webEvents.length, 0, "No OS mouse/key input events for Markdown editor ui.type");
+    assert.equal(dispatches.some((s) => s.selection !== undefined), false);
+
+    // 1b timeout expiry: stale unmatched agent key expires after 500ms so later physical user key is intercepted.
+    let interceptedLateKey = false;
+    let keySent = false;
+    let checkedExpiry = false;
+    const uiTimeout = new UiControlService({
+      win,
+      getUiTypingSpeed: () => "visible",
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") doc.activeElement = nonEditorBtn;
+          if (ev.type === "keyDown") keySent = true;
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        // Wait >500ms on press_key settle so the unmatched head entry expires, then inject physical 'a'.
+        if (keySent && !checkedExpiry) {
+          checkedExpiry = true;
+          await new Promise<void>((resolve) => setTimeout(resolve, 520));
+          let prevented = false;
+          const ev = {
+            type: "keydown",
+            key: "a",
+            isTrusted: true,
+            preventDefault: () => {
+              prevented = true;
+            },
+            stopImmediatePropagation: () => undefined,
+            stopPropagation: () => undefined,
+          };
+          for (const fn of [...(listeners.get("keydown") ?? [])]) {
+            fn(ev);
+          }
+          interceptedLateKey = prevented;
+        }
+      },
+    });
+    await uiTimeout.batch(
+      {
+        steps: [
+          { action: "click", target: { selector: ".non-editor-btn" } },
+          { action: "press_key", key: "a" },
+        ],
+      },
+      "A"
+    );
+    assert.equal(interceptedLateKey, true, "Expired ledger entry after 500ms must not exempt later physical key");
+    assert.equal(userField.value, "usera");
+  });
+
+  it("refuses title bar window controls and app-level quit with ui_protected_area unless allowed (Audit P0)", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const closeSvg = {
+      tagName: "svg",
+      getBoundingClientRect: () => ({ x: 1886, y: 8, left: 1886, top: 8, width: 24, height: 24, right: 1910, bottom: 32 }),
+      closest: (sel: string): unknown => {
+        if (sel.includes(".titlebar-button") || sel.includes(".mod-close") || sel.includes(".titlebar-button-container")) {
+          return titleCloseBtn;
+        }
+        return null;
+      },
+    } as unknown as Element;
+    const titleCloseBtn = {
+      tagName: "DIV",
+      className: "titlebar-button mod-close",
+      getBoundingClientRect: () => ({ x: 1884, y: 6, left: 1884, top: 6, width: 28, height: 28, right: 1912, bottom: 34 }),
+      getAttribute: (name: string) => (name === "aria-label" ? "Close window" : null),
+      closest: (sel: string): unknown => {
+        if (
+          sel.includes(".titlebar-button-container") ||
+          sel.includes(".titlebar-button") ||
+          sel.includes(".mod-close") ||
+          sel.includes(".titlebar")
+        ) {
+          return titleCloseBtn;
+        }
+        return null;
+      },
+      contains: (other: Element | null) => other === titleCloseBtn || other === closeSvg,
+    } as unknown as Element;
+    const titleMinBtn = {
+      tagName: "DIV",
+      className: "titlebar-button mod-minimize",
+      getBoundingClientRect: () => ({ x: 1824, y: 6, left: 1824, top: 6, width: 28, height: 28, right: 1852, bottom: 34 }),
+      getAttribute: (name: string) => (name === "aria-label" ? "Minimize" : null),
+      closest: (sel: string): unknown =>
+        sel.includes(".titlebar-minimize") || sel.includes(".mod-minimize") || sel.includes(".titlebar-button-container")
+          ? titleMinBtn
+          : null,
+      contains: (other: Element | null) => other === titleMinBtn,
+    } as unknown as Element;
+    const quitMenuEl = {
+      tagName: "DIV",
+      textContent: "Quit",
+      getBoundingClientRect: () => ({ x: 120, y: 220, left: 120, top: 220, width: 160, height: 26, right: 280, bottom: 246 }),
+      getAttribute: (name: string) => (name === "data-command" ? "app:quit" : name === "aria-label" ? "Quit" : null),
+      closest: (sel: string): unknown =>
+        sel.includes('[data-command="app:quit"]') || sel.includes(".menu-item") ? quitMenuEl : null,
+      contains: (other: Element | null) => other === quitMenuEl,
+    } as unknown as Element;
+    const activeNoteEl = editableField();
+    let allowProtected = false;
+    const doc = {
+      activeElement: activeNoteEl,
+      querySelector: (sel: string) => {
+        if (sel.includes(".mod-close") || sel.includes(".titlebar-button")) return titleCloseBtn;
+        if (sel.includes(".mod-minimize")) return titleMinBtn;
+        if (sel.includes("app:quit")) return quitMenuEl;
+        return null;
+      },
+      querySelectorAll: (sel: string) => {
+        if (sel.includes(".mod-close") || sel.includes(".titlebar-button")) return [titleCloseBtn];
+        if (sel.includes(".mod-minimize")) return [titleMinBtn];
+        if (sel.includes("app:quit")) return [quitMenuEl];
+        return [];
+      },
+      elementFromPoint: (x: number, y: number) => {
+        if (x >= 1880 && y <= 36) return closeSvg;
+        if (x >= 1820 && x < 1860 && y <= 36) return titleMinBtn;
+        if (x >= 100 && x <= 280 && y >= 210 && y <= 250) return quitMenuEl;
+        return activeNoteEl;
+      },
+      body: {},
+      documentElement: { clientWidth: 1920, clientHeight: 1080 },
+    } as unknown as Document;
+    const win = {
+      document: doc,
+      innerWidth: 1920,
+      innerHeight: 1080,
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+      setTimeout,
+      clearTimeout,
+    } as unknown as Window;
+    const ui = new UiControlService({
+      win,
+      getWebContents: () => fakeWebContents(events, []),
+      platform: "linux",
+      sleep: noSleep,
+      getAllowUiInProtectedAreas: () => allowProtected,
+    });
+
+    // Simulate agy5 clicking (1898, 20) over window close button.
+    await assert.rejects(
+      () => ui.click({ target: { x: 1898, y: 20 } }, "agy5"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    await assert.rejects(
+      () => ui.click({ target: { selector: ".titlebar-button.mod-close" } }, "agy5"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    await assert.rejects(
+      () => ui.click({ target: { selector: ".mod-minimize" } }, "agy5"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    await assert.rejects(
+      () => ui.click({ target: { selector: '[data-command="app:quit"]' } }, "agy5"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    await assert.rejects(
+      () => ui.pressKey({ key: "q", modifiers: ["Mod"] }, "agy5"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    await assert.rejects(
+      () => ui.pressKey({ key: "q", modifiers: ["Control"] }, "agy5"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    await assert.rejects(
+      () => ui.pressKey({ key: "F4", modifiers: ["Alt"] }, "agy5"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    assert.equal(events.length, 0, "Zero input events may be sent to protected window/quit controls");
+
+    // Same setting gate unlocks when explicitly authorized.
+    allowProtected = true;
+    await ui.click({ target: { x: 1898, y: 20 } }, "agy5");
+    await ui.pressKey({ key: "q", modifiers: ["Mod"] }, "agy5");
+    assert.equal(events.some((e) => e.type === "mouseDown"), true);
+    assert.equal(events.some((e) => e.type === "keyDown" && e.keyCode === "Q"), true);
+  });
+
+  it("supports punctuation keys and shifted forms in keys.ts for zoom and hotkeys (Audit item 3)", () => {
+    assert.deepEqual(buildKeyPress("=", ["Mod"], "linux"), {
+      keyCode: "=",
+      text: null,
+      modifiers: ["control"],
+    });
+    assert.deepEqual(buildKeyPress("-", ["Mod"], "linux"), {
+      keyCode: "-",
+      text: null,
+      modifiers: ["control"],
+    });
+    assert.deepEqual(buildKeyPress(",", ["Mod"], "darwin"), {
+      keyCode: ",",
+      text: null,
+      modifiers: ["meta"],
+    });
+    assert.deepEqual(buildKeyPress("=", ["Shift"]), {
+      keyCode: "=",
+      text: "+",
+      modifiers: ["shift"],
+    });
+    assert.deepEqual(buildKeyPress("+", ["Mod"], "linux"), {
+      keyCode: "+",
+      text: null,
+      modifiers: ["control"],
+    });
+    const unshifted = ["=", "-", "[", "]", ";", "'", ",", ".", "/", "\\", "`"];
+    const shifted = ["+", "_", "{", "}", ":", "\"", "<", ">", "?", "|", "~"];
+    for (let i = 0; i < unshifted.length; i += 1) {
+      assert.equal(buildKeyPress(unshifted[i], []).text, unshifted[i]);
+      assert.equal(buildKeyPress(unshifted[i], ["Shift"]).text, shifted[i]);
+      assert.equal(buildKeyPress(shifted[i], []).text, shifted[i]);
+    }
+  });
+
+  it("matches modifiers in agent ledger (P1-1), replays modal navigation + selection in order (P1-2), and avoids splitting UTF-16 surrogates on Backspace/Delete (P2-1)", async () => {
+    // Setup common DOM/window listener harness.
+    const listeners = new Map<string, Set<(ev: unknown) => void>>();
+    const dispatchedOnCm: Array<Record<string, unknown>> = [];
+    let modalOpen = false;
+    const modalEl = {
+      tagName: "DIV",
+      className: "modal-container",
+      isConnected: true,
+      closest: (sel: string) => (sel.includes(".modal") ? modalEl : null),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      contains: (other: unknown) => other === modalInput,
+    } as unknown as Element;
+    const modalInput = {
+      tagName: "INPUT",
+      type: "text",
+      value: "",
+      isConnected: true,
+      selectionStart: 0,
+      selectionEnd: 0,
+      focus: () => {
+        doc.activeElement = modalInput;
+      },
+      matches: () => false,
+      closest: (sel: string) => (sel.includes(".modal") ? modalEl : null),
+      getBoundingClientRect: () => ({ x: 400, y: 100, left: 400, top: 100, width: 200, height: 30, right: 600, bottom: 130 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+
+    let cmText = "seed";
+    let cmAnchor = 4;
+    let cmHead = 4;
+    let cmView!: CodeMirrorViewLike;
+    const cmContent = {
+      tagName: "DIV",
+      className: "cm-content",
+      isConnected: true,
+      isContentEditable: true,
+      get cmView() {
+        return { view: cmView };
+      },
+      matches: () => false,
+      closest: (sel: string) => (sel.includes(".cm-content") ? cmContent : null),
+      focus: () => {
+        doc.activeElement = cmContent;
+      },
+      getBoundingClientRect: () => ({ x: 100, y: 200, left: 100, top: 200, width: 400, height: 200, right: 500, bottom: 400 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    cmView = {
+      contentDOM: cmContent,
+      dom: cmContent,
+      state: {
+        get doc() {
+          return {
+            length: cmText.length,
+            lines: cmText.split("\n").length,
+            toString: () => cmText,
+            line: (n: number) => {
+              const parts = cmText.split("\n");
+              let offset = 0;
+              for (let i = 0; i < n - 1; i += 1) offset += parts[i].length + 1;
+              const t = parts[n - 1] ?? "";
+              return { from: offset, to: offset + t.length, number: n, text: t };
+            },
+          };
+        },
+        get selection() {
+          return {
+            main: {
+              anchor: cmAnchor,
+              head: cmHead,
+              from: Math.min(cmAnchor, cmHead),
+              to: Math.max(cmAnchor, cmHead),
+            },
+          };
+        },
+      },
+      coordsAtPos: () => ({ left: 120, top: 220, bottom: 240 }),
+      dispatch: (rawSpec: unknown) => {
+        const spec = rawSpec as {
+          changes?: { from: number; to?: number; insert: string };
+          selection?: { anchor: number; head?: number };
+        };
+        if (spec.changes) {
+          const to = spec.changes.to ?? spec.changes.from;
+          cmText = cmText.slice(0, spec.changes.from) + spec.changes.insert + cmText.slice(to);
+        }
+        if (spec.selection) {
+          cmAnchor = spec.selection.anchor;
+          cmHead = spec.selection.head ?? spec.selection.anchor;
+        }
+      },
+    };
+    const cmLeaf = {
+      path: "Note.md",
+      pane: "left",
+      activePane: true,
+      containerEl: {
+        isConnected: true,
+        querySelector: (sel: string) => (sel.includes(".cm-content") ? cmContent : null),
+        querySelectorAll: () => [],
+        contains: (other: unknown) => other === cmContent,
+        closest: () => null,
+      } as unknown as Element,
+      cm: cmView,
+    };
+
+    const actionBtn = {
+      tagName: "BUTTON",
+      isConnected: true,
+      focus: () => {
+        doc.activeElement = actionBtn;
+      },
+      matches: () => false,
+      closest: () => null,
+      getBoundingClientRect: () => ({ x: 600, y: 80, left: 600, top: 80, width: 80, height: 28, right: 680, bottom: 108 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+
+    const doc = {
+      activeElement: cmContent as unknown as HTMLElement,
+      body: { isConnected: true },
+      documentElement: { clientWidth: 1920, clientHeight: 1080 },
+      querySelector: (sel: string) => (sel.includes(".action-btn") ? actionBtn : null),
+      querySelectorAll: (sel: string) => {
+        if (modalOpen && sel.includes(".modal")) return [modalEl];
+        if (sel.includes(".action-btn")) return [actionBtn];
+        return [];
+      },
+      elementFromPoint: (x: number) => (x >= 580 ? actionBtn : cmContent),
+      addEventListener: (type: string, fn: (ev: unknown) => void) => {
+        let set = listeners.get(type);
+        if (!set) {
+          set = new Set();
+          listeners.set(type, set);
+        }
+        set.add(fn);
+      },
+      removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+        listeners.get(type)?.delete(fn);
+      },
+    } as unknown as Document;
+
+    const makeKeyEv = (key: string, mods?: { ctrlKey?: boolean; shiftKey?: boolean }) => {
+      let canceled = false;
+      const ev = {
+        type: "keydown",
+        key,
+        isTrusted: true,
+        ctrlKey: Boolean(mods?.ctrlKey),
+        shiftKey: Boolean(mods?.shiftKey),
+        altKey: false,
+        metaKey: false,
+        preventDefault: () => {
+          canceled = true;
+        },
+        stopImmediatePropagation: () => undefined,
+        stopPropagation: () => undefined,
+      };
+      for (const fn of [...(listeners.get("keydown") ?? [])]) {
+        fn(ev);
+      }
+      return { canceled, ev };
+    };
+
+    // P1-1: Physical Ctrl+ArrowRight before delayed plain agent ArrowRight must be canceled and NOT consume the plain head.
+    let physicalCanceled = false;
+    let agentCanceled = true;
+    let keySent = false;
+    let checked = false;
+    const win = {
+      document: doc,
+      innerWidth: 1920,
+      innerHeight: 1080,
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+      setTimeout,
+      clearTimeout,
+    } as unknown as Window;
+    const uiP1 = new UiControlService({
+      win,
+      platform: "linux",
+      getUiTypingSpeed: () => "visible",
+      resolveNoteLeaf: () => cmLeaf,
+      resolveElementContext: (el) => (el === cmContent ? { notePath: "Note.md", pane: "left", activePane: true } : null),
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") doc.activeElement = actionBtn;
+          if (ev.type === "keyDown" && ev.keyCode === "Right") keySent = true;
+          dispatchedOnCm.push(ev);
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        if (keySent && !checked) {
+          checked = true;
+          // 1) Physical Ctrl+ArrowRight arrives while plain agent ArrowRight is pending in ledger:
+          physicalCanceled = makeKeyEv("ArrowRight", { ctrlKey: true }).canceled;
+          // 2) Delayed real plain agent ArrowRight arrives next:
+          agentCanceled = makeKeyEv("ArrowRight", { ctrlKey: false }).canceled;
+        }
+      },
+    });
+    doc.activeElement = cmContent;
+    await uiP1.batch(
+      {
+        steps: [
+          { action: "click", target: { selector: ".action-btn" } },
+          { action: "press_key", key: "ArrowRight" },
+        ],
+      },
+      "A"
+    );
+    assert.equal(physicalCanceled, true, "P1-1: physical Ctrl+ArrowRight must be canceled by shield");
+    assert.equal(agentCanceled, false, "P1-1: real plain agent ArrowRight must NOT be falsely canceled");
+
+    // P1-2 (CodeMirror): modal keeps focus while user types ArrowLeft then 'j' on 'seed'@4 -> 'seejd'@4.
+    cmText = "seed";
+    cmAnchor = 4;
+    cmHead = 4;
+    doc.activeElement = cmContent;
+    modalOpen = false;
+    let triggerModalKeys = false;
+    const uiP12 = new UiControlService({
+      win,
+      platform: "linux",
+      getUiTypingSpeed: () => "visible",
+      resolveNoteLeaf: () => cmLeaf,
+      resolveElementContext: (el) => (el === cmContent ? { notePath: "Note.md", pane: "left", activePane: true } : null),
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") {
+            modalOpen = true;
+            doc.activeElement = modalInput;
+            triggerModalKeys = true;
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        if (triggerModalKeys) {
+          triggerModalKeys = false;
+          makeKeyEv("ArrowLeft");
+          makeKeyEv("j");
+        }
+      },
+    });
+    await uiP12.click({ target: { selector: ".action-btn" } }, "A");
+    assert.equal(doc.activeElement, modalInput, "Modal must retain focus");
+    assert.equal(cmText, "seejd", "P1-2 CM: ArrowLeft then 'j' must insert before 'd'");
+    assert.equal(cmHead, 4);
+
+    // P1-2 (CodeMirror selection extend + Delete): Shift+ArrowLeft x2 then Backspace on 'seejd'@5 -> 'see'@3.
+    cmText = "seejd";
+    cmAnchor = 5;
+    cmHead = 5;
+    doc.activeElement = cmContent;
+    modalOpen = false;
+    let triggerExtend = true;
+    const uiExtend = new UiControlService({
+      win,
+      platform: "linux",
+      getUiTypingSpeed: () => "visible",
+      resolveNoteLeaf: () => cmLeaf,
+      resolveElementContext: (el) => (el === cmContent ? { notePath: "Note.md", pane: "left", activePane: true } : null),
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") {
+            modalOpen = true;
+            doc.activeElement = modalInput;
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        if (triggerExtend) {
+          triggerExtend = false;
+          makeKeyEv("ArrowLeft", { shiftKey: true });
+          makeKeyEv("ArrowLeft", { shiftKey: true });
+          makeKeyEv("Backspace");
+        }
+      },
+    });
+    await uiExtend.click({ target: { selector: ".action-btn" } }, "A");
+    assert.equal(cmText, "see", "P1-2 CM Shift+ArrowLeft x2 + Backspace must delete 'jd'");
+    assert.equal(cmHead, 3);
+
+    // P1-2 (native input): 'seed'@4, ArrowLeft + 'j' -> 'seejd'@4.
+    const nativeInput = {
+      tagName: "INPUT",
+      type: "text",
+      value: "seed",
+      isConnected: true,
+      selectionStart: 4,
+      selectionEnd: 4,
+      selectionDirection: "none",
+      setSelectionRange(start: number, end: number, dir?: "forward" | "backward" | "none") {
+        this.selectionStart = start;
+        this.selectionEnd = end;
+        this.selectionDirection = dir ?? "none";
+      },
+      setRangeText(rep: string, start: number, end: number) {
+        this.value = this.value.slice(0, start) + rep + this.value.slice(end);
+        const p = start + rep.length;
+        this.selectionStart = p;
+        this.selectionEnd = p;
+      },
+      focus: () => {
+        doc.activeElement = nativeInput as unknown as HTMLElement;
+      },
+      matches: () => false,
+      closest: () => null,
+      getBoundingClientRect: () => ({ x: 50, y: 80, left: 50, top: 80, width: 160, height: 26, right: 210, bottom: 106 }),
+      getAttribute: () => null,
+    } as unknown as HTMLInputElement;
+    doc.activeElement = nativeInput;
+    modalOpen = false;
+    let triggerNative = true;
+    const uiNative = new UiControlService({
+      win,
+      platform: "linux",
+      getUiTypingSpeed: () => "visible",
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") {
+            modalOpen = true;
+            doc.activeElement = modalInput;
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        if (triggerNative) {
+          triggerNative = false;
+          makeKeyEv("ArrowLeft");
+          makeKeyEv("j");
+        }
+      },
+    });
+    await uiNative.click({ target: { selector: ".action-btn" } }, "A");
+    assert.equal(nativeInput.value, "seejd", "P1-2 input: ArrowLeft then 'j' must produce 'seejd'");
+    assert.equal(nativeInput.selectionStart, 4);
+
+    // P2-1: UTF-16 surrogate pair Backspace/Delete in CM and native input must remove whole emoji, not half a surrogate pair.
+    cmText = "\ud83d\ude00";
+    cmAnchor = 2;
+    cmHead = 2;
+    doc.activeElement = cmContent;
+    modalOpen = false;
+    let triggerEmojiCm = true;
+    const uiEmojiCm = new UiControlService({
+      win,
+      platform: "linux",
+      getUiTypingSpeed: () => "visible",
+      resolveNoteLeaf: () => cmLeaf,
+      resolveElementContext: (el) => (el === cmContent ? { notePath: "Note.md", pane: "left", activePane: true } : null),
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") {
+            modalOpen = true;
+            doc.activeElement = modalInput;
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        if (triggerEmojiCm) {
+          triggerEmojiCm = false;
+          makeKeyEv("Backspace");
+        }
+      },
+    });
+    await uiEmojiCm.click({ target: { selector: ".action-btn" } }, "A");
+    assert.equal(cmText, "", "P2-1 CM: Backspace after emoji must delete the whole surrogate pair");
+    assert.equal(cmHead, 0);
+
+    nativeInput.value = "\ud83d\ude00";
+    nativeInput.selectionStart = 2;
+    nativeInput.selectionEnd = 2;
+    doc.activeElement = nativeInput;
+    modalOpen = false;
+    let triggerEmojiInput = true;
+    const uiEmojiInput = new UiControlService({
+      win,
+      platform: "linux",
+      getUiTypingSpeed: () => "visible",
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          if (ev.type === "mouseDown") {
+            modalOpen = true;
+            doc.activeElement = modalInput;
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: async () => {
+        if (triggerEmojiInput) {
+          triggerEmojiInput = false;
+          makeKeyEv("Backspace");
+        }
+      },
+    });
+    await uiEmojiInput.click({ target: { selector: ".action-btn" } }, "A");
+    assert.equal(nativeInput.value, "", "P2-1 input: Backspace after emoji must not leave lone surrogate");
+    assert.equal(nativeInput.selectionStart, 0);
+  });
+
+  it("supports ui.hover (mouseMove only, protected-area safe) and note-only ui.scroll without a line anchor (Audit item 4)", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const cursorCalls: Array<{ method: string; caller: string; x: number; y: number; docContext: unknown }> = [];
+    const linkEl = {
+      tagName: "A",
+      className: "internal-link",
+      isConnected: true,
+      getBoundingClientRect: () => ({ x: 420, y: 260, left: 420, top: 260, width: 100, height: 20, right: 520, bottom: 280 }),
+      closest: () => null,
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    const ribbonBtn = {
+      tagName: "DIV",
+      className: "side-dock-ribbon-action",
+      isConnected: true,
+      getBoundingClientRect: () => ({ x: 10, y: 200, left: 10, top: 200, width: 32, height: 32, right: 42, bottom: 232 }),
+      matches: () => false,
+      closest: () => null,
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    const scrollerEl = {
+      tagName: "DIV",
+      className: "cm-scroller",
+      scrollHeight: 2400,
+      clientHeight: 600,
+      scrollTop: 0,
+      getBoundingClientRect: () => ({ x: 100, y: 60, left: 100, top: 60, width: 700, height: 600, right: 800, bottom: 660 }),
+      closest: (sel: string) => (sel.includes(".workspace-leaf") ? noteLeaf.containerEl : null),
+    } as unknown as HTMLElement;
+    const noteLeaf = {
+      path: "Long.md",
+      pane: "main",
+      activePane: true,
+      containerEl: {
+        isConnected: true,
+        getBoundingClientRect: () => ({ x: 100, y: 60, left: 100, top: 60, width: 700, height: 600, right: 800, bottom: 660 }),
+        querySelector: (sel: string) => (sel.includes(".cm-scroller") ? scrollerEl : null),
+        querySelectorAll: () => [],
+        contains: (other: unknown) => other === scrollerEl || other === linkEl,
+        closest: () => null,
+      } as unknown as Element,
+      cm: {
+        scrollDOM: scrollerEl,
+        state: {
+          doc: {
+            length: 10,
+            lines: 1,
+            toString: () => "long note.",
+            line: () => ({ from: 0, to: 10, number: 1, text: "long note." }),
+          },
+          selection: { main: { head: 0 } },
+        },
+        coordsAtPos: () => ({ left: 120, top: 80, bottom: 100 }),
+      },
+    };
+    const doc = {
+      activeElement: scrollerEl,
+      body: { isConnected: true },
+      documentElement: { clientWidth: 1920, clientHeight: 1080 },
+      querySelector: (sel: string) => {
+        if (sel.includes(".internal-link")) return linkEl;
+        if (sel.includes(".ribbon")) return ribbonBtn;
+        return null;
+      },
+      querySelectorAll: (sel: string) => {
+        if (sel.includes(".internal-link")) return [linkEl];
+        if (sel.includes(".ribbon")) return [ribbonBtn];
+        return [];
+      },
+      elementFromPoint: (x: number) => (x < 60 ? ribbonBtn : linkEl),
+    } as unknown as Document;
+    let settledWaitCalls = 0;
+    let settledResolved = false;
+    const overlay = {
+      whenSettled: async (_caller: string, maxWaitMs?: number) => {
+        settledWaitCalls += 1;
+        assert.ok((maxWaitMs ?? 0) > 0 && (maxWaitMs ?? 9999) <= 500, "whenSettled must receive bounded cap");
+        await new Promise<void>((resolve) => setTimeout(resolve, 15));
+        settledResolved = true;
+      },
+      moveTo: (caller: string, _label: string, x: number, y: number, _action?: string, docContext?: unknown) => {
+        cursorCalls.push({ method: "moveTo", caller, x, y, docContext });
+      },
+      pulseClick: (caller: string, _label: string, x: number, y: number, _action?: string, docContext?: unknown) => {
+        cursorCalls.push({ method: "pulseClick", caller, x, y, docContext });
+      },
+      setTyping: () => undefined,
+      finishTyping: () => undefined,
+      exitAgent: () => undefined,
+      notifyNoteUpdated: () => undefined,
+    } as unknown as AgentCursorOverlay;
+
+    const ui = new UiControlService({
+      win: {
+        document: doc,
+        innerWidth: 1920,
+        innerHeight: 1080,
+        getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+        setTimeout,
+        clearTimeout,
+      } as unknown as Window,
+      getWebContents: () => fakeWebContents(events, []),
+      resolveNoteLeaf: (p) => (p === "Long.md" ? noteLeaf : null),
+      resolveElementContext: (el) => (el === linkEl || el === scrollerEl ? { notePath: "Long.md", pane: "main", activePane: true } : null),
+      cursorOverlay: overlay,
+      sleep: noSleep,
+    });
+
+    // Hover dispatches mouseMove only, awaits whenSettled, and shows cursor without clicking.
+    const hoverRes = await ui.hover({ target: { selector: ".internal-link" } }, "agy3") as Record<string, unknown>;
+    assert.equal(hoverRes.dispatched, true);
+    assert.equal(settledWaitCalls, 1);
+    assert.equal(settledResolved, true);
+    assert.equal(events.some((e) => e.type === "mouseMove"), true);
+    assert.equal(events.some((e) => e.type === "mouseDown" || e.type === "mouseUp"), false);
+    assert.equal(cursorCalls.some((c) => c.method === "moveTo" && c.caller === "agy3"), true);
+
+    // Non-note click must wait for overlay whenSettled and pass null docContext so cursor drops old docAnchor.
+    cursorCalls.length = 0;
+    settledResolved = false;
+    await ui.click({ target: { selector: ".ribbon" } }, "agy3");
+    assert.equal(settledWaitCalls, 2);
+    assert.equal(settledResolved, true, "ui.click must await cursorOverlay.whenSettled before resolving (Audit item 2)");
+    const nonNoteCall = cursorCalls.find((c) => c.method === "pulseClick");
+    assert.ok(nonNoteCall);
+    assert.equal(nonNoteCall.docContext, null, "Non-note target must pass null docContext to clear previous docAnchor");
+
+    // ui.scroll with note target only (no line/after/heading/text) scrolls Long.md's scroller.
+    events.length = 0;
+    const scrollRes = await ui.scroll({ target: { note: "Long.md" }, deltaY: 360 }, "agy3") as Record<string, unknown>;
+    assert.equal(scrollRes.dispatched, true);
+    const wheelEv = events.find((e) => e.type === "mouseWheel");
+    assert.ok(wheelEv, "Note-only scroll must dispatch mouseWheel over the note scroller");
+    assert.equal(wheelEv.deltaY, -360);
+  });
+
+  it("routes Tab and Shift+Tab inside batch typing in tables and properties as key presses, never inserted characters (Audit item 5)", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const typed: string[] = [];
+    const propInput = {
+      tagName: "INPUT",
+      type: "text",
+      value: "",
+      isConnected: true,
+      focus: () => {
+        doc.activeElement = propInput;
+      },
+      matches: (s: string) => s.includes('input[type="text"]'),
+      closest: (sel: string) => (sel.includes(".metadata-container") ? propContainer : null),
+      getBoundingClientRect: () => ({ x: 200, y: 120, left: 200, top: 120, width: 180, height: 24, right: 380, bottom: 144 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    const propContainer = {
+      tagName: "DIV",
+      className: "metadata-container",
+      contains: (other: unknown) => other === propInput,
+    } as unknown as Element;
+    const doc = {
+      activeElement: propInput,
+      body: { isConnected: true },
+      documentElement: { clientWidth: 1920, clientHeight: 1080 },
+      querySelector: (sel: string) => (sel.includes(".metadata-property-key") ? propInput : null),
+      querySelectorAll: (sel: string) => (sel.includes(".metadata-property-key") ? [propInput] : []),
+      elementFromPoint: () => propInput,
+    } as unknown as Document;
+    const ui = new UiControlService({
+      win: {
+        document: doc,
+        innerWidth: 1920,
+        innerHeight: 1080,
+        getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+        setTimeout,
+        clearTimeout,
+      } as unknown as Window,
+      getWebContents: () => fakeWebContents(events, typed),
+      getUiTypingSpeed: () => "fast",
+      platform: "linux",
+      sleep: noSleep,
+    });
+
+    await ui.batch(
+      {
+        steps: [
+          { action: "click", target: { selector: ".metadata-property-key" } },
+          { action: "type", text: "status\tdraft" },
+          { action: "press_key", key: "Shift+Tab" },
+        ],
+      },
+      "agy3"
+    );
+
+    assert.equal(typed.some((t) => t.includes("\t")), false, "Tab must never be passed to insertText as a literal '\\t'");
+    assert.equal(typed.join(""), "statusdraft");
+    const tabDowns = events.filter((e) => e.type === "keyDown" && e.keyCode === "Tab");
+    assert.equal(tabDowns.length, 2, "Both inline '\\t' and 'Shift+Tab' must dispatch Tab keyDown events");
+    assert.deepEqual(tabDowns[1].modifiers, ["shift"]);
+    assert.equal(
+      events.some((e) => e.type === "char" && e.keyCode === "\t"),
+      false,
+      "Tab key presses must never send a '\\t' char event"
+    );
+  });
+
+  it("integrates html-drag (HTML5 draggable tabs) and nested-editors (table cell CM, property commit, and rename focus preservation) (Audit item 6)", async () => {
+    const dispatchedTypes: string[] = [];
+    const propEvents: string[] = [];
+    const dragEvents: Array<{ target: string; type: string; data?: string }> = [];
+    const webEvents: Array<Record<string, unknown>> = [];
+    const typed: string[] = [];
+
+    // 1) HTML5 draggable tab drag via performDrag integration in dragNow.
+    const makeDragTarget = (label: string) => ({
+      tagName: "DIV",
+      className: "workspace-tab-header",
+      draggable: true,
+      isConnected: true,
+      getAttribute: (name: string) => (name === "draggable" ? "true" : null),
+      closest: (sel: string) => (sel.includes(".workspace-tab-header") || sel.includes('[draggable="true"]') ? tabFrom : null),
+      getBoundingClientRect: () =>
+        label === "from"
+          ? { x: 100, y: 12, left: 100, top: 12, width: 120, height: 28, right: 220, bottom: 40 }
+          : { x: 260, y: 12, left: 260, top: 12, width: 120, height: 28, right: 380, bottom: 40 },
+      dispatchEvent: (ev: { type: string; preventDefault?: () => void; dataTransfer?: { setData(t: string, d: string): void; getData(t: string): string } }) => {
+        if (ev.type === "dragstart") {
+          ev.dataTransfer?.setData("text/plain", "tab-A");
+        }
+        if (ev.type === "dragover" || ev.type === "drop") {
+          ev.preventDefault?.();
+        }
+        dragEvents.push({
+          target: label,
+          type: ev.type,
+          data: ev.dataTransfer?.getData("text/plain"),
+        });
+        dispatchedTypes.push(`${label}:${ev.type}`);
+        return true;
+      },
+    });
+    const tabFrom = makeDragTarget("from") as unknown as Element;
+    const tabTo = makeDragTarget("to") as unknown as Element;
+    (tabTo as unknown as { closest: (sel: string) => unknown }).closest = () => null;
+
+    // 2) Nested table cell CM inside .cm-table-widget td without falling back to outer note CM.
+    let outerDoc = "outer";
+    let cellDoc = "initial";
+    const cellCmContent = {
+      tagName: "DIV",
+      className: "cm-content",
+      isConnected: true,
+      isContentEditable: true,
+      matches: () => false,
+      closest: (sel: string): unknown => {
+        if (sel.includes("td")) return tableCellTd;
+        if (sel.includes(".cm-table-widget")) return tableWidget;
+        if (sel.includes(".cm-editor") || sel.includes(".cm-content")) return cellCmEditor;
+        return null;
+      },
+      focus: () => {
+        doc.activeElement = cellCmContent;
+      },
+      getBoundingClientRect: () => ({ x: 400, y: 300, left: 400, top: 300, width: 100, height: 24, right: 500, bottom: 324 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    const cellCmView: CodeMirrorViewLike = {
+      dom: cellCmContent,
+      contentDOM: cellCmContent,
+      state: {
+        get doc() {
+          return {
+            length: cellDoc.length,
+            lines: 1,
+            toString: () => cellDoc,
+            line: () => ({ from: 0, to: cellDoc.length, number: 1, text: cellDoc }),
+          };
+        },
+        selection: { main: { head: cellDoc.length, anchor: cellDoc.length } },
+      },
+      coordsAtPos: () => ({ left: 420, top: 302, bottom: 322 }),
+      dispatch: () => undefined,
+      focus: () => {
+        doc.activeElement = cellCmContent;
+      },
+    };
+    const cellCmEditor = {
+      tagName: "DIV",
+      className: "cm-editor",
+      cmView: { view: cellCmView },
+      contains: (other: unknown) => other === cellCmContent,
+      closest: (sel: string): unknown => {
+        if (sel.includes("td")) return tableCellTd;
+        if (sel.includes(".cm-table-widget")) return tableWidget;
+        return null;
+      },
+    } as unknown as Element;
+    let cmMountedOnClick = false;
+    const tableCellTd = {
+      tagName: "TD",
+      isConnected: true,
+      parentElement: null as unknown as Element,
+      querySelectorAll: (sel: string) => (cmMountedOnClick && sel.includes(".cm-editor") ? [cellCmEditor] : []),
+      closest: (sel: string): unknown => {
+        if (sel.includes("td")) return tableCellTd;
+        if (sel.includes(".cm-table-widget")) return tableWidget;
+        return null;
+      },
+      contains: (other: unknown) => other === tableCellTd || other === cellCmEditor || other === cellCmContent,
+      getBoundingClientRect: () => ({ x: 400, y: 300, left: 400, top: 300, width: 100, height: 24, right: 500, bottom: 324 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    (cellCmContent as unknown as { parentElement: Element }).parentElement = cellCmEditor;
+    (cellCmEditor as unknown as { parentElement: Element }).parentElement = tableCellTd;
+    const tableWidget = {
+      tagName: "DIV",
+      className: "cm-table-widget",
+      contains: (other: unknown) => other === tableCellTd || other === cellCmEditor || other === cellCmContent,
+    } as unknown as Element;
+
+    const outerContent = {
+      tagName: "DIV",
+      className: "cm-content",
+      isConnected: true,
+      isContentEditable: true,
+      contains: (other: unknown) => other === outerContent || other === tableWidget || other === tableCellTd || other === cellCmEditor || other === cellCmContent,
+      closest: (sel: string) => (sel.includes(".cm-editor") ? outerEditorEl : null),
+      focus: () => {
+        doc.activeElement = outerContent;
+      },
+      matches: () => false,
+      getBoundingClientRect: () => ({ x: 100, y: 100, left: 100, top: 100, width: 600, height: 400, right: 700, bottom: 500 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    const outerEditorEl = {
+      tagName: "DIV",
+      className: "cm-editor",
+      contains: (other: unknown) => other === outerContent || outerContent.contains(other as Node),
+      closest: () => null,
+    } as unknown as Element;
+    const outerCmView: CodeMirrorViewLike = {
+      dom: outerEditorEl,
+      contentDOM: outerContent,
+      state: {
+        get doc() {
+          return {
+            length: outerDoc.length,
+            lines: 1,
+            toString: () => outerDoc,
+            line: () => ({ from: 0, to: outerDoc.length, number: 1, text: outerDoc }),
+          };
+        },
+        selection: { main: { head: outerDoc.length } },
+      },
+      coordsAtPos: () => ({ left: 120, top: 120, bottom: 140 }),
+      dispatch: (spec: unknown) => {
+        const s = spec as { changes?: { insert?: string } };
+        if (s.changes?.insert) outerDoc += s.changes.insert;
+      },
+    };
+    const leafContainer = {
+      isConnected: true,
+      contains: (other: unknown) => other === outerContent || outerContent.contains(other as Node),
+      closest: () => leafContainer,
+      getAttribute: () => null,
+      querySelector: () => outerContent,
+      querySelectorAll: () => [],
+    } as unknown as Element;
+    const leafObj = {
+      path: "TableNote.md",
+      pane: "main",
+      activePane: true,
+      containerEl: leafContainer,
+      cm: outerCmView,
+      view: { file: { path: "TableNote.md" }, editor: { cm: outerCmView } },
+    };
+
+    // 3) Property input (.metadata-input-longtext) and file-explorer rename box (.is-being-renamed).
+    const propLongText = {
+      tagName: "DIV",
+      className: "metadata-input-longtext",
+      isConnected: true,
+      isContentEditable: true,
+      matches: () => false,
+      closest: (sel: string) => (sel.includes(".metadata-input-longtext") ? propLongText : null),
+      focus: () => {
+        doc.activeElement = propLongText;
+      },
+      blur: () => {
+        propEvents.push("blur-method");
+      },
+      dispatchEvent: (ev: { type: string }) => {
+        propEvents.push(ev.type);
+        return true;
+      },
+      getBoundingClientRect: () => ({ x: 400, y: 180, left: 400, top: 180, width: 160, height: 24, right: 560, bottom: 204 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+
+    const renameBox = {
+      tagName: "DIV",
+      className: "nav-file-title is-being-renamed",
+      isConnected: true,
+      isContentEditable: true,
+      matches: () => false,
+      closest: (sel: string) => (sel.includes(".is-being-renamed") ? renameBox : null),
+      focus: () => {
+        doc.activeElement = renameBox;
+      },
+      getBoundingClientRect: () => ({ x: 50, y: 260, left: 50, top: 260, width: 140, height: 24, right: 190, bottom: 284 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+
+    const doc = {
+      activeElement: outerContent as unknown as HTMLElement,
+      body: { isConnected: true },
+      documentElement: { clientWidth: 1920, clientHeight: 1080 },
+      querySelector: (sel: string) => {
+        if (sel.includes(".tab-from")) return tabFrom;
+        if (sel.includes(".tab-to")) return tabTo;
+        if (sel.includes("td.cell")) return tableCellTd;
+        if (sel.includes(".metadata-input-longtext")) return propLongText;
+        if (sel.includes(".rename-trigger")) return renameBox;
+        return null;
+      },
+      querySelectorAll: (sel: string) => {
+        if (sel.includes(".tab-from")) return [tabFrom];
+        if (sel.includes(".tab-to")) return [tabTo];
+        if (sel.includes("td.cell")) return [tableCellTd];
+        if (sel.includes(".metadata-input-longtext")) return [propLongText];
+        if (sel.includes(".rename-trigger")) return [renameBox];
+        return [];
+      },
+      elementFromPoint: (x: number, y: number) => {
+        if (y < 60) return x < 240 ? tabFrom : tabTo;
+        if (x >= 390 && y >= 290) return tableCellTd;
+        if (x >= 390 && y >= 170 && y < 220) return propLongText;
+        if (x < 200 && y >= 250) return renameBox;
+        return outerContent;
+      },
+    } as unknown as Document;
+
+    const ui = new UiControlService({
+      win: {
+        document: doc,
+        innerWidth: 1920,
+        innerHeight: 1080,
+        getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+        setTimeout,
+        clearTimeout,
+      } as unknown as Window,
+      getUiTypingSpeed: () => "fast",
+      resolveNoteLeaf: (p) => (p === "TableNote.md" ? leafObj : null),
+      resolveElementContext: (el) =>
+        outerContent.contains(el) ? { notePath: "TableNote.md", pane: "main", activePane: true } : null,
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1000, 600)),
+        sendInputEvent: (ev) => {
+          webEvents.push(ev);
+          if (ev.type === "mouseDown" && (ev.x as number) >= 390 && (ev.y as number) >= 290) {
+            cmMountedOnClick = true;
+            doc.activeElement = cellCmContent;
+          } else if (ev.type === "mouseDown" && (ev.x as number) >= 390 && (ev.y as number) >= 170 && (ev.y as number) < 220) {
+            doc.activeElement = propLongText;
+          } else if (ev.type === "mouseDown" && (ev.x as number) < 200 && (ev.y as number) >= 250) {
+            doc.activeElement = renameBox;
+          }
+        },
+        insertText: (txt) => {
+          typed.push(txt);
+          if (doc.activeElement === cellCmContent) {
+            cellDoc += txt;
+          }
+        },
+      }),
+      sleep: noSleep,
+    });
+
+    // A) HTML5 draggable tab drag succeeds through performDrag.
+    const dragRes = await ui.drag(
+      { from: { selector: ".tab-from" }, to: { selector: ".tab-to" } },
+      "agy3"
+    ) as Record<string, unknown>;
+    assert.equal(dragRes.mode, "html5");
+    assert.equal(dragRes.dropped, true);
+    assert.equal(dispatchedTypes.includes("from:dragstart") && dispatchedTypes.includes("to:drop"), true);
+    assert.equal(dragEvents.find((e) => e.target === "to" && e.type === "drop")?.data, "tab-A");
+
+    // B) Typing directly into nested table <td> uses nested cell CM without failing ui_target_changed and never mutates outerDoc.
+    doc.activeElement = outerContent;
+    const tdTypeRes = await ui.type(
+      { target: { selector: "td.cell" }, text: "verified" },
+      "agy5"
+    ) as Record<string, unknown>;
+    assert.equal(tdTypeRes.dispatched, true);
+    assert.equal(cmMountedOnClick, true);
+    assert.equal(cellDoc, "initialverified");
+    assert.equal(outerDoc, "outer", "Outer note doc must never receive nested table cell typing");
+
+    // C) Typing into standalone .metadata-input-longtext commits input/change/blur so YAML updates.
+    propEvents.length = 0;
+    await ui.type({ target: { selector: ".metadata-input-longtext" }, text: "draft-ok" }, "agy5");
+    assert.equal(propEvents.includes("input") && propEvents.includes("change"), true);
+    assert.equal(propEvents.includes("blur") || propEvents.includes("blur-method"), true);
+
+    // D) Split-call rename: clicking rename box from outer editor preserves .is-being-renamed focus instead of restoring editor!
+    doc.activeElement = outerContent;
+    await ui.click({ target: { selector: ".rename-trigger" } }, "agy4");
+    assert.equal(
+      doc.activeElement,
+      renameBox,
+      "Clicking .is-being-renamed from an editor must keep focus in rename box across separate calls"
+    );
+  });
+
+  it("pierces open shadowRoot.activeElement and bounds hanging insertText with timeout cleanup (Homies reference)", async () => {
+    const typed: string[] = [];
+    const innerInput = {
+      tagName: "INPUT",
+      type: "text",
+      isConnected: true,
+      matches: (s: string) => s.includes('input[type="text"]'),
+      getAttribute: (n: string) => (n === "aria-label" ? "Shadow Input" : null),
+      closest: () => null,
+      getBoundingClientRect: () => ({ x: 100, y: 120, left: 100, top: 120, width: 180, height: 24, right: 280, bottom: 144 }),
+    } as unknown as HTMLElement;
+    const shadowHost = {
+      tagName: "DIV",
+      isConnected: true,
+      matches: () => false,
+      getAttribute: () => null,
+      closest: () => null,
+      getBoundingClientRect: () => ({ x: 90, y: 110, left: 90, top: 110, width: 200, height: 40, right: 290, bottom: 150 }),
+      shadowRoot: { activeElement: innerInput },
+    } as unknown as HTMLElement;
+    let clearedTimers = 0;
+    const win = {
+      innerWidth: 1200,
+      innerHeight: 800,
+      document: {
+        activeElement: shadowHost,
+        body: { isConnected: true },
+        documentElement: { clientWidth: 1200, clientHeight: 800 },
+        querySelectorAll: () => [],
+      },
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+      setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, Math.min(ms, 20)),
+      clearTimeout: (id: ReturnType<typeof setTimeout>) => {
+        clearedTimers += 1;
+        globalThis.clearTimeout(id);
+      },
+    } as unknown as Window;
+
+    const ui = new UiControlService({
+      win,
+      getUiTypingSpeed: () => "fast",
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(800, 600)),
+        sendInputEvent: () => undefined,
+        insertText: (txt) => {
+          typed.push(txt);
+        },
+      }),
+      sleep: noSleep,
+    });
+
+    const state = ui.focusState();
+    assert.equal(state.tag, "input");
+    assert.equal(state.editable, true);
+    assert.equal(state.label, "Shadow Input");
+    await ui.type({ text: "shadow-ok" }, "agy1");
+    assert.deepEqual(typed, ["shadow-ok"]);
+    assert.ok(clearedTimers >= 1, "Timeout timer must be cleared after insertText resolves");
+
+    // Hanging insertText must reject cleanly on timeout and unblock subsequent UI actions.
+    let rejectHang = false;
+    const uiHang = new UiControlService({
+      win,
+      getUiTypingSpeed: () => "fast",
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(800, 600)),
+        sendInputEvent: () => undefined,
+        insertText: () => {
+          rejectHang = true;
+          return new Promise<void>(() => undefined);
+        },
+      }),
+      sleep: noSleep,
+    });
+    await assert.rejects(
+      () => uiHang.type({ text: "hang" }, "agy1"),
+      /timed out/i
+    );
+    assert.equal(rejectHang, true);
+    assert.equal(uiHang.focusState().tag, "input", "UI queue remains responsive after timeout");
+  });
+
+  it("refuses Enter/Space when focused prompt selects a protected command like app:quit (P0-1) and keeps Markdown ui.type with tabs on focus-free CM transactions (P1-2)", async () => {
+    // P0-1: Focused command palette input whose selected suggestion is app:quit must block Enter & Space unless allowed.
+    const webEvents: Array<Record<string, unknown>> = [];
+    let selectedCmdId = "app:quit";
+    let selectedTitle = "Quit Obsidian";
+    let nativeActivations = 0;
+    let allowProtected = false;
+
+    const matchesModalSel = (sel: string): boolean =>
+      sel.split(",").some((p) => {
+        const s = p.trim();
+        return s === ".prompt" || s === ".modal" || s === ".modal-container" || s === '[role="dialog"]';
+      });
+    const paletteInput = {
+      tagName: "INPUT",
+      type: "text",
+      isConnected: true,
+      matches: (s: string) => s.includes('input[type="text"]'),
+      getAttribute: () => null,
+      closest: (sel: string): unknown => (matchesModalSel(sel) ? promptModal : null),
+      getBoundingClientRect: () => ({ x: 400, y: 120, left: 400, top: 120, width: 320, height: 32, right: 720, bottom: 152 }),
+    } as unknown as HTMLElement;
+    const quitSuggestion = {
+      tagName: "DIV",
+      className: "suggestion-item is-selected",
+      isConnected: true,
+      get textContent() {
+        return selectedTitle;
+      },
+      getAttribute: (name: string) => (name === "data-command-id" ? selectedCmdId : null),
+      closest: (sel: string): unknown => {
+        if (sel.includes("app:quit") && selectedCmdId === "app:quit") return quitSuggestion;
+        if (sel.split(",").some((p) => p.trim() === ".suggestion-item")) return quitSuggestion;
+        if (matchesModalSel(sel)) return promptModal;
+        return null;
+      },
+      querySelector: () => null,
+      getBoundingClientRect: () => ({ x: 400, y: 170, left: 400, top: 170, width: 320, height: 28, right: 720, bottom: 198 }),
+    } as unknown as Element;
+    const promptModal = {
+      tagName: "DIV",
+      className: "modal-container prompt",
+      isConnected: true,
+      closest: (sel: string) => (matchesModalSel(sel) ? promptModal : null),
+      querySelector: (sel: string) => (sel.includes("is-selected") ? quitSuggestion : null),
+      querySelectorAll: (sel: string) => (sel.includes("is-selected") ? [quitSuggestion] : []),
+      contains: (other: unknown) => other === paletteInput || other === quitSuggestion,
+    } as unknown as Element;
+
+    const doc = {
+      activeElement: paletteInput as unknown as HTMLElement,
+      body: { isConnected: true },
+      documentElement: { clientWidth: 1920, clientHeight: 1080 },
+      querySelector: () => null,
+      querySelectorAll: (sel: string) => (sel.includes("is-selected") ? [quitSuggestion] : []),
+      elementFromPoint: () => paletteInput,
+    } as unknown as Document;
+
+    const uiPrompt = new UiControlService({
+      win: {
+        document: doc,
+        innerWidth: 1920,
+        innerHeight: 1080,
+        getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+        setTimeout,
+        clearTimeout,
+      } as unknown as Window,
+      getAllowUiInProtectedAreas: () => allowProtected,
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(800, 600)),
+        sendInputEvent: (ev) => {
+          webEvents.push(ev);
+          if (ev.type === "keyDown" && (ev.keyCode === "Enter" || ev.keyCode === "Space")) {
+            nativeActivations += 1;
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: noSleep,
+    });
+
+    await assert.rejects(
+      () => uiPrompt.pressKey({ key: "Enter" }, "sol3"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    await assert.rejects(
+      () => uiPrompt.pressKey({ key: "Space" }, "sol3"),
+      (err: unknown) => err instanceof UiControlError && err.code === "ui_protected_area"
+    );
+    assert.equal(nativeActivations, 0, "Selected protected suggestion must prevent native Enter/Space dispatch");
+    assert.equal(webEvents.length, 0);
+
+    // Non-protected selected item is allowed; protected item is allowed when allowUiInProtectedAreas is enabled.
+    selectedCmdId = "editor:toggle-fold";
+    selectedTitle = "Toggle fold";
+    await uiPrompt.pressKey({ key: "Enter" }, "sol3");
+    assert.equal(nativeActivations, 1);
+
+    selectedCmdId = "app:quit";
+    selectedTitle = "Quit Obsidian";
+    allowProtected = true;
+    await uiPrompt.pressKey({ key: "Enter" }, "sol3");
+    assert.equal(nativeActivations, 2);
+
+    // P1-2: Literal '\t' inside Markdown editor ui.type must stay on focus-free CM dispatch with zero native events.
+    const userInput = {
+      tagName: "INPUT",
+      type: "text",
+      isConnected: true,
+      matches: (s: string) => s.includes('input[type="text"]'),
+      getAttribute: () => null,
+      closest: () => null,
+      getBoundingClientRect: () => ({ x: 50, y: 500, left: 50, top: 500, width: 200, height: 28, right: 250, bottom: 528 }),
+    } as unknown as HTMLElement;
+    let noteText = "alpha";
+    let focusChanges = 0;
+    const cmEvents: Array<Record<string, unknown>> = [];
+    let cmView!: CodeMirrorViewLike;
+    const cmContent = {
+      tagName: "DIV",
+      className: "cm-content",
+      isConnected: true,
+      isContentEditable: true,
+      matches: () => false,
+      get cmView() {
+        return { view: cmView };
+      },
+      focus: () => {
+        focusChanges += 1;
+        docMd.activeElement = cmContent;
+      },
+      closest: (sel: string): unknown => {
+        if (sel.includes(".cm-content") || sel.includes(".cm-editor")) return cmContent;
+        if (sel.includes(".workspace-leaf")) return leafEl;
+        return null;
+      },
+      getBoundingClientRect: () => ({ x: 80, y: 80, left: 80, top: 80, width: 500, height: 300, right: 580, bottom: 380 }),
+      getAttribute: () => null,
+    } as unknown as HTMLElement;
+    cmView = {
+      dom: cmContent,
+      contentDOM: cmContent,
+      state: {
+        get doc() {
+          return {
+            length: noteText.length,
+            lines: 1,
+            toString: () => noteText,
+            line: () => ({ from: 0, to: noteText.length, number: 1, text: noteText }),
+          };
+        },
+        selection: { main: { head: noteText.length } },
+      },
+      coordsAtPos: () => ({ left: 120, top: 100, bottom: 120 }),
+      dispatch: (spec: unknown) => {
+        const s = spec as { changes?: { from: number; insert?: string } };
+        if (s.changes?.insert) {
+          noteText = noteText.slice(0, s.changes.from) + s.changes.insert + noteText.slice(s.changes.from);
+        }
+      },
+      focus: () => {
+        focusChanges += 1;
+        docMd.activeElement = cmContent;
+      },
+    };
+    const leafEl = {
+      isConnected: true,
+      contains: (other: unknown) => other === leafEl || other === cmContent,
+      closest: (sel: string) => (sel.includes(".workspace-leaf") ? leafEl : null),
+      querySelector: (sel: string) => (sel.includes(".cm-content") ? cmContent : null),
+      querySelectorAll: (sel: string) => (sel.includes(".cm-content") ? [cmContent] : []),
+      getAttribute: () => null,
+    } as unknown as Element;
+    const docMd = {
+      activeElement: userInput as unknown as HTMLElement,
+      body: { isConnected: true },
+      documentElement: { clientWidth: 1920, clientHeight: 1080 },
+      querySelector: (sel: string) => (sel.includes(".cm-content") ? cmContent : null),
+      querySelectorAll: (sel: string) => (sel.includes(".cm-content") ? [cmContent] : []),
+      elementFromPoint: () => cmContent,
+    } as unknown as Document;
+
+    const uiMd = new UiControlService({
+      win: {
+        document: docMd,
+        innerWidth: 1920,
+        innerHeight: 1080,
+        getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+        setTimeout,
+        clearTimeout,
+      } as unknown as Window,
+      getUiTypingSpeed: () => "fast",
+      resolveNoteLeaf: () => ({
+        path: "Note.md",
+        pane: "main",
+        activePane: true,
+        containerEl: leafEl,
+        cm: cmView,
+      }),
+      resolveElementContext: (el) =>
+        el === leafEl || el === cmContent ? { notePath: "Note.md", pane: "main", activePane: true } : null,
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(800, 600)),
+        sendInputEvent: (ev) => {
+          cmEvents.push(ev);
+        },
+        insertText: () => undefined,
+      }),
+      sleep: noSleep,
+    });
+
+    await uiMd.type({ target: { selector: ".cm-content" }, text: "\tj" }, "sol3");
+    assert.equal(noteText, "alpha\tj");
+    assert.equal(cmEvents.length, 0, "Markdown editor ui.type with '\\t' must emit zero native mouse/key events");
+    assert.equal(focusChanges, 0, "User focus must never move when typing '\\t' into Markdown CM");
+    assert.equal(docMd.activeElement, userInput);
+  });
+
+  it("maps Zoom accelerators (Mod+=, Mod+Shift+=, Mod++, Mod+-, Mod+0) to Obsidian commands with cursor shown", async () => {
+    const createZoomHarness = (platform: "linux" | "darwin", commandsEnabled = true) => {
+      const executed: string[] = [];
+      const dispatched: Array<Record<string, unknown>> = [];
+      const cursorLabels: string[] = [];
+      let settleCalls = 0;
+
+      const editorEl = {
+        tagName: "DIV",
+        isConnected: true,
+        isContentEditable: true,
+        closest: (sel: string) => (sel.includes(".cm-content") ? editorEl : null),
+        matches: (sel: string) => sel.includes(".cm-content"),
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        getAttribute: () => null,
+        getBoundingClientRect: () => ({ left: 120, top: 80, right: 620, bottom: 480, width: 500, height: 400 }),
+        focus: () => undefined,
+      } as unknown as HTMLElement;
+
+      const doc = {
+        activeElement: editorEl,
+        body: { isConnected: true },
+        documentElement: { clientWidth: 1200, clientHeight: 800 },
+        querySelectorAll: () => [],
+        elementFromPoint: () => editorEl,
+      } as unknown as Document;
+
+      const commandManager = commandsEnabled
+        ? {
+            tag: "manager-this-check",
+            executeCommandById(this: { tag?: string }, id: string): boolean {
+              if (this?.tag !== "manager-this-check") {
+                throw new Error("lost command manager receiver binding");
+              }
+              executed.push(id);
+              return id.startsWith("window:");
+            },
+          }
+        : undefined;
+
+      const win = {
+        innerWidth: 1200,
+        innerHeight: 800,
+        devicePixelRatio: 1,
+        document: doc,
+        app: commandManager ? { commands: commandManager } : undefined,
+        getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1" }),
+        setTimeout,
+        clearTimeout,
+      } as unknown as Window;
+
+      const ui = new UiControlService({
+        win,
+        platform,
+        getWebContents: () => ({
+          capturePage: () => Promise.resolve(fakeImage(1200, 800)),
+          sendInputEvent: (ev) => {
+            dispatched.push(ev);
+          },
+          insertText: () => undefined,
+        }),
+        sleep: noSleep,
+        getUiTypingSpeed: () => "fast",
+        cursorOverlay: {
+          moveTo: (_caller: string, _label: string, _x: number, _y: number, action?: string) => {
+            if (action) {
+              cursorLabels.push(action);
+            }
+          },
+          pulseClick: () => undefined,
+          setTyping: () => undefined,
+          whenSettled: () => {
+            settleCalls += 1;
+            return Promise.resolve();
+          },
+        } as unknown as AgentCursorOverlay,
+      });
+
+      return { ui, executed, dispatched, cursorLabels, getSettleCalls: () => settleCalls };
+    };
+
+    const linux = createZoomHarness("linux", true);
+    const zoomIn = (await linux.ui.pressKey({ key: "Mod+=" }, "agy4")) as Record<string, unknown>;
+    assert.equal(zoomIn.commandId, "window:zoom-in");
+    await linux.ui.pressKey({ key: "Mod+Shift+=" }, "agy4");
+    await linux.ui.pressKey({ key: "Mod++" }, "agy4");
+    const zoomOut = (await linux.ui.pressKey({ key: "Mod+-" }, "agy4")) as Record<string, unknown>;
+    assert.equal(zoomOut.commandId, "window:zoom-out");
+    const zoomReset = (await linux.ui.pressKey({ key: "Mod+0" }, "agy4")) as Record<string, unknown>;
+    assert.equal(zoomReset.commandId, "window:reset-zoom");
+
+    assert.deepEqual(linux.executed, [
+      "window:zoom-in",
+      "window:zoom-in",
+      "window:zoom-in",
+      "window:zoom-out",
+      "window:reset-zoom",
+    ]);
+    assert.equal(linux.dispatched.length, 0);
+    assert.ok(linux.cursorLabels.some((l) => l.includes("Mod+=")));
+    assert.ok(linux.cursorLabels.some((l) => l.includes("Mod+-")));
+    assert.ok(linux.cursorLabels.some((l) => l.includes("Mod+0")));
+    assert.ok(linux.getSettleCalls() >= 5);
+
+    // Non-matching or Alt-modified combos fall back to normal key events.
+    await linux.ui.pressKey({ key: "Mod+Alt+=" }, "agy4");
+    await linux.ui.pressKey({ key: "Mod+Shift+0" }, "agy4");
+    await linux.ui.pressKey({ key: "Mod+p" }, "agy4");
+    assert.equal(linux.executed.length, 5);
+    assert.ok(linux.dispatched.length >= 6);
+
+    // macOS Mod resolves to Meta and still triggers the zoom commands.
+    const darwin = createZoomHarness("darwin", true);
+    await darwin.ui.pressKey({ key: "Mod+=" }, "agy4");
+    await darwin.ui.pressKey({ key: "Mod+-" }, "agy4");
+    await darwin.ui.pressKey({ key: "Mod+0" }, "agy4");
+    assert.deepEqual(darwin.executed, ["window:zoom-in", "window:zoom-out", "window:reset-zoom"]);
+
+    // When Obsidian commands are unavailable, pressKey falls back to sendInputEvent.
+    const fallback = createZoomHarness("linux", false);
+    const fbRes = (await fallback.ui.pressKey({ key: "Mod+=" }, "agy4")) as Record<string, unknown>;
+    assert.equal(fbRes.commandId, undefined);
+    assert.ok(fallback.dispatched.some((ev) => ev.type === "keyDown" && ev.keyCode === "="));
+  });
+
+  it("refuses opening Obsidian Settings via Mod+,, gear click, or palette selection unless allowUiInProtectedAreas is enabled, and drops Mod+, accelerator mapping", async () => {
+    const docState: { activeElement: MockNode | null } = { activeElement: null };
+    const nodes: MockNode[] = [];
+    const exitedAgents: string[] = [];
+    const appCommandsCalled: string[] = [];
+    let allowProtected = false;
+
+    interface MockNode {
+      tagName: string;
+      classes: string[];
+      attrs: Record<string, string>;
+      rect: { left: number; top: number; right: number; bottom: number };
+      text: string;
+      editable: boolean;
+      connected: boolean;
+      visible: boolean;
+      parent: MockNode | null;
+      children: MockNode[];
+      closest: (sel: string) => MockNode | null;
+      matches: (sel: string) => boolean;
+      contains: (other: unknown) => boolean;
+      querySelector: (sel: string) => MockNode | null;
+      querySelectorAll: (sel: string) => MockNode[];
+      getAttribute: (name: string) => string | null;
+      getBoundingClientRect: () => { left: number; top: number; right: number; bottom: number; width: number; height: number };
+      focus: () => void;
+      isContentEditable: boolean;
+      isConnected: boolean;
+      textContent: string;
+      addEventListener?: (type: string, fn: () => void) => void;
+    }
+
+    const matchesSimple = (node: MockNode, part: string): boolean => {
+      const p = part.trim();
+      if (!p) return false;
+      const attrEq = /^\[([a-zA-Z0-9_-]+)="([^"]+)"\]$/.exec(p);
+      if (attrEq) {
+        return node.getAttribute(attrEq[1]) === attrEq[2];
+      }
+      if (p.startsWith(".")) {
+        const clsList = p.slice(1).split(".").filter(Boolean);
+        return clsList.every((c) => node.classes.includes(c));
+      }
+      return node.tagName.toLowerCase() === p.toLowerCase();
+    };
+
+    const matchesChain = (node: MockNode, selPart: string): boolean => {
+      const tokens = selPart.trim().match(/(?:\[[^\]]*\]|\S)+/g) ?? [];
+      if (tokens.length === 0) return false;
+      if (!matchesSimple(node, tokens[tokens.length - 1])) return false;
+      let cur = node.parent;
+      let idx = tokens.length - 2;
+      while (idx >= 0 && cur) {
+        if (matchesSimple(cur, tokens[idx])) {
+          idx -= 1;
+        }
+        cur = cur.parent;
+      }
+      return idx < 0;
+    };
+
+    const matchesSel = (node: MockNode, sel: string): boolean =>
+      sel.split(",").some((s) => matchesChain(node, s));
+
+    const mkNode = (
+      tag: string,
+      classes: string[],
+      rect: { left: number; top: number; right: number; bottom: number },
+      opts: {
+        parent?: MockNode | null;
+        attrs?: Record<string, string>;
+        editable?: boolean;
+        text?: string;
+        connected?: boolean;
+      } = {}
+    ): MockNode => {
+      const n: MockNode = {
+        tagName: tag.toUpperCase(),
+        classes,
+        attrs: opts.attrs ?? {},
+        rect,
+        text: opts.text ?? "",
+        editable: Boolean(opts.editable),
+        connected: opts.connected ?? true,
+        visible: true,
+        parent: opts.parent ?? null,
+        children: [],
+        get isConnected() {
+          return this.connected;
+        },
+        get isContentEditable() {
+          return this.editable && this.tagName !== "INPUT" && this.tagName !== "TEXTAREA";
+        },
+        get textContent() {
+          return this.text;
+        },
+        closest: (sel: string) => {
+          let cur: MockNode | null = n;
+          while (cur) {
+            if (matchesSel(cur, sel)) return cur;
+            cur = cur.parent;
+          }
+          return null;
+        },
+        matches: (sel: string) => matchesSel(n, sel),
+        contains: (other: unknown) => {
+          let cur = other as MockNode | null;
+          while (cur) {
+            if (cur === n) return true;
+            cur = cur.parent;
+          }
+          return false;
+        },
+        querySelector: (sel: string) => {
+          const stack = [...n.children];
+          while (stack.length > 0) {
+            const c = stack.shift()!;
+            if (matchesSel(c, sel)) return c;
+            stack.push(...c.children);
+          }
+          return null;
+        },
+        querySelectorAll: (sel: string) => {
+          const out: MockNode[] = [];
+          const stack = [...n.children];
+          while (stack.length > 0) {
+            const c = stack.shift()!;
+            if (matchesSel(c, sel)) out.push(c);
+            stack.push(...c.children);
+          }
+          return out;
+        },
+        getAttribute: (name: string) => n.attrs[name] ?? null,
+        getBoundingClientRect: () => ({
+          ...n.rect,
+          width: Math.max(0, n.rect.right - n.rect.left),
+          height: Math.max(0, n.rect.bottom - n.rect.top),
+        }),
+        focus: () => {
+          docState.activeElement = n;
+        },
+      };
+      if (opts.parent) {
+        opts.parent.children.push(n);
+      }
+      nodes.push(n);
+      return n;
+    };
+
+    const body = mkNode("body", [], { left: 0, top: 0, right: 1200, bottom: 800 });
+    const editorEl = mkNode("div", ["cm-content"], { left: 260, top: 60, right: 1180, bottom: 760 }, { parent: body, editable: true });
+    const gearBtn = mkNode(
+      "div",
+      ["clickable-icon"],
+      { left: 10, top: 750, right: 38, bottom: 778 },
+      { parent: body, attrs: { "aria-label": "Settings" } }
+    );
+    const openSettingsRibbonBtn = mkNode(
+      "div",
+      ["clickable-icon"],
+      { left: 10, top: 710, right: 38, bottom: 738 },
+      { parent: body, attrs: { "aria-label": "Open settings" } }
+    );
+    const settingsModal = mkNode(
+      "div",
+      ["modal-container", "mod-settings"],
+      { left: 200, top: 80, right: 1000, bottom: 720 },
+      { parent: body, connected: false }
+    );
+    const settingsSearch = mkNode(
+      "input",
+      ["setting-search"],
+      { left: 230, top: 110, right: 420, bottom: 140 },
+      { parent: settingsModal, editable: true, connected: false }
+    );
+    const pluginsBox = mkNode(
+      "div",
+      ["installed-plugins-container"],
+      { left: 450, top: 150, right: 950, bottom: 450 },
+      { parent: settingsModal, connected: false }
+    );
+    mkNode(
+      "div",
+      ["checkbox-container"],
+      { left: 880, top: 170, right: 920, bottom: 195 },
+      { parent: pluginsBox, connected: false }
+    );
+    const promptModal = mkNode(
+      "div",
+      ["modal-container"],
+      { left: 300, top: 90, right: 900, bottom: 320 },
+      { parent: body, connected: false }
+    );
+    const promptBox = mkNode(
+      "div",
+      ["prompt"],
+      { left: 305, top: 95, right: 895, bottom: 315 },
+      { parent: promptModal, connected: false }
+    );
+    const promptInput = mkNode(
+      "input",
+      ["prompt-input"],
+      { left: 320, top: 105, right: 880, bottom: 135 },
+      { parent: promptBox, editable: true, connected: false }
+    );
+    const settingsSuggestion = mkNode(
+      "div",
+      ["suggestion-item", "is-selected"],
+      { left: 320, top: 150, right: 880, bottom: 180 },
+      {
+        parent: promptBox,
+        text: "Open settings",
+        attrs: { "data-command": "app:open-settings" },
+        connected: false,
+      }
+    );
+
+    const openSettings = () => {
+      for (const n of [settingsModal, settingsSearch, pluginsBox, ...pluginsBox.children]) {
+        n.connected = true;
+        n.visible = true;
+      }
+      docState.activeElement = settingsSearch;
+    };
+    const closeSettings = () => {
+      for (const n of [settingsModal, settingsSearch, pluginsBox, ...pluginsBox.children]) {
+        n.connected = false;
+      }
+      docState.activeElement = editorEl;
+    };
+    const openPrompt = () => {
+      for (const n of [promptModal, promptBox, promptInput, settingsSuggestion]) {
+        n.connected = true;
+        n.visible = true;
+      }
+      docState.activeElement = promptInput;
+    };
+    const closePrompt = () => {
+      for (const n of [promptModal, promptBox, promptInput, settingsSuggestion]) {
+        n.connected = false;
+      }
+      docState.activeElement = editorEl;
+    };
+
+    const doc = {
+      get activeElement() {
+        return docState.activeElement;
+      },
+      body,
+      documentElement: { clientWidth: 1200, clientHeight: 800 },
+      querySelectorAll: (sel: string) => nodes.filter((n) => n.connected && matchesSel(n, sel)),
+      elementFromPoint: (x: number, y: number) => {
+        for (let i = nodes.length - 1; i >= 0; i -= 1) {
+          const n = nodes[i];
+          if (!n.connected || n === body) continue;
+          if (x >= n.rect.left && x <= n.rect.right && y >= n.rect.top && y <= n.rect.bottom) {
+            return n;
+          }
+        }
+        return body;
+      },
+    } as unknown as Document;
+
+    const dispatchedEvents: Array<Record<string, unknown>> = [];
+    const win = {
+      innerWidth: 1200,
+      innerHeight: 800,
+      devicePixelRatio: 1,
+      document: doc,
+      app: {
+        commands: {
+          executeCommandById: (id: string) => {
+            appCommandsCalled.push(id);
+            if (id === "app:open-settings") {
+              openSettings();
+              return true;
+            }
+            return false;
+          },
+        },
+      },
+      getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1" }),
+      setTimeout,
+      clearTimeout,
+    } as unknown as Window;
+
+    const ui = new UiControlService({
+      win,
+      getWebContents: () => ({
+        capturePage: () => Promise.resolve(fakeImage(1200, 800)),
+        sendInputEvent: (ev) => {
+          dispatchedEvents.push(ev);
+          if (
+            ev.type === "mouseUp" &&
+            typeof ev.x === "number" &&
+            typeof ev.y === "number" &&
+            ((ev.x >= gearBtn.rect.left &&
+              ev.x <= gearBtn.rect.right &&
+              ev.y >= gearBtn.rect.top &&
+              ev.y <= gearBtn.rect.bottom) ||
+              (ev.x >= openSettingsRibbonBtn.rect.left &&
+                ev.x <= openSettingsRibbonBtn.rect.right &&
+                ev.y >= openSettingsRibbonBtn.rect.top &&
+                ev.y <= openSettingsRibbonBtn.rect.bottom))
+          ) {
+            openSettings();
+          }
+          if (ev.type === "keyDown" && ev.keyCode === "P" && Array.isArray(ev.modifiers) && ev.modifiers.includes("control")) {
+            openPrompt();
+          }
+        },
+        insertText: () => undefined,
+      }),
+      sleep: noSleep,
+      getUiTypingSpeed: () => "fast",
+      getAllowUiInProtectedAreas: () => allowProtected,
+      cursorOverlay: {
+        moveTo: () => undefined,
+        pulseClick: () => undefined,
+        setTyping: () => undefined,
+        exitAgent: (caller: string) => {
+          exitedAgents.push(caller);
+        },
+        whenSettled: () => Promise.resolve(),
+      } as unknown as AgentCursorOverlay,
+    });
+
+    const isProtectedErr = (err: unknown): boolean =>
+      err instanceof UiControlError && err.code === "ui_protected_area";
+
+    // 1. Default protected mode: refuse Mod+,, gear click, ribbon click, and Command Palette "Open settings".
+    docState.activeElement = editorEl;
+    await assert.rejects(() => ui.pressKey({ key: "Mod+," }, "agy5"), isProtectedErr);
+    await assert.rejects(() => ui.click({ target: { selector: "[aria-label=\"Settings\"]" } }, "agy5"), isProtectedErr);
+    await assert.rejects(() => ui.click({ target: { selector: "[aria-label=\"Open settings\"]" } }, "agy5"), isProtectedErr);
+    await assert.rejects(() => ui.hover({ target: { selector: "[aria-label=\"Settings\"]" } }, "agy5"), isProtectedErr);
+    assert.deepEqual(appCommandsCalled, []);
+    assert.equal(settingsModal.isConnected, false);
+
+    // Command palette opens cleanly, and pressing Enter on selected "Open settings" is refused.
+    await ui.pressKey({ key: "Mod+p" }, "agy5");
+    assert.equal(promptModal.isConnected, true);
+    assert.equal(docState.activeElement, promptInput);
+    await assert.rejects(() => ui.pressKey({ key: "Enter" }, "agy5"), isProtectedErr);
+    assert.equal(settingsModal.isConnected, false);
+
+    // If Settings is open, agent UI input inside it and community plugins is refused.
+    closePrompt();
+    openSettings();
+    await assert.rejects(() => ui.click({ target: { selector: ".setting-search" } }), isProtectedErr);
+    await assert.rejects(() => ui.click({ target: { selector: ".checkbox-container" } }), isProtectedErr);
+    await assert.rejects(() => ui.type({ text: "plugin" }), isProtectedErr);
+    await assert.rejects(() => ui.pressKey({ key: "Escape" }), isProtectedErr);
+    closeSettings();
+
+    // 2. When allowUiInProtectedAreas is true, Mod+, drops accelerator mapping (uses sendInputEvent) and gear click keeps Settings open and focused.
+    allowProtected = true;
+    const allowedModComma = (await ui.pressKey({ key: "Mod+," }, "agy5")) as Record<string, unknown>;
+    assert.equal(allowedModComma.commandId, undefined);
+    assert.deepEqual(appCommandsCalled, []);
+    assert.ok(dispatchedEvents.some((ev) => ev.type === "keyDown" && ev.keyCode === ","));
+
+    await ui.click({ target: { selector: "[aria-label=\"Settings\"]" } }, "agy5");
+    assert.equal(settingsModal.isConnected, true);
+    assert.equal(docState.activeElement, settingsSearch, "withFocusRestore must not steal focus away from .mod-settings");
   });
 });

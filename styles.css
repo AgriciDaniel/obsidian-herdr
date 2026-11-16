@@ -987,7 +987,8 @@
   position: fixed;
   inset: 0;
   pointer-events: none;
-  z-index: 9999;
+  z-index: max(9999, calc(var(--layer-notice, 70) + 100));
+  isolation: isolate;
   overflow: hidden;
 }
 

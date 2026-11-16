@@ -4,7 +4,18 @@
 
 import { EditorView } from "@codemirror/view";
 import type { AgentCursorOverlay, DocumentCursorContext, NoteDocChange } from "./agent-cursor";
+import { performDrag } from "./html-drag";
 import { buildKeyPress } from "./keys";
+import {
+  assertNestedCodeMirrorIntact,
+  classifyNestedEditable,
+  cmOwnsElementStrict,
+  commitNestedEditor,
+  isInTableCellWidget,
+  isNestedCodeMirrorOwnership,
+  resolveNestedCodeMirror,
+  shouldPreserveNestedFocus,
+} from "./nested-editors";
 
 /** Subset of Electron's NativeImage used for screenshots. */
 export interface NativeImageLike {
@@ -59,6 +70,22 @@ const COMMUNITY_PLUGIN_PROTECTED_SELECTOR =
   '.installed-plugins-container, .community-plugin-item, .community-plugins-container, .community-plugin-info, [data-plugin-id]';
 const SETTINGS_MODAL_PROTECTED_SELECTOR =
   '.mod-settings, .modal-container.mod-settings, .modal.mod-settings, [data-type="settings"]';
+const WINDOW_CONTROL_PROTECTED_SELECTOR =
+  '.titlebar, .titlebar-button-container, .titlebar-button, .titlebar-close, .titlebar-minimize, .titlebar-maximize, .mod-close, .mod-minimize, .mod-maximize, .window-control, .window-controls';
+const APP_QUIT_PROTECTED_SELECTOR =
+  '[data-command="app:quit"], [data-command-id="app:quit"], [data-value="app:quit"], [data-command="window:close"], [data-command-id="window:close"], [data-value="window:close"]';
+const SETTINGS_OPEN_PROTECTED_SELECTOR =
+  '[data-command="app:open-settings"], [data-command-id="app:open-settings"], [data-value="app:open-settings"]';
+// Electron main-menu zoom accelerators bypass renderer sendInputEvent, so map them to Obsidian commands.
+const APP_ACCELERATOR_COMMANDS: ReadonlyArray<{
+  keyCodes: readonly string[];
+  allowShift: boolean;
+  commandId: string;
+}> = [
+  { keyCodes: ["=", "+"], allowShift: true, commandId: "window:zoom-in" },
+  { keyCodes: ["-"], allowShift: false, commandId: "window:zoom-out" },
+  { keyCodes: ["0"], allowShift: false, commandId: "window:reset-zoom" },
+];
 
 export type UiTypingSpeed = "visible" | "fast";
 
@@ -82,12 +109,18 @@ export interface CodeMirrorViewLike {
   scrollDOM?: HTMLElement | null;
   state?: {
     doc?: CodeMirrorDocLike;
-    selection?: { main?: { head?: number; anchor?: number } };
+    selection?: { main?: { head?: number; anchor?: number; from?: number; to?: number } };
   };
   coordsAtPos?(pos: number, side?: number): CaretCoords | null;
+  posAtCoords?(coords: { x: number; y: number }): number | null;
   dispatch?(spec: unknown): void;
   focus?(): void;
 }
+
+export type TerminalInputDeliverer = (
+  element: Element,
+  data: string
+) => boolean | void | Promise<boolean | void>;
 
 export interface ElementLeafContext {
   notePath?: string;
@@ -150,6 +183,9 @@ export interface UiMutationContext {
   caller: string;
   targetView?: unknown;
   targetCm?: CodeMirrorViewLike | null;
+  targetElement?: Element | null;
+  targetFilePath?: string;
+  expectedFileOperation?: { kind: "trash"; path: string };
 }
 
 export type MutationCompleteCallback = (
@@ -215,6 +251,16 @@ interface CapturedUserEvent {
   altKey?: boolean;
   metaKey?: boolean;
   repeat?: boolean;
+}
+
+interface ExpectedAgentEvent {
+  eventType: "keydown" | "keypress" | "beforeinput";
+  keyMatch: string;
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  expiresAt: number;
 }
 
 interface FocusShieldSession {
@@ -376,14 +422,16 @@ export class UiControlService {
   private readonly resolveAgentLabel: (caller: string) => string;
   private readonly getUiTypingSpeed: () => UiTypingSpeed;
   private readonly getAllowUiInProtectedAreas: () => boolean;
+  private readonly deliverToTerminal: TerminalInputDeliverer | null;
+  private readonly executeCommandByIdOption: ((commandId: string) => boolean) | null;
   private queue: Promise<unknown> = Promise.resolve();
   private activeMutationRun: ActiveMutationRun | null = null;
   private activeShield: FocusShieldSession | null = null;
-  private agentKeyDepth = 0;
-  private agentKeyMatch: string | null = null;
-  private agentInsertTextChunk: string | null = null;
+  private expectedAgentLedger: ExpectedAgentEvent[] = [];
   private deferredUserInputs: CapturedUserEvent[] = [];
   private replayingUserInput = false;
+  private dispatchingAgentInput = false;
+  private inBatchExecution = false;
 
   constructor(options: {
     win: Window;
@@ -398,6 +446,8 @@ export class UiControlService {
     resolveAgentLabel?: (caller: string) => string;
     getUiTypingSpeed?: () => UiTypingSpeed;
     getAllowUiInProtectedAreas?: () => boolean;
+    deliverToTerminal?: TerminalInputDeliverer;
+    executeCommandById?: (commandId: string) => boolean;
   }) {
     this.win = options.win;
     this.getWebContents = options.getWebContents;
@@ -412,6 +462,8 @@ export class UiControlService {
     this.resolveAgentLabel = options.resolveAgentLabel ?? ((caller) => caller);
     this.getUiTypingSpeed = options.getUiTypingSpeed ?? (() => "visible");
     this.getAllowUiInProtectedAreas = options.getAllowUiInProtectedAreas ?? (() => false);
+    this.deliverToTerminal = options.deliverToTerminal ?? null;
+    this.executeCommandByIdOption = options.executeCommandById ?? null;
   }
 
   private async timedAsync<T extends object>(
@@ -671,7 +723,35 @@ export class UiControlService {
     if (settleMs > 0) {
       await this.runWithUserInputShield(() => this.sleep(settleMs));
     }
+    await this.waitForCursorSettled(caller);
     return { dispatched: true, point, button, count, focus: this.focusState() };
+  }
+
+  private async waitForCursorSettled(caller: string): Promise<void> {
+    const overlay = this.cursorOverlay;
+    if (!overlay || typeof overlay.whenSettled !== "function") {
+      return;
+    }
+    const maxWaitMs = this.actionDelayMs(250, 80);
+    let timer: ReturnType<Window["setTimeout"]> | null = null;
+    try {
+      const capPromise =
+        typeof this.win.setTimeout === "function"
+          ? new Promise<void>((resolve) => {
+              timer = this.win.setTimeout(resolve, maxWaitMs + 50);
+            })
+          : null;
+      const settlePromise = overlay.whenSettled(caller, maxWaitMs);
+      if (capPromise) {
+        await Promise.race([settlePromise, capPromise]);
+      } else {
+        await settlePromise;
+      }
+    } finally {
+      if (timer !== null && typeof this.win.clearTimeout === "function") {
+        this.win.clearTimeout(timer);
+      }
+    }
   }
 
   private async clickNow(
@@ -698,14 +778,41 @@ export class UiControlService {
         {
           targetView: resolved.view ?? undefined,
           targetCm: resolved.cm ?? undefined,
+          targetElement: resolved.element ?? resolved.containerEl ?? null,
         }
       );
     });
   }
 
+  hover(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
+    return this.executeUiAction(() => this.hoverNow(params, caller), false, false);
+  }
+
+  private async hoverNow(params: Record<string, unknown>, caller: string): Promise<Record<string, unknown>> {
+    return this.timedAsync(async () => {
+      const wc = this.requireWebContents();
+      const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
+      this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "hover");
+      this.assertPointReceiverSafe(resolved.point, "hover", this.expectedTargetContainer(resolved));
+      const docCtx = this.docContextForResolvedTarget(resolved);
+      const point = resolved.point;
+      this.showCursor(caller, "move", point.x, point.y, "hover", params, docCtx);
+      const at = this.toWindowPoint(wc, point);
+      wc.sendInputEvent({ type: "mouseMove", ...at });
+      const settleMs = this.actionDelayMs(100, 10);
+      if (settleMs > 0) {
+        await this.sleep(settleMs);
+      }
+      await this.waitForCursorSettled(caller);
+      return { dispatched: true, point };
+    });
+  }
+
   type(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
     this.validateTypeParams(params);
-    const borrowFocus = !(params.target !== undefined && this.isAnchorTargetObject(params.target));
+    // Targeted ui.type may resolve to a Markdown CodeMirror editor (focus-free via view.dispatch)
+    // or a non-editor control (which enters withFocusRestore inside typeNow).
+    const borrowFocus = params.target === undefined;
     return this.executeUiAction(() => this.typeNow(params, caller), true, borrowFocus);
   }
 
@@ -774,6 +881,13 @@ export class UiControlService {
       const liveViewCm = this.extractCodeMirrorView(
         ownership.view?.editor?.cm ?? ownership.leaf?.view?.editor?.cm
       );
+      if (isNestedCodeMirrorOwnership(ownership.cm, liveViewCm)) {
+        const nestedCheck = assertNestedCodeMirrorIntact(ownership.cm, liveFocusEl, progress);
+        if (!nestedCheck.ok) {
+          throw new UiControlError("ui_target_changed", nestedCheck.reason);
+        }
+        return;
+      }
       const liveFocusedCm = liveFocusEl ? this.findFocusedCodeMirrorView(liveFocusEl) : null;
       const liveCm = liveViewCm ?? liveFocusedCm;
       if (liveCm && liveCm !== ownership.cm) {
@@ -816,7 +930,7 @@ export class UiControlService {
       insertedChars > 0
         ? `Typing stopped after inserting ${insertedChars} of ${totalChars} characters`
         : "Typing aborted before inserting any characters";
-    const current = this.win.document.activeElement ?? null;
+    const current = this.deepActiveElement();
     if (!this.isProtectedAreasAllowed()) {
       const protectedArea = this.detectProtectedArea(current);
       if (protectedArea) {
@@ -853,26 +967,114 @@ export class UiControlService {
     }
   }
 
-  private async dispatchAgentInsertText(wc: WebContentsLike, chunk: string): Promise<void> {
-    const prevChunk = this.agentInsertTextChunk;
-    this.agentInsertTextChunk = chunk;
-    try {
+  private static readonly AGENT_LEDGER_TTL_MS = 500;
+
+  private pruneExpiredAgentLedger(): void {
+    if (this.expectedAgentLedger.length === 0) {
+      return;
+    }
+    const now = Date.now();
+    this.expectedAgentLedger = this.expectedAgentLedger.filter((entry) => entry.expiresAt > now);
+  }
+
+  private pushExpectedAgentEvent(
+    eventType: ExpectedAgentEvent["eventType"],
+    keyMatch: string,
+    mods?: { shiftKey?: boolean; ctrlKey?: boolean; altKey?: boolean; metaKey?: boolean }
+  ): ExpectedAgentEvent {
+    this.pruneExpiredAgentLedger();
+    const entry: ExpectedAgentEvent = {
+      eventType,
+      keyMatch,
+      shiftKey: Boolean(mods?.shiftKey),
+      ctrlKey: Boolean(mods?.ctrlKey),
+      altKey: Boolean(mods?.altKey),
+      metaKey: Boolean(mods?.metaKey),
+      expiresAt: Date.now() + UiControlService.AGENT_LEDGER_TTL_MS,
+    };
+    this.expectedAgentLedger.push(entry);
+    return entry;
+  }
+
+  private extractEventModifierState(rawMods: unknown): {
+    shiftKey: boolean;
+    ctrlKey: boolean;
+    altKey: boolean;
+    metaKey: boolean;
+  } {
+    const list = Array.isArray(rawMods) ? rawMods.map((m) => String(m).toLowerCase()) : [];
+    const set = new Set(list);
+    return {
+      shiftKey: set.has("shift"),
+      ctrlKey: set.has("control") || set.has("ctrl"),
+      altKey: set.has("alt") || set.has("option"),
+      metaKey: set.has("meta") || set.has("command") || set.has("cmd"),
+    };
+  }
+
+  private static readonly INSERT_TEXT_TIMEOUT_MS = 2000;
+
+  private deepActiveElement(): Element | null {
+    let el: Element | null = this.win.document.activeElement ?? null;
+    for (let depth = 0; depth < 16 && el; depth += 1) {
+      const next = (el as Element & { shadowRoot?: { activeElement?: Element | null } | null })
+        .shadowRoot?.activeElement;
+      if (!next || next === el) {
+        break;
+      }
+      el = next;
+    }
+    return el;
+  }
+
+  private async insertTextWithTimeout(wc: WebContentsLike, chunk: string): Promise<void> {
+    if (typeof this.win.setTimeout !== "function") {
       await wc.insertText(chunk);
+      return;
+    }
+    let timer: ReturnType<Window["setTimeout"]> | null = null;
+    try {
+      await Promise.race([
+        Promise.resolve(wc.insertText(chunk)),
+        new Promise<never>((_, reject) => {
+          timer = this.win.setTimeout(() => {
+            reject(new UiControlError("ui_timeout", "Native text input timed out; result unknown."));
+          }, UiControlService.INSERT_TEXT_TIMEOUT_MS);
+        }),
+      ]);
     } finally {
-      this.agentInsertTextChunk = prevChunk;
+      if (timer !== null && typeof this.win.clearTimeout === "function") {
+        this.win.clearTimeout(timer);
+      }
+    }
+  }
+
+  private async dispatchAgentInsertText(wc: WebContentsLike, chunk: string): Promise<void> {
+    const entry = this.pushExpectedAgentEvent("beforeinput", chunk);
+    try {
+      await this.insertTextWithTimeout(wc, chunk);
+    } finally {
+      const idx = this.expectedAgentLedger.indexOf(entry);
+      if (idx >= 0) {
+        this.expectedAgentLedger.splice(idx, 1);
+      }
     }
   }
 
   private dispatchAgentKeyInput(wc: WebContentsLike, event: Record<string, unknown>): void {
-    const keyCode = typeof event.keyCode === "string" ? event.keyCode : null;
-    const prevMatch = this.agentKeyMatch;
-    this.agentKeyMatch = keyCode;
-    this.agentKeyDepth += 1;
+    const type = typeof event.type === "string" ? event.type : "";
+    const keyCode = typeof event.keyCode === "string" ? event.keyCode : "";
+    const modState = this.extractEventModifierState(event.modifiers);
+    if (type === "keyDown" && keyCode) {
+      this.pushExpectedAgentEvent("keydown", keyCode, modState);
+    } else if (type === "char" && keyCode) {
+      this.pushExpectedAgentEvent("keypress", keyCode, modState);
+    }
+    this.dispatchingAgentInput = true;
     try {
       wc.sendInputEvent(event);
     } finally {
-      this.agentKeyMatch = prevMatch;
-      this.agentKeyDepth = Math.max(0, this.agentKeyDepth - 1);
+      this.dispatchingAgentInput = false;
     }
   }
 
@@ -981,7 +1183,7 @@ export class UiControlService {
       view?: WorkspaceLeafLike["view"] | null;
     }
   ): Promise<void> {
-    const expectedActive = this.win.document.activeElement ?? null;
+    const expectedActive = this.deepActiveElement();
     const activeCm = preferredCm ?? this.findFocusedCodeMirrorView(expectedActive);
     const ownership: EditorTypingOwnership = {
       expectedActive,
@@ -1006,25 +1208,42 @@ export class UiControlService {
     const startPt = this.resolveCaretOrFocusPoint(activeCm);
     this.showCursor(caller, "type", startPt.x, startPt.y, undefined, params, lastDocCtx);
 
+    const routeTabAsKey = this.isTableOrPropertyElement(expectedActive);
+    const sendTabPress = async (): Promise<void> => {
+      this.dispatchAgentKeyInput(wc, { type: "keyDown", keyCode: "Tab", modifiers: [] });
+      this.dispatchAgentKeyInput(wc, { type: "keyUp", keyCode: "Tab", modifiers: [] });
+      const tabDelay = this.actionDelayMs(25, 0);
+      if (tabDelay > 0) {
+        await this.sleep(tabDelay);
+      }
+    };
+
     const insertChunkAndSync = async (chunk: string, delayMs: number): Promise<void> => {
-      const beforeHead = activeCm?.state?.selection?.main?.head;
-      if (chunk) {
-        await this.dispatchAgentInsertText(wc, chunk);
-        this.recordMutationInsert(beforeHead, chunk);
-      }
-      if (delayMs > 0) {
-        await this.sleep(delayMs);
-      }
-      await this.ensureCaretInView(activeCm);
-      lastDocCtx = buildCtx() ?? lastDocCtx;
-      const nextPt = this.resolveCaretOrFocusPoint(activeCm);
-      this.showCursor(caller, "type", nextPt.x, nextPt.y, undefined, params, lastDocCtx);
-      const change: NoteDocChange | undefined =
-        typeof beforeHead === "number" && chunk
-          ? { from: beforeHead, to: beforeHead, insertLength: chunk.length }
-          : undefined;
-      if (chunk) {
-        this.notifyOverlayNoteUpdated(lastDocCtx?.notePath, change);
+      const parts = routeTabAsKey ? chunk.split("\t") : [chunk];
+      for (let i = 0; i < parts.length; i += 1) {
+        if (i > 0) {
+          await sendTabPress();
+        }
+        const piece = parts[i];
+        const beforeHead = activeCm?.state?.selection?.main?.head;
+        if (piece) {
+          await this.dispatchAgentInsertText(wc, piece);
+          this.recordMutationInsert(beforeHead, piece);
+        }
+        if (delayMs > 0) {
+          await this.sleep(delayMs);
+        }
+        await this.ensureCaretInView(activeCm);
+        lastDocCtx = buildCtx() ?? lastDocCtx;
+        const nextPt = this.resolveCaretOrFocusPoint(activeCm);
+        this.showCursor(caller, "type", nextPt.x, nextPt.y, undefined, params, lastDocCtx);
+        const change: NoteDocChange | undefined =
+          typeof beforeHead === "number" && piece
+            ? { from: beforeHead, to: beforeHead, insertLength: piece.length }
+            : undefined;
+        if (piece) {
+          this.notifyOverlayNoteUpdated(lastDocCtx?.notePath, change);
+        }
       }
     };
 
@@ -1061,112 +1280,223 @@ export class UiControlService {
     }
   }
 
+  private resolveMarkdownEditorForResolvedTarget(
+    rawTarget: unknown,
+    resolved: ResolvedUiTarget
+  ): {
+    cm: CodeMirrorViewLike;
+    pos: number;
+    leaf: WorkspaceLeafLike | null;
+    view: WorkspaceLeafLike["view"] | null;
+    containerEl: Element | null;
+    notePath: string | null;
+    paneId: string | null;
+  } | null {
+    const meta = this.resolveTargetLeafMeta(resolved);
+    const isAnchor = this.isAnchorTargetObject(rawTarget);
+    let cm: CodeMirrorViewLike | null = resolved.cm ?? null;
+    if (!isAnchor) {
+      const el = resolved.element ?? null;
+      if (!el || isInputOrTextarea(el)) {
+        return null;
+      }
+      if (isInTableCellWidget(el)) {
+        const leafCm = this.extractCodeMirrorView(meta.view?.editor?.cm);
+        const nested = resolveNestedCodeMirror(el, { outerCm: leafCm });
+        cm = nested.cm;
+      } else {
+        cm = this.findFocusedCodeMirrorView(el);
+        if (!cm && this.findClosestElement(el, ".cm-editor, .cm-content, .cm-line")) {
+          const leafContainer =
+            meta.containerEl ?? this.findClosestElement(el, ".workspace-leaf");
+          const leafCm = this.extractCodeMirrorView(meta.view?.editor?.cm);
+          cm = leafCm ?? (leafContainer ? this.findCodeMirrorInContainer(leafContainer) : null);
+        }
+        if (cm && !this.cmOwnsElement(cm, el)) {
+          cm = null;
+        }
+      }
+    }
+    if (!cm || !cm.state?.doc || typeof cm.dispatch !== "function") {
+      if (isAnchor) {
+        throw new UiControlError(
+          "ui_not_editable",
+          `Target note '${resolved.notePath ?? "note"}' does not have an active CodeMirror editor view. Switch the pane to Editing view before typing.`
+        );
+      }
+      return null;
+    }
+
+    let pos = resolved.pos;
+    if (typeof pos !== "number") {
+      if (typeof cm.posAtCoords === "function") {
+        try {
+          const fromCoords = cm.posAtCoords({ x: resolved.point.x, y: resolved.point.y });
+          if (typeof fromCoords === "number" && Number.isFinite(fromCoords)) {
+            pos = fromCoords;
+          }
+        } catch {
+          // Fall through to line or selection lookup.
+        }
+      }
+      if (typeof pos !== "number" && resolved.element) {
+        const lineEl = this.findClosestElement(resolved.element, ".cm-line");
+        const lineText = lineEl?.textContent?.trim();
+        if (lineText) {
+          const doc = cm.state.doc;
+          for (let i = 1; i <= doc.lines; i += 1) {
+            const line = doc.line(i);
+            if (line.text.trim() === lineText) {
+              pos = line.to;
+              break;
+            }
+          }
+        }
+      }
+      if (typeof pos !== "number") {
+        pos = cm.state.selection?.main?.head ?? cm.state.doc.length;
+      }
+    }
+
+    return {
+      cm,
+      pos,
+      leaf: resolved.workspaceLeaf ?? meta.leaf ?? null,
+      view: resolved.view ?? meta.view ?? null,
+      containerEl: resolved.containerEl ?? meta.containerEl ?? null,
+      notePath: meta.notePath ?? resolved.notePath ?? null,
+      paneId: meta.paneId ?? resolved.paneId ?? null,
+    };
+  }
+
   private async typeNow(params: Record<string, unknown>, caller: string): Promise<Record<string, unknown>> {
     return this.timedAsync(async () => {
       const text = this.validateTypeParams(params);
-      if (params.target !== undefined && this.isAnchorTargetObject(params.target)) {
+      if (params.target !== undefined) {
         const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
         this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "type");
         this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
-        const preferredCm = resolved.cm ?? null;
-        if (!preferredCm || !preferredCm.state?.doc || typeof preferredCm.dispatch !== "function") {
-          throw new UiControlError(
-            "ui_not_editable",
-            `Target note '${resolved.notePath ?? "note"}' does not have an active CodeMirror editor view. Switch the pane to Editing view before typing.`
+        const skipEditorRouteForNestedTab =
+          text.includes("\t") && this.isTableOrPropertyElement(resolved.element);
+        const editorTarget = skipEditorRouteForNestedTab
+          ? null
+          : this.resolveMarkdownEditorForResolvedTarget(params.target, resolved);
+        if (editorTarget) {
+          const ownership: EditorTypingOwnership = {
+            expectedActive: null,
+            notePath: editorTarget.notePath,
+            paneId: editorTarget.paneId,
+            containerEl: editorTarget.containerEl,
+            leaf: editorTarget.leaf,
+            view: editorTarget.view,
+            cm: editorTarget.cm,
+          };
+          return this.withMutationHook(
+            "type",
+            editorTarget.notePath,
+            editorTarget.paneId,
+            caller,
+            async () => {
+              this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
+              if (resolved.scrolled) {
+                this.showCursor(
+                  caller,
+                  "move",
+                  resolved.point.x,
+                  resolved.point.y,
+                  "scroll",
+                  params,
+                  this.docContextForResolvedTarget(resolved)
+                );
+              }
+              await this.dispatchCmChunks(
+                editorTarget.cm,
+                text,
+                editorTarget.pos,
+                caller,
+                params,
+                ownership,
+                {
+                  notePath: editorTarget.notePath,
+                  paneId: editorTarget.paneId,
+                  containerEl: editorTarget.containerEl,
+                }
+              );
+              return { dispatched: true, characters: text.length, focus: this.focusState() };
+            },
+            { targetView: editorTarget.view, targetCm: editorTarget.cm, targetElement: resolved.element ?? editorTarget.containerEl ?? null }
           );
         }
+
+        const wc = this.requireWebContents();
+        const clickStep = { ...params, target: params.target };
         const targetMeta = this.resolveTargetLeafMeta(resolved);
-        const notePath = targetMeta.notePath ?? resolved.notePath ?? null;
-        const paneId = targetMeta.paneId ?? resolved.paneId ?? null;
-        const targetView = resolved.view ?? targetMeta.view ?? null;
-        const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? null;
-        const containerEl = resolved.containerEl ?? targetMeta.containerEl ?? null;
-        const ownership: EditorTypingOwnership = {
-          expectedActive: null,
-          notePath,
-          paneId,
-          containerEl,
-          leaf: targetLeaf,
-          view: targetView,
-          cm: preferredCm,
-        };
-        return this.withMutationHook(
-          "type",
-          notePath,
-          paneId,
-          caller,
-          async () => {
-            this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
-            if (resolved.scrolled) {
-              this.showCursor(
-                caller,
-                "move",
-                resolved.point.x,
-                resolved.point.y,
-                "scroll",
-                params,
-                this.docContextForResolvedTarget(resolved)
-              );
-            }
-            await this.dispatchCmChunks(
-              preferredCm,
-              text,
-              resolved.pos ?? preferredCm.state?.selection?.main?.head ?? 0,
+        const runRawTargeted = (): Promise<Record<string, unknown>> =>
+          this.runWithUserInputShield(async () => {
+            const focusedOwnership = this.resolveFocusedOwnership();
+            const notePath = targetMeta.notePath ?? focusedOwnership.notePath;
+            const paneId = targetMeta.paneId ?? focusedOwnership.paneId;
+            const targetView = resolved.view ?? targetMeta.view ?? focusedOwnership.view ?? null;
+            const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? focusedOwnership.leaf ?? null;
+            const containerEl =
+              resolved.containerEl ?? targetMeta.containerEl ?? focusedOwnership.containerEl ?? null;
+            const preferredCm = resolved.cm ?? null;
+            return this.withMutationHook(
+              "type",
+              notePath,
+              paneId,
               caller,
-              params,
-              ownership,
-              { notePath, paneId, containerEl }
+              async () => {
+                await this.dispatchResolvedClick(wc, resolved, clickStep, caller, "type");
+                this.assertElementNotProtected(this.deepActiveElement(), "type");
+                const focus = this.focusState();
+                if (!focus.editable || focus.password) {
+                  throw new UiControlError(
+                    "ui_not_editable",
+                    "Focus an editable text field before typing. Password fields are excluded."
+                  );
+                }
+                const liveActive = this.deepActiveElement();
+                const outerViewCm = this.extractCodeMirrorView(targetView?.editor?.cm ?? targetLeaf?.view?.editor?.cm);
+                const nestedResolved = resolveNestedCodeMirror(liveActive, { outerCm: outerViewCm });
+                const effectiveCm =
+                  nestedResolved.cm ??
+                  (nestedResolved.inTableCell ? null : preferredCm ?? this.findFocusedCodeMirrorView(liveActive));
+                await this.typeChunks(wc, text, caller, params, effectiveCm, {
+                  notePath,
+                  paneId,
+                  containerEl,
+                  leaf: targetLeaf,
+                  view: targetView,
+                });
+                const nestedKind = classifyNestedEditable(liveActive);
+                if (
+                  !this.inBatchExecution &&
+                  liveActive &&
+                  nestedKind &&
+                  nestedKind !== "table-cell"
+                ) {
+                  commitNestedEditor(liveActive, this.win, {
+                    triggerEnter: nestedKind === "inline-title" || nestedKind === "file-explorer-rename",
+                    triggerBlur: true,
+                    text,
+                  });
+                }
+                return { dispatched: true, characters: text.length, focus: this.focusState() };
+              },
+              {
+                targetView,
+                targetCm: preferredCm,
+                targetElement: resolved.element ?? containerEl ?? null,
+              }
             );
-            return { dispatched: true, characters: text.length, focus: this.focusState() };
-          },
-          { targetView, targetCm: preferredCm }
-        );
+          });
+        return this.activeShield ? runRawTargeted() : this.withFocusRestore(runRawTargeted);
       }
 
       const wc = this.requireWebContents();
       return this.runWithUserInputShield(async () => {
-        if (params.target !== undefined) {
-          const clickStep = { ...params, target: params.target };
-          const resolved = await this.resolveTargetAsync(params.target);
-          this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "type");
-          this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
-          const preferredCm = resolved.cm ?? null;
-          const targetMeta = this.resolveTargetLeafMeta(resolved);
-          const focusedOwnership = this.resolveFocusedOwnership();
-          const notePath = targetMeta.notePath ?? focusedOwnership.notePath;
-          const paneId = targetMeta.paneId ?? focusedOwnership.paneId;
-          const targetView = resolved.view ?? targetMeta.view ?? focusedOwnership.view ?? null;
-          const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? focusedOwnership.leaf ?? null;
-          const containerEl = resolved.containerEl ?? targetMeta.containerEl ?? focusedOwnership.containerEl ?? null;
-          return this.withMutationHook(
-            "type",
-            notePath,
-            paneId,
-            caller,
-            async () => {
-              await this.dispatchResolvedClick(wc, resolved, clickStep, caller, "type");
-              this.assertElementNotProtected(this.win.document.activeElement ?? null, "type");
-              const focus = this.focusState();
-              if (!focus.editable || focus.password) {
-                throw new UiControlError(
-                  "ui_not_editable",
-                  "Focus an editable text field before typing. Password fields are excluded."
-                );
-              }
-              await this.typeChunks(wc, text, caller, params, preferredCm, {
-                notePath,
-                paneId,
-                containerEl,
-                leaf: targetLeaf,
-                view: targetView,
-              });
-              return { dispatched: true, characters: text.length, focus: this.focusState() };
-            },
-            { targetView, targetCm: preferredCm }
-          );
-        }
-
-        this.assertElementNotProtected(this.win.document.activeElement ?? null, "type");
+        this.assertElementNotProtected(this.deepActiveElement(), "type");
         const focus = this.focusState();
         if (!focus.editable || focus.password) {
           throw new UiControlError(
@@ -1181,6 +1511,7 @@ export class UiControlService {
           focusedOwnership.paneId,
           caller,
           async () => {
+            const liveActive = this.deepActiveElement();
             await this.typeChunks(wc, text, caller, params, focusedOwnership.cm, {
               notePath: focusedOwnership.notePath,
               paneId: focusedOwnership.paneId,
@@ -1188,11 +1519,25 @@ export class UiControlService {
               leaf: focusedOwnership.leaf,
               view: focusedOwnership.view,
             });
+            const nestedKind = classifyNestedEditable(liveActive);
+            if (
+              !this.inBatchExecution &&
+              liveActive &&
+              nestedKind &&
+              nestedKind !== "table-cell"
+            ) {
+              commitNestedEditor(liveActive, this.win, {
+                triggerEnter: nestedKind === "inline-title" || nestedKind === "file-explorer-rename",
+                triggerBlur: true,
+                text,
+              });
+            }
             return { dispatched: true, characters: text.length, focus: this.focusState() };
           },
           {
             targetView: focusedOwnership.view,
             targetCm: focusedOwnership.cm,
+            targetElement: this.deepActiveElement() ?? focusedOwnership.containerEl ?? null,
           }
         );
       });
@@ -1318,6 +1663,86 @@ export class UiControlService {
     return this.executeUiAction(() => this.pressKeyNow(params, caller), true);
   }
 
+  private parseKeyAndModifiers(rawKey: string, rawModifiers: unknown): { key: string; modifiers: string[] } {
+    const explicitMods = Array.isArray(rawModifiers) ? rawModifiers.map(String) : [];
+    if (explicitMods.length > 0 || !rawKey.includes("+") || rawKey.length <= 1) {
+      return { key: rawKey, modifiers: explicitMods };
+    }
+    const modPrefix = new Set(["mod", "ctrl", "control", "alt", "option", "shift", "meta", "cmd", "command"]);
+    if (rawKey.endsWith("++")) {
+      const head = rawKey.slice(0, -2);
+      const headParts = head ? head.split("+") : [];
+      if (headParts.length >= 1 && headParts.every((p) => modPrefix.has(p.toLowerCase()))) {
+        return { key: "+", modifiers: headParts };
+      }
+    }
+    const parts = rawKey.split("+");
+    if (parts.length >= 2 && parts.slice(0, -1).every((p) => modPrefix.has(p.toLowerCase()))) {
+      return {
+        key: parts[parts.length - 1],
+        modifiers: parts.slice(0, -1),
+      };
+    }
+    return { key: rawKey, modifiers: explicitMods };
+  }
+
+  private resolveAppAcceleratorCommandId(
+    keyCode: string,
+    modifiers: readonly string[]
+  ): string | null {
+    const hasPrimaryMod =
+      this.platform === "darwin"
+        ? modifiers.includes("meta") && !modifiers.includes("control")
+        : modifiers.includes("control") && !modifiers.includes("meta");
+    if (!hasPrimaryMod || modifiers.includes("alt")) {
+      return null;
+    }
+    const hasShift = modifiers.includes("shift");
+    for (const entry of APP_ACCELERATOR_COMMANDS) {
+      if (!entry.keyCodes.includes(keyCode)) {
+        continue;
+      }
+      if (!entry.allowShift && hasShift) {
+        continue;
+      }
+      return entry.commandId;
+    }
+    return null;
+  }
+
+  private executeObsidianCommandById(commandId: string): boolean {
+    if (this.executeCommandByIdOption) {
+      return Boolean(this.executeCommandByIdOption(commandId));
+    }
+    const winWithApp = this.win as unknown as {
+      app?: { commands?: { executeCommandById?: (id: string) => boolean } };
+    };
+    const fn = winWithApp.app?.commands?.executeCommandById;
+    if (typeof fn !== "function") {
+      return false;
+    }
+    return Boolean(fn.call(winWithApp.app?.commands, commandId));
+  }
+
+  private isAppQuitShortcut(keyCode: string, modifiers: readonly string[]): boolean {
+    if (keyCode === "Q") {
+      return (modifiers.includes("control") || modifiers.includes("meta")) && !modifiers.includes("alt");
+    }
+    if (keyCode === "F4") {
+      return modifiers.includes("alt");
+    }
+    return false;
+  }
+
+  private isSettingsOpenShortcut(keyCode: string, modifiers: readonly string[]): boolean {
+    return (
+      keyCode === "," &&
+      (modifiers.includes("control") || modifiers.includes("meta")) &&
+      !modifiers.includes("alt") &&
+      !modifiers.includes("shift")
+    );
+  }
+
   private async pressKeyNow(
     params: Record<string, unknown>,
     caller: string,
@@ -1325,47 +1750,74 @@ export class UiControlService {
   ): Promise<Record<string, unknown>> {
     return this.timedAsync(async () => {
       const wc = this.requireWebContents();
-      const key = typeof params.key === "string" ? params.key : "";
-      const modifiers = Array.isArray(params.modifiers) ? params.modifiers.map(String) : [];
+      const rawKey = typeof params.key === "string" ? params.key : "";
+      const { key, modifiers } = this.parseKeyAndModifiers(rawKey, params.modifiers);
       let press;
       try {
         press = buildKeyPress(key, modifiers, this.platform);
       } catch (err) {
         throw new UiControlError("invalid_params", err instanceof Error ? err.message : String(err));
       }
-      this.assertElementNotProtected(this.win.document.activeElement ?? null, "press_key");
+      if (!this.isProtectedAreasAllowed() && this.isAppQuitShortcut(press.keyCode, press.modifiers)) {
+        throw new UiControlError(
+          "ui_protected_area",
+          "Refused ui.press_key for app quit shortcut. Ask the user to quit Obsidian manually, or enable allowUiInProtectedAreas in Herdr settings if explicitly authorized."
+        );
+      }
+      if (!this.isProtectedAreasAllowed() && this.isSettingsOpenShortcut(press.keyCode, press.modifiers)) {
+        throw new UiControlError(
+          "ui_protected_area",
+          "Refused ui.press_key for Settings shortcut. Ask the user to open Obsidian Settings manually, or enable allowUiInProtectedAreas in Herdr settings if explicitly authorized."
+        );
+      }
+      const activeBeforeKey = this.deepActiveElement();
+      this.assertElementNotProtected(activeBeforeKey, "press_key");
+      if (
+        !this.isProtectedAreasAllowed() &&
+        (press.keyCode === "Enter" || press.keyCode === "Space")
+      ) {
+        for (const selectedEl of this.findSelectedActivationElements(activeBeforeKey)) {
+          this.assertElementNotProtected(selectedEl, "press_key");
+        }
+      }
+      const acceleratorCommandId = this.resolveAppAcceleratorCommandId(press.keyCode, press.modifiers);
       const run = (): Promise<Record<string, unknown>> =>
         this.runWithUserInputShield(async () => {
           const pt = this.resolveCaretOrFocusPoint();
           const combo = [...modifiers, key].filter(Boolean).join("+");
           const beforeCtx = this.buildDocContext();
           this.showCursor(caller, "move", pt.x, pt.y, combo || "key", params, beforeCtx);
-          try {
-            this.dispatchAgentKeyInput(wc, {
-              type: "keyDown",
-              keyCode: press.keyCode,
-              modifiers: press.modifiers,
-            });
-            if (press.text !== null) {
+          let executedCommandId: string | null = null;
+          if (acceleratorCommandId && this.executeObsidianCommandById(acceleratorCommandId)) {
+            executedCommandId = acceleratorCommandId;
+          } else {
+            try {
               this.dispatchAgentKeyInput(wc, {
-                type: "char",
-                keyCode: press.text,
+                type: "keyDown",
+                keyCode: press.keyCode,
+                modifiers: press.modifiers,
+              });
+              if (press.text !== null) {
+                this.dispatchAgentKeyInput(wc, {
+                  type: "char",
+                  keyCode: press.text,
+                  modifiers: press.modifiers,
+                });
+              }
+            } finally {
+              this.dispatchAgentKeyInput(wc, {
+                type: "keyUp",
+                keyCode: press.keyCode,
                 modifiers: press.modifiers,
               });
             }
-          } finally {
-            this.dispatchAgentKeyInput(wc, {
-              type: "keyUp",
-              keyCode: press.keyCode,
-              modifiers: press.modifiers,
-            });
           }
           const settleMs = this.actionDelayMs(80, 10);
           if (settleMs > 0) {
             await this.sleep(settleMs);
           }
           const doc = this.win.document;
-          const afterActive = doc.activeElement ?? null;
+          const afterActive = this.deepActiveElement();
           const afterProtected = this.detectProtectedArea(afterActive);
           const afterRect =
             afterActive &&
@@ -1406,8 +1858,15 @@ export class UiControlService {
             ) {
               this.notifyOverlayNoteUpdated(afterCtx.notePath);
             }
+            await this.waitForCursorSettled(caller);
           }
-          return { dispatched: true, key, modifiers: press.modifiers, focus: this.focusState() };
+          return {
+            dispatched: true,
+            ...(executedCommandId ? { commandId: executedCommandId } : {}),
+            key,
+            modifiers: press.modifiers,
+            focus: this.focusState(),
+          };
         });
       if (!notifyMutation) {
         return run();
@@ -1422,6 +1881,7 @@ export class UiControlService {
         {
           targetView: focusedOwnership.view,
           targetCm: focusedOwnership.cm,
+          targetElement: this.deepActiveElement() ?? focusedOwnership.containerEl ?? null,
         }
       );
     });
@@ -1431,6 +1891,71 @@ export class UiControlService {
     return this.executeUiAction(() => this.scrollNow(params, caller), false, false);
   }
 
+  private isNoteOnlyScrollTarget(raw: unknown): string | null {
+    if (!this.isAnchorTargetObject(raw)) {
+      return null;
+    }
+    const obj = raw as Record<string, unknown>;
+    if (
+      obj.line !== undefined ||
+      obj.after !== undefined ||
+      obj.heading !== undefined ||
+      obj.text !== undefined
+    ) {
+      return null;
+    }
+    const note =
+      typeof obj.note === "string"
+        ? obj.note.trim()
+        : typeof obj.path === "string"
+          ? obj.path.trim()
+          : "";
+    return note || null;
+  }
+
+  private resolveNoteOnlyScrollTarget(rawNote: string): ResolvedUiTarget {
+    const leaf = this.findOpenNoteLeaf(rawNote);
+    if (!leaf) {
+      throw new UiControlError(
+        "ui_target_not_found",
+        `Note '${rawNote}' is not open in any visible Obsidian pane.`
+      );
+    }
+    const scroller =
+      leaf.cm?.scrollDOM ??
+      leaf.containerEl.querySelector?.(".cm-scroller, .markdown-preview-view, .view-content") ??
+      leaf.containerEl;
+    const rawRect = scroller.getBoundingClientRect?.() ?? leaf.containerEl.getBoundingClientRect?.();
+    if (!hasNonZeroBox(rawRect)) {
+      throw new UiControlError(
+        "ui_target_outside",
+        `Could not resolve scroll viewport coordinates for '${rawNote}'.`
+      );
+    }
+    const left = typeof rawRect.left === "number" ? rawRect.left : 0;
+    const top = typeof rawRect.top === "number" ? rawRect.top : 0;
+    const right = typeof rawRect.right === "number" ? rawRect.right : left + (rawRect.width ?? 0);
+    const bottom = typeof rawRect.bottom === "number" ? rawRect.bottom : top + (rawRect.height ?? 0);
+    const clampedLeft = Math.max(0, left);
+    const clampedTop = Math.max(0, top);
+    const clampedRight = Math.min(this.win.innerWidth, right);
+    const clampedBottom = Math.min(this.win.innerHeight, bottom);
+    const point = {
+      x: Math.round((clampedLeft + clampedRight) / 2),
+      y: Math.round((clampedTop + clampedBottom) / 2),
+    };
+    return {
+      point,
+      element: scroller,
+      notePath: leaf.path,
+      paneId: leaf.pane,
+      containerEl: leaf.containerEl,
+      cm: leaf.cm ?? null,
+      view: leaf.view ?? null,
+      workspaceLeaf: leaf.workspaceLeaf ?? null,
+    };
+  }
+
   private async scrollNow(
     params: Record<string, unknown>,
     caller: string,
@@ -1438,7 +1963,10 @@ export class UiControlService {
   ): Promise<Record<string, unknown>> {
     return this.timedAsync(async () => {
       const wc = this.requireWebContents();
-      const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
+      const noteOnlyPath = this.isNoteOnlyScrollTarget(params.target);
+      const resolved = noteOnlyPath
+        ? this.resolveNoteOnlyScrollTarget(noteOnlyPath)
+        : await this.resolveTargetAsync(params.target, { focusLeaf: false });
       this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "scroll");
       this.assertPointReceiverSafe(resolved.point, "scroll", this.expectedTargetContainer(resolved));
       const point = resolved.point;
@@ -1503,27 +2031,20 @@ export class UiControlService {
       const expectedEndContainer = this.expectedTargetContainer(resolvedEnd);
       const start = resolvedStart.point;
       const end = resolvedEnd.point;
-      const steps = Math.min(60, Math.max(1, Math.round(num(params.steps, 12))));
-      const from = this.toWindowPoint(wc, start);
-      const to = this.toWindowPoint(wc, end);
-      const stepPoints = Array.from({ length: steps }, (_, idx) => {
-        const i = idx + 1;
-        return {
-          css: {
-            x: start.x + ((end.x - start.x) * i) / steps,
-            y: start.y + ((end.y - start.y) * i) / steps,
-          },
-          win: {
-            x: Math.round(from.x + ((to.x - from.x) * i) / steps),
-            y: Math.round(from.y + ((to.y - from.y) * i) / steps),
-          },
-          isLast: i === steps,
-        };
-      });
-      // Preflight start, destination, and every interpolated point before starting mouseDown.
+      const explicitSteps =
+        params.steps !== undefined ? Math.min(60, Math.max(1, Math.round(num(params.steps, 12)))) : undefined;
+      const startElement = resolvedStart.element ?? this.elementAtPoint(start);
+      const endElement = resolvedEnd.element ?? this.elementAtPoint(end);
+
+      // Preflight start, destination, and interpolated path before sending any drag input.
       this.assertPointReceiverSafe(start, "drag", expectedStartContainer);
-      for (const step of stepPoints) {
-        this.assertPointReceiverSafe(step.css, "drag", step.isLast ? expectedEndContainer : undefined);
+      const preflightSteps = explicitSteps ?? 16;
+      for (let i = 1; i <= preflightSteps; i += 1) {
+        const pt = {
+          x: start.x + ((end.x - start.x) * i) / preflightSteps,
+          y: start.y + ((end.y - start.y) * i) / preflightSteps,
+        };
+        this.assertPointReceiverSafe(pt, "drag", i === preflightSteps ? expectedEndContainer : undefined);
       }
 
       const startMeta = this.resolveTargetLeafMeta(resolvedStart);
@@ -1536,39 +2057,41 @@ export class UiControlService {
         startMeta.paneId ?? endMeta.paneId,
         caller,
         async () => {
-          let last = from;
           const stepDelayMs = this.actionDelayMs(16, 4);
-          this.showCursor(caller, "click", start.x, start.y, "drag", params, startDocCtx);
-          wc.sendInputEvent({ type: "mouseMove", ...from });
-          this.assertPointReceiverSafe(start, "drag", expectedStartContainer);
-          try {
-            wc.sendInputEvent({ type: "mouseDown", ...from, button: "left", clickCount: 1 });
-            for (const step of stepPoints) {
-              this.assertPointReceiverSafe(
-                step.css,
-                "drag",
-                step.isLast ? expectedEndContainer : undefined
-              );
-              this.showCursor(caller, "move", step.css.x, step.css.y, "drag", params, startDocCtx);
-              wc.sendInputEvent({ type: "mouseMove", ...step.win, modifiers: ["leftButtonDown"] });
-              last = step.win;
-              if (stepDelayMs > 0) {
-                await this.sleep(stepDelayMs);
-              }
-            }
-          } finally {
-            wc.sendInputEvent({ type: "mouseUp", ...last, button: "left", clickCount: 1 });
-          }
-          this.showCursor(caller, "move", end.x, end.y, "drop", params, endDocCtx);
           const dropSettleMs = this.actionDelayMs(100, 10);
-          if (dropSettleMs > 0) {
-            await this.sleep(dropSettleMs);
-          }
-          return { dispatched: true, from: start, to: end, steps };
+          const dragRes = await performDrag({
+            win: this.win,
+            wc,
+            from: start,
+            to: end,
+            toWindowPoint: (pt) => this.toWindowPoint(wc, pt),
+            fromElement: startElement,
+            toElement: endElement,
+            steps: explicitSteps,
+            stepDelayMs,
+            dropSettleMs,
+            sleep: this.sleep,
+            onBeforeStart: (pt) => this.assertPointReceiverSafe(pt, "drag", expectedStartContainer),
+            onStart: (pt) => this.showCursor(caller, "click", pt.x, pt.y, "drag", params, startDocCtx),
+            onBeforeStep: (pt, isLast) =>
+              this.assertPointReceiverSafe(pt, "drag", isLast ? expectedEndContainer : undefined),
+            onStep: (pt) => this.showCursor(caller, "move", pt.x, pt.y, "drag", params, startDocCtx),
+            onComplete: (pt) => this.showCursor(caller, "move", pt.x, pt.y, "drop", params, endDocCtx),
+          });
+          await this.waitForCursorSettled(caller);
+          return {
+            dispatched: true,
+            mode: dragRes.mode,
+            dropped: dragRes.dropped,
+            from: start,
+            to: end,
+            steps: dragRes.steps,
+          };
         },
         {
           targetView: resolvedStart.view ?? resolvedEnd.view ?? undefined,
           targetCm: resolvedStart.cm ?? resolvedEnd.cm ?? undefined,
+          targetElement: startElement ?? endElement ?? null,
         }
       );
     });
@@ -1584,7 +2107,23 @@ export class UiControlService {
       return true;
     }
     if (action === "type") {
-      return !(step.target !== undefined && this.isAnchorTargetObject(step.target));
+      if (step.target === undefined) {
+        return true;
+      }
+      if (this.isAnchorTargetObject(step.target)) {
+        return false;
+      }
+      try {
+        const pt = this.resolveTarget(step.target);
+        const editorTarget = this.resolveMarkdownEditorForResolvedTarget(step.target, {
+          point: { x: pt.x, y: pt.y },
+          element: pt.element,
+          isSelector: pt.isSelector,
+        });
+        return editorTarget === null;
+      } catch {
+        return false;
+      }
     }
     return false;
   }
@@ -1619,40 +2158,47 @@ export class UiControlService {
               : undefined;
         const results: unknown[] = [];
         const stepsList: unknown[] = rawSteps;
-        for (let i = 0; i < stepsList.length; i += 1) {
-          const rawStep = stepsList[i];
-          if (!rawStep || typeof rawStep !== "object") {
-            throw new UiControlError("invalid_params", "Each ui.batch step must be an object.");
+        this.inBatchExecution = true;
+        try {
+          for (let i = 0; i < stepsList.length; i += 1) {
+            const rawStep = stepsList[i];
+            if (!rawStep || typeof rawStep !== "object") {
+              throw new UiControlError("invalid_params", "Each ui.batch step must be an object.");
+            }
+            const isLastStep = i === stepsList.length - 1;
+            const baseStep = rawStep as Record<string, unknown>;
+            const step =
+              batchAgentName && baseStep.agentName === undefined && baseStep.callerName === undefined
+                ? { ...baseStep, agentName: batchAgentName }
+                : baseStep;
+            const action = typeof step.action === "string" ? step.action : "";
+            if (action === "click") {
+              results.push(await this.clickNow(step, caller));
+            } else if (action === "hover") {
+              results.push(await this.hoverNow(step, caller));
+            } else if (action === "type") {
+              results.push(await this.typeNow(step, caller));
+            } else if (action === "insert_line") {
+              results.push(await this.insertLineNow(step, caller));
+            } else if (action === "press_key") {
+              results.push(await this.pressKeyNow(step, caller));
+            } else if (action === "scroll") {
+              results.push(await this.scrollNow(step, caller, isLastStep));
+            } else if (action === "drag") {
+              results.push(await this.dragNow(step, caller));
+            } else if (action === "wait_for") {
+              results.push(await this.waitFor(step, caller));
+            } else {
+              throw new UiControlError(
+                "invalid_params",
+                `Unsupported ui.batch step action '${action}'.`
+              );
+            }
           }
-          const isLastStep = i === stepsList.length - 1;
-          const baseStep = rawStep as Record<string, unknown>;
-          const step =
-            batchAgentName && baseStep.agentName === undefined && baseStep.callerName === undefined
-              ? { ...baseStep, agentName: batchAgentName }
-              : baseStep;
-          const action = typeof step.action === "string" ? step.action : "";
-          if (action === "click") {
-            results.push(await this.clickNow(step, caller));
-          } else if (action === "type") {
-            results.push(await this.typeNow(step, caller));
-          } else if (action === "insert_line") {
-            results.push(await this.insertLineNow(step, caller));
-          } else if (action === "press_key") {
-            results.push(await this.pressKeyNow(step, caller));
-          } else if (action === "scroll") {
-            results.push(await this.scrollNow(step, caller, isLastStep));
-          } else if (action === "drag") {
-            results.push(await this.dragNow(step, caller));
-          } else if (action === "wait_for") {
-            results.push(await this.waitFor(step, caller));
-          } else {
-            throw new UiControlError(
-              "invalid_params",
-              `Unsupported ui.batch step action '${action}'.`
-            );
-          }
+          return { completed: true, stepCount: results.length, results };
+        } finally {
+          this.inBatchExecution = false;
         }
-        return { completed: true, stepCount: results.length, results };
       },
       false,
       borrowFocus
@@ -1700,7 +2246,7 @@ export class UiControlService {
     containerEl?: Element | null;
     pos?: number;
   }): DocumentCursorContext | undefined {
-    const activeEl = this.win.document.activeElement ?? null;
+    const activeEl = this.deepActiveElement();
     const cm = opts && "cm" in opts ? (opts.cm ?? null) : this.findFocusedCodeMirrorView(activeEl);
     const cmEl = cm?.contentDOM ?? cm?.dom ?? null;
     const cmCtx = cmEl ? this.resolveElementLeafContext(cmEl) : null;
@@ -1757,7 +2303,7 @@ export class UiControlService {
     };
   }
 
-  private docContextForResolvedTarget(resolved: ResolvedUiTarget): DocumentCursorContext | undefined {
+  private docContextForResolvedTarget(resolved: ResolvedUiTarget): DocumentCursorContext | null | undefined {
     const meta = this.resolveTargetLeafMeta(resolved);
     const cm =
       resolved.cm !== undefined
@@ -1765,6 +2311,9 @@ export class UiControlService {
         : resolved.element
           ? this.findFocusedCodeMirrorView(resolved.element)
           : null;
+    if (!cm && !meta.notePath) {
+      return null;
+    }
     const containerEl =
       resolved.containerEl ??
       resolved.element?.closest?.(".workspace-leaf") ??
@@ -1796,9 +2345,9 @@ export class UiControlService {
     }
     const label = this.formatCursorLabel(caller, params);
     if (kind === "click") {
-      this.cursorOverlay.pulseClick(caller, label, x, y, action, docContext ?? undefined);
+      this.cursorOverlay.pulseClick(caller, label, x, y, action, docContext);
     } else if (kind === "type") {
-      this.cursorOverlay.setTyping(caller, label, x, y, docContext ?? undefined);
+      this.cursorOverlay.setTyping(caller, label, x, y, docContext);
     } else {
       this.cursorOverlay.moveTo(caller, label, x, y, action, docContext);
     }
@@ -1819,23 +2368,36 @@ export class UiControlService {
   }
 
   private cmOwnsElement(view: CodeMirrorViewLike, el: Element | null): boolean {
-    if (!el) {
-      return true;
+    if (!cmOwnsElementStrict(view, el)) {
+      return false;
     }
     const root = view.contentDOM ?? view.dom;
-    if (root) {
-      if (root === el) {
-        return true;
-      }
-      if (typeof root.contains === "function") {
-        return root.contains(el);
-      }
+    if (!root && el && isInputOrTextarea(el)) {
+      return false;
     }
-    // Without DOM containment info on a mock view, avoid hijacking plain input/textarea modals.
-    return !isInputOrTextarea(el);
+    return true;
   }
 
   private findFocusedCodeMirrorView(activeEl: Element | null): CodeMirrorViewLike | null {
+    const winWithApp = this.win as unknown as {
+      app?: { workspace?: { activeEditor?: { editor?: { cm?: unknown } } } };
+    };
+    const outerHookCm = this.extractCodeMirrorView(this.getCodeMirrorView?.());
+    const outerWorkspaceCm = this.extractCodeMirrorView(
+      winWithApp.app?.workspace?.activeEditor?.editor?.cm
+    );
+    const outerCm = outerWorkspaceCm ?? outerHookCm;
+
+    if (activeEl) {
+      const nested = resolveNestedCodeMirror(activeEl, { outerCm });
+      if (nested.inTableCell) {
+        return nested.cm;
+      }
+      if (nested.cm && this.cmOwnsElement(nested.cm, activeEl)) {
+        return nested.cm;
+      }
+    }
+
     let node: Element | null = activeEl;
     while (node) {
       const rec = node as unknown as {
@@ -1859,19 +2421,12 @@ export class UiControlService {
       node = node.parentElement ?? null;
     }
 
-    const fromHook = this.extractCodeMirrorView(this.getCodeMirrorView?.());
-    if (fromHook && this.cmOwnsElement(fromHook, activeEl)) {
-      return fromHook;
+    if (outerHookCm && this.cmOwnsElement(outerHookCm, activeEl)) {
+      return outerHookCm;
     }
 
-    const winWithApp = this.win as unknown as {
-      app?: { workspace?: { activeEditor?: { editor?: { cm?: unknown } } } };
-    };
-    const fromWorkspace = this.extractCodeMirrorView(
-      winWithApp.app?.workspace?.activeEditor?.editor?.cm
-    );
-    if (fromWorkspace && this.cmOwnsElement(fromWorkspace, activeEl)) {
-      return fromWorkspace;
+    if (outerWorkspaceCm && this.cmOwnsElement(outerWorkspaceCm, activeEl)) {
+      return outerWorkspaceCm;
     }
 
     return null;
@@ -2160,7 +2715,7 @@ export class UiControlService {
     preferredCm?: CodeMirrorViewLike | null,
     explicitPos?: number
   ): { x: number; y: number } {
-    const activeEl = this.win.document.activeElement ?? null;
+    const activeEl = this.deepActiveElement();
 
     const cmPoint = this.codeMirrorCaretPoint(activeEl, preferredCm, explicitPos);
     if (cmPoint) {
@@ -2196,7 +2751,7 @@ export class UiControlService {
   }
 
   private activeElementCenter(): { x: number; y: number } {
-    const el = this.win.document.activeElement as HTMLElement | null;
+    const el = this.deepActiveElement() as HTMLElement | null;
     if (el && typeof el.getBoundingClientRect === "function") {
       const r = el.getBoundingClientRect();
       if (r.width > 0 && r.height > 0) {
@@ -2527,7 +3082,7 @@ export class UiControlService {
 
   private captureFocusSnapshot(): FocusSnapshot {
     const doc = this.win.document;
-    const raw = (doc.activeElement as HTMLElement | null) ?? null;
+    const raw = (this.deepActiveElement() as HTMLElement | null) ?? null;
     const element =
       raw && raw !== doc.body && raw !== doc.documentElement && raw.isConnected !== false
         ? raw
@@ -2622,10 +3177,27 @@ export class UiControlService {
     }
   }
 
-  private matchesAgentKeyName(evKey: string | undefined, expected: string): boolean {
+  private matchesAgentKeyName(
+    evKey: string | undefined,
+    expected: string,
+    shiftKey = false
+  ): boolean {
     if (!evKey) {
       return false;
     }
+    const shiftedPunct: Record<string, string> = {
+      "=": "+",
+      "-": "_",
+      "[": "{",
+      "]": "}",
+      ";": ":",
+      "'": "\"",
+      ",": "<",
+      ".": ">",
+      "/": "?",
+      "\\": "|",
+      "`": "~",
+    };
     const normalize = (value: string): string => {
       const lower = value.toLowerCase();
       const aliases: Record<string, string> = {
@@ -2656,7 +3228,10 @@ export class UiControlService {
         ins: "insert",
         tab: "tab",
       };
-      return aliases[lower] ?? lower;
+      const base = aliases[lower] ?? lower;
+      return shiftKey && Object.prototype.hasOwnProperty.call(shiftedPunct, base)
+        ? shiftedPunct[base]
+        : base;
     };
     return normalize(evKey) === normalize(expected);
   }
@@ -2665,31 +3240,44 @@ export class UiControlService {
     type?: string;
     key?: string;
     data?: string | null;
+    shiftKey?: boolean;
+    ctrlKey?: boolean;
+    altKey?: boolean;
+    metaKey?: boolean;
   }): boolean {
-    const evType = ev.type;
-    if (evType === "keydown" || evType === "keypress") {
-      if (this.agentKeyDepth <= 0) {
+    this.pruneExpiredAgentLedger();
+    const head = this.expectedAgentLedger[0];
+    if (!head || ev.type !== head.eventType) {
+      return false;
+    }
+    if (head.eventType === "beforeinput") {
+      if ((ev.data ?? "") !== head.keyMatch) {
         return false;
       }
-      if (!this.agentKeyMatch) {
-        return true;
-      }
-      const keyVal = typeof ev.key === "string" ? ev.key : (ev.data ?? "");
-      return this.matchesAgentKeyName(keyVal, this.agentKeyMatch);
+      this.expectedAgentLedger.shift();
+      return true;
     }
-    if (evType === "beforeinput") {
-      const dataVal = typeof ev.data === "string" ? ev.data : "";
-      if (this.agentInsertTextChunk !== null && dataVal === this.agentInsertTextChunk) {
-        return true;
-      }
-      if (this.agentKeyDepth > 0) {
-        if (!this.agentKeyMatch) {
-          return true;
-        }
-        return this.matchesAgentKeyName(dataVal || ev.key, this.agentKeyMatch);
-      }
+    const hasModifierFlags =
+      typeof ev.shiftKey === "boolean" ||
+      typeof ev.ctrlKey === "boolean" ||
+      typeof ev.altKey === "boolean" ||
+      typeof ev.metaKey === "boolean";
+    const skipStrictModsForSyncMock = this.dispatchingAgentInput && !hasModifierFlags;
+    if (
+      !skipStrictModsForSyncMock &&
+      (Boolean(ev.shiftKey) !== head.shiftKey ||
+        Boolean(ev.ctrlKey) !== head.ctrlKey ||
+        Boolean(ev.altKey) !== head.altKey ||
+        Boolean(ev.metaKey) !== head.metaKey)
+    ) {
+      return false;
     }
-    return false;
+    const keyVal = typeof ev.key === "string" ? ev.key : (ev.data ?? "");
+    if (!this.matchesAgentKeyName(keyVal, head.keyMatch, head.shiftKey)) {
+      return false;
+    }
+    this.expectedAgentLedger.shift();
+    return true;
   }
 
   private attachUserInputCaptureListener(session: FocusShieldSession): () => void {
@@ -2723,7 +3311,7 @@ export class UiControlService {
         return;
       }
       const expectedBase = session.userElement ?? this.win.document.body ?? null;
-      const focusMovedAway = (this.win.document.activeElement ?? null) !== expectedBase;
+      const focusMovedAway = this.deepActiveElement() !== expectedBase;
       if (!focusMovedAway && session.activeCount <= 0) {
         return;
       }
@@ -2861,28 +3449,523 @@ export class UiControlService {
     return { type: ev.type, ...init };
   }
 
+  private isLowSurrogate(code: number): boolean {
+    return code >= 0xdc00 && code <= 0xdfff;
+  }
+
+  private isHighSurrogate(code: number): boolean {
+    return code >= 0xd800 && code <= 0xdbff;
+  }
+
+  private clampCleanSliceBounds(text: string, rawPos: number): { start: number; end: number } {
+    let start = text.lastIndexOf("\n", Math.max(0, rawPos - 1)) + 1;
+    const rawEnd = text.indexOf("\n", rawPos);
+    let end = rawEnd === -1 ? text.length : rawEnd;
+    if (rawPos - start > 512) {
+      start = rawPos - 512;
+      while (start > 0 && this.isLowSurrogate(text.charCodeAt(start))) {
+        start -= 1;
+      }
+    }
+    if (end - rawPos > 512) {
+      end = rawPos + 512;
+      while (end < text.length && this.isLowSurrogate(text.charCodeAt(end))) {
+        end += 1;
+      }
+    }
+    return { start, end };
+  }
+
+  /** Steps back one grapheme cluster (never splitting UTF-16 surrogate pairs). */
+  private prevGraphemeBoundary(text: string, pos: number): number {
+    const clamped = Math.max(0, Math.min(text.length, pos));
+    if (clamped === 0) {
+      return 0;
+    }
+    const SegmenterCtor = (
+      Intl as unknown as {
+        Segmenter?: new (
+          locale: string | undefined,
+          options: { granularity: "grapheme" }
+        ) => { segment(input: string): Iterable<{ index: number; segment: string }> };
+      }
+    ).Segmenter;
+    if (typeof SegmenterCtor === "function") {
+      const { start, end } = this.clampCleanSliceBounds(text, clamped);
+      const slice = text.slice(start, end);
+      const rel = clamped - start;
+      let prev = 0;
+      for (const seg of new SegmenterCtor(undefined, { granularity: "grapheme" }).segment(slice)) {
+        if (seg.index >= rel) {
+          break;
+        }
+        prev = seg.index;
+      }
+      return start + prev;
+    }
+    const prevUnit = text.charCodeAt(clamped - 1);
+    if (
+      clamped >= 2 &&
+      this.isLowSurrogate(prevUnit) &&
+      this.isHighSurrogate(text.charCodeAt(clamped - 2))
+    ) {
+      return clamped - 2;
+    }
+    return clamped - 1;
+  }
+
+  /** Steps forward one grapheme cluster (never splitting UTF-16 surrogate pairs). */
+  private nextGraphemeBoundary(text: string, pos: number): number {
+    const clamped = Math.max(0, Math.min(text.length, pos));
+    if (clamped >= text.length) {
+      return text.length;
+    }
+    const SegmenterCtor = (
+      Intl as unknown as {
+        Segmenter?: new (
+          locale: string | undefined,
+          options: { granularity: "grapheme" }
+        ) => { segment(input: string): Iterable<{ index: number; segment: string }> };
+      }
+    ).Segmenter;
+    if (typeof SegmenterCtor === "function") {
+      const { start, end } = this.clampCleanSliceBounds(text, clamped);
+      const slice = text.slice(start, end);
+      const rel = clamped - start;
+      for (const seg of new SegmenterCtor(undefined, { granularity: "grapheme" }).segment(slice)) {
+        const segEnd = seg.index + seg.segment.length;
+        if (segEnd > rel) {
+          return start + segEnd;
+        }
+      }
+      return end;
+    }
+    const curUnit = text.charCodeAt(clamped);
+    if (
+      clamped + 1 < text.length &&
+      this.isHighSurrogate(curUnit) &&
+      this.isLowSurrogate(text.charCodeAt(clamped + 1))
+    ) {
+      return clamped + 2;
+    }
+    return clamped + 1;
+  }
+
+  private stepWordLeft(text: string, pos: number): number {
+    let i = Math.max(0, Math.min(text.length, pos));
+    while (i > 0 && /\s/.test(text[i - 1])) {
+      i = this.prevGraphemeBoundary(text, i);
+    }
+    while (i > 0 && !/\s/.test(text[i - 1])) {
+      i = this.prevGraphemeBoundary(text, i);
+    }
+    return i;
+  }
+
+  private stepWordRight(text: string, pos: number): number {
+    let i = Math.max(0, Math.min(text.length, pos));
+    while (i < text.length && /\s/.test(text[i])) {
+      i = this.nextGraphemeBoundary(text, i);
+    }
+    while (i < text.length && !/\s/.test(text[i])) {
+      i = this.nextGraphemeBoundary(text, i);
+    }
+    return i;
+  }
+
+  private computeNextTextSelection(
+    text: string,
+    anchor: number,
+    head: number,
+    dir: "left" | "right" | "up" | "down" | "home" | "end",
+    opts: { extend: boolean; word: boolean; lineEdge: boolean }
+  ): { anchor: number; head: number } {
+    const len = text.length;
+    const curAnchor = Math.max(0, Math.min(len, anchor));
+    const curHead = Math.max(0, Math.min(len, head));
+    const lineStart = (pos: number): number => text.lastIndexOf("\n", Math.max(0, pos - 1)) + 1;
+    const lineEnd = (pos: number): number => {
+      const idx = text.indexOf("\n", pos);
+      return idx === -1 ? len : idx;
+    };
+
+    let nextHead = curHead;
+    if (dir === "left") {
+      if (!opts.extend && curAnchor !== curHead && !opts.word && !opts.lineEdge) {
+        nextHead = Math.min(curAnchor, curHead);
+      } else if (opts.lineEdge) {
+        nextHead = lineStart(curHead);
+      } else if (opts.word) {
+        nextHead = this.stepWordLeft(text, curHead);
+      } else {
+        nextHead = this.prevGraphemeBoundary(text, curHead);
+      }
+    } else if (dir === "right") {
+      if (!opts.extend && curAnchor !== curHead && !opts.word && !opts.lineEdge) {
+        nextHead = Math.max(curAnchor, curHead);
+      } else if (opts.lineEdge) {
+        nextHead = lineEnd(curHead);
+      } else if (opts.word) {
+        nextHead = this.stepWordRight(text, curHead);
+      } else {
+        nextHead = this.nextGraphemeBoundary(text, curHead);
+      }
+    } else if (dir === "home") {
+      nextHead = lineStart(curHead);
+    } else if (dir === "end") {
+      nextHead = lineEnd(curHead);
+    } else if (dir === "up") {
+      const curLs = lineStart(curHead);
+      if (curLs === 0) {
+        nextHead = 0;
+      } else {
+        const col = curHead - curLs;
+        const prevLe = curLs - 1;
+        const prevLs = lineStart(prevLe);
+        nextHead = Math.min(prevLe, prevLs + col);
+      }
+    } else if (dir === "down") {
+      const curLs = lineStart(curHead);
+      const curLe = lineEnd(curHead);
+      if (curLe >= len) {
+        nextHead = len;
+      } else {
+        const col = curHead - curLs;
+        const nextLs = curLe + 1;
+        const nextLe = lineEnd(nextLs);
+        nextHead = Math.min(nextLe, nextLs + col);
+      }
+    }
+
+    return {
+      anchor: opts.extend ? curAnchor : nextHead,
+      head: nextHead,
+    };
+  }
+
+  private extractUserInputOps(
+    captured: CapturedUserEvent[]
+  ): Array<
+    | { kind: "text"; text: string; ev: CapturedUserEvent }
+    | { kind: "backspace" | "delete" | "enter" | "select_all"; ev: CapturedUserEvent }
+    | {
+        kind: "nav";
+        dir: "left" | "right" | "up" | "down" | "home" | "end";
+        extend: boolean;
+        word: boolean;
+        lineEdge: boolean;
+        ev: CapturedUserEvent;
+      }
+    | { kind: "key"; key: string; ev: CapturedUserEvent }
+  > {
+    const ops: Array<
+      | { kind: "text"; text: string; ev: CapturedUserEvent }
+      | { kind: "backspace" | "delete" | "enter" | "select_all"; ev: CapturedUserEvent }
+      | {
+          kind: "nav";
+          dir: "left" | "right" | "up" | "down" | "home" | "end";
+          extend: boolean;
+          word: boolean;
+          lineEdge: boolean;
+          ev: CapturedUserEvent;
+        }
+      | { kind: "key"; key: string; ev: CapturedUserEvent }
+    > = [];
+    const navKeyMap: Record<string, "left" | "right" | "up" | "down" | "home" | "end"> = {
+      ArrowLeft: "left",
+      Left: "left",
+      ArrowRight: "right",
+      Right: "right",
+      ArrowUp: "up",
+      Up: "up",
+      ArrowDown: "down",
+      Down: "down",
+      Home: "home",
+      End: "end",
+    };
+    let lastKeyChar: string | null = null;
+    for (const ev of captured) {
+      if (ev.type === "keydown") {
+        const key = ev.key ?? "";
+        if (!key || key === "Shift" || key === "Control" || key === "Alt" || key === "Meta") {
+          continue;
+        }
+        lastKeyChar = null;
+        const isPrimaryMod = this.platform === "darwin" ? Boolean(ev.metaKey && !ev.ctrlKey) : Boolean(ev.ctrlKey && !ev.metaKey);
+        if (isPrimaryMod && !ev.altKey && (key === "a" || key === "A")) {
+          ops.push({ kind: "select_all", ev });
+        } else if (Object.prototype.hasOwnProperty.call(navKeyMap, key)) {
+          const wordMod = this.platform === "darwin" ? Boolean(ev.altKey) : Boolean(ev.ctrlKey);
+          const lineEdgeMod = this.platform === "darwin" ? Boolean(ev.metaKey) : false;
+          ops.push({
+            kind: "nav",
+            dir: navKeyMap[key],
+            extend: Boolean(ev.shiftKey),
+            word: wordMod,
+            lineEdge: lineEdgeMod,
+            ev,
+          });
+        } else if (key === "Backspace" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          ops.push({ kind: "backspace", ev });
+        } else if ((key === "Delete" || key === "Del") && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          ops.push({ kind: "delete", ev });
+        } else if ((key === "Enter" || key === "Return") && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          ops.push({ kind: "enter", ev });
+        } else if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          lastKeyChar = key;
+          ops.push({ kind: "text", text: key, ev });
+        } else {
+          ops.push({ kind: "key", key, ev });
+        }
+      } else if (ev.type === "keypress") {
+        const ch = ev.key || ev.data || "";
+        if (lastKeyChar !== null && ch === lastKeyChar) {
+          continue;
+        }
+        lastKeyChar = null;
+        if (ch.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          lastKeyChar = ch;
+          ops.push({ kind: "text", text: ch, ev });
+        }
+      } else if (ev.type === "beforeinput") {
+        const data = typeof ev.data === "string" ? ev.data : "";
+        if (data && data === lastKeyChar) {
+          lastKeyChar = null;
+          continue;
+        }
+        lastKeyChar = null;
+        if (ev.inputType === "deleteContentBackward") {
+          ops.push({ kind: "backspace", ev });
+        } else if (ev.inputType === "deleteContentForward") {
+          ops.push({ kind: "delete", ev });
+        } else if (data) {
+          ops.push({ kind: "text", text: data, ev });
+        }
+      }
+    }
+    return ops;
+  }
+
+  private encodeOpsForTerminal(
+    ops: ReturnType<UiControlService["extractUserInputOps"]>
+  ): string {
+    const sequences: Record<string, string> = {
+      Tab: "\t",
+      Escape: "\x1b",
+      Esc: "\x1b",
+    };
+    const navSequences: Record<"left" | "right" | "up" | "down" | "home" | "end", string> = {
+      up: "\x1b[A",
+      down: "\x1b[B",
+      right: "\x1b[C",
+      left: "\x1b[D",
+      home: "\x1b[H",
+      end: "\x1b[F",
+    };
+    let out = "";
+    for (const op of ops) {
+      if (op.kind === "text") {
+        out += op.text;
+      } else if (op.kind === "backspace") {
+        out += "\x7f";
+      } else if (op.kind === "delete") {
+        out += "\x1b[3~";
+      } else if (op.kind === "enter") {
+        out += "\r";
+      } else if (op.kind === "nav") {
+        out += navSequences[op.dir];
+      } else if (op.kind === "select_all") {
+        out += "\x01";
+      } else if (op.kind === "key") {
+        const mapped = sequences[op.key];
+        if (mapped) {
+          out += mapped;
+        } else if (
+          op.ev.ctrlKey &&
+          !op.ev.altKey &&
+          !op.ev.metaKey &&
+          op.key.length === 1
+        ) {
+          const code = op.key.toUpperCase().charCodeAt(0);
+          if (code >= 65 && code <= 90) {
+            out += String.fromCharCode(code - 64);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  private findEditorCmForReplay(target: Element): CodeMirrorViewLike | null {
+    if (isInputOrTextarea(target)) {
+      return null;
+    }
+    const direct = this.findFocusedCodeMirrorView(target);
+    if (direct && direct.state?.doc && typeof direct.dispatch === "function") {
+      return direct;
+    }
+    const leafEl = this.findClosestElement(target, ".workspace-leaf");
+    if (leafEl && !isInTableCellWidget(target)) {
+      const leaf = this.findWorkspaceLeafForElement(target);
+      const fromLeaf =
+        this.extractCodeMirrorView(leaf?.view?.editor?.cm) ??
+        this.findCodeMirrorInContainer(leafEl);
+      if (
+        fromLeaf &&
+        fromLeaf.state?.doc &&
+        typeof fromLeaf.dispatch === "function" &&
+        this.cmOwnsElement(fromLeaf, target)
+      ) {
+        return fromLeaf;
+      }
+    }
+    return null;
+  }
+
+  private replayCodeMirrorOps(
+    target: Element,
+    cm: CodeMirrorViewLike,
+    ops: ReturnType<UiControlService["extractUserInputOps"]>
+  ): CapturedUserEvent[] {
+    const docObj = cm.state?.doc;
+    if (!docObj || typeof cm.dispatch !== "function") {
+      return ops.map((o) => o.ev);
+    }
+    const mainSel = cm.state?.selection?.main;
+    let anchor =
+      typeof mainSel?.anchor === "number"
+        ? mainSel.anchor
+        : typeof mainSel?.head === "number"
+          ? mainSel.head
+          : typeof mainSel?.from === "number"
+            ? mainSel.from
+            : docObj.length;
+    let head =
+      typeof mainSel?.head === "number"
+        ? mainSel.head
+        : typeof mainSel?.to === "number"
+          ? mainSel.to
+          : anchor;
+    const notePath = this.resolveElementLeafContext(target)?.notePath;
+    const unhandled: CapturedUserEvent[] = [];
+
+    const readLiveSelection = (): void => {
+      const nextDocLen = cm.state?.doc?.length ?? 0;
+      const nextMain = cm.state?.selection?.main;
+      if (nextMain && typeof nextMain.head === "number") {
+        anchor = Math.max(
+          0,
+          Math.min(
+            nextDocLen,
+            typeof nextMain.anchor === "number"
+              ? nextMain.anchor
+              : typeof nextMain.from === "number"
+                ? nextMain.from
+                : nextMain.head
+          )
+        );
+        head = Math.max(0, Math.min(nextDocLen, nextMain.head));
+      }
+    };
+
+    for (const op of ops) {
+      const liveText = cm.state?.doc?.toString() ?? "";
+      const liveLen = liveText.length;
+      anchor = Math.max(0, Math.min(liveLen, anchor));
+      head = Math.max(0, Math.min(liveLen, head));
+      const from = Math.min(anchor, head);
+      const to = Math.max(anchor, head);
+
+      if (op.kind === "text" || op.kind === "enter") {
+        const insert = op.kind === "text" ? op.text : "\n";
+        const nextAnchor = from + insert.length;
+        cm.dispatch({
+          changes: { from, to, insert },
+          selection: { anchor: nextAnchor },
+        });
+        this.notifyOverlayNoteUpdated(notePath, { from, to, insertLength: insert.length });
+        anchor = nextAnchor;
+        head = nextAnchor;
+        readLiveSelection();
+      } else if (op.kind === "backspace") {
+        const delFrom = from !== to ? from : this.prevGraphemeBoundary(liveText, from);
+        const delTo = to;
+        if (delTo > delFrom) {
+          cm.dispatch({
+            changes: { from: delFrom, to: delTo, insert: "" },
+            selection: { anchor: delFrom },
+          });
+          this.notifyOverlayNoteUpdated(notePath, { from: delFrom, to: delTo, insertLength: 0 });
+          anchor = delFrom;
+          head = delFrom;
+          readLiveSelection();
+        }
+      } else if (op.kind === "delete") {
+        const delFrom = from;
+        const delTo = from !== to ? to : this.nextGraphemeBoundary(liveText, to);
+        if (delTo > delFrom) {
+          cm.dispatch({
+            changes: { from: delFrom, to: delTo, insert: "" },
+            selection: { anchor: delFrom },
+          });
+          this.notifyOverlayNoteUpdated(notePath, { from: delFrom, to: delTo, insertLength: 0 });
+          anchor = delFrom;
+          head = delFrom;
+          readLiveSelection();
+        }
+      } else if (op.kind === "nav") {
+        const next = this.computeNextTextSelection(liveText, anchor, head, op.dir, op);
+        cm.dispatch({ selection: { anchor: next.anchor, head: next.head } });
+        anchor = next.anchor;
+        head = next.head;
+        readLiveSelection();
+      } else if (op.kind === "select_all") {
+        cm.dispatch({ selection: { anchor: 0, head: liveLen } });
+        anchor = 0;
+        head = liveLen;
+        readLiveSelection();
+      } else {
+        unhandled.push(op.ev);
+      }
+    }
+    return unhandled;
+  }
+
   private applyTextToNativeInput(
     target: HTMLInputElement | HTMLTextAreaElement,
     insertText: string,
-    backspace = false
+    mode: "insert" | "backspace" | "delete" = "insert"
   ): void {
     const value = typeof target.value === "string" ? target.value : "";
-    const start =
+    const rawStart =
       typeof target.selectionStart === "number" ? target.selectionStart : value.length;
-    const end =
-      typeof target.selectionEnd === "number" ? target.selectionEnd : start;
-    if (backspace) {
-      const nextStart = start === end ? Math.max(0, start - 1) : start;
-      target.value = value.slice(0, nextStart) + value.slice(end);
-      if (typeof target.setSelectionRange === "function") {
-        target.setSelectionRange(nextStart, nextStart);
-      } else {
-        target.selectionStart = nextStart;
-        target.selectionEnd = nextStart;
-      }
+    const rawEnd =
+      typeof target.selectionEnd === "number" ? target.selectionEnd : rawStart;
+    const start = Math.min(rawStart, rawEnd);
+    const end = Math.max(rawStart, rawEnd);
+    let delFrom = start;
+    let delTo = end;
+    let replacement = insertText;
+    if (mode === "backspace") {
+      delFrom = start === end ? this.prevGraphemeBoundary(value, start) : start;
+      replacement = "";
+    } else if (mode === "delete") {
+      delTo = start === end ? this.nextGraphemeBoundary(value, end) : end;
+      replacement = "";
+    }
+    const nextPos = delFrom + replacement.length;
+    const rangeTarget = target as HTMLInputElement & {
+      setRangeText?: (
+        replacement: string,
+        start: number,
+        end: number,
+        selectionMode?: "select" | "start" | "end" | "preserve"
+      ) => void;
+    };
+    if (typeof rangeTarget.setRangeText === "function") {
+      rangeTarget.setRangeText(replacement, delFrom, delTo, "end");
     } else {
-      target.value = value.slice(0, start) + insertText + value.slice(end);
-      const nextPos = start + insertText.length;
+      target.value = value.slice(0, delFrom) + replacement + value.slice(delTo);
       if (typeof target.setSelectionRange === "function") {
         target.setSelectionRange(nextPos, nextPos);
       } else {
@@ -2895,21 +3978,56 @@ export class UiControlService {
       const InputCtor = (
         this.win as unknown as { InputEvent?: new (type: string, init: Record<string, unknown>) => unknown }
       ).InputEvent;
+      const inputType =
+        mode === "backspace"
+          ? "deleteContentBackward"
+          : mode === "delete"
+            ? "deleteContentForward"
+            : "insertText";
+      const data = mode === "insert" ? insertText : null;
       const inputEv =
         typeof InputCtor === "function"
-          ? new InputCtor("input", {
-              data: backspace ? null : insertText,
-              inputType: backspace ? "deleteContentBackward" : "insertText",
-              bubbles: true,
-            })
-          : {
-              type: "input",
-              data: backspace ? null : insertText,
-              inputType: backspace ? "deleteContentBackward" : "insertText",
-              bubbles: true,
-            };
+          ? new InputCtor("input", { data, inputType, bubbles: true })
+          : { type: "input", data, inputType, bubbles: true };
       dispatcher.dispatchEvent(inputEv);
     }
+  }
+
+  private applySelectionToNativeInput(
+    target: HTMLInputElement | HTMLTextAreaElement,
+    anchor: number,
+    head: number
+  ): void {
+    const start = Math.min(anchor, head);
+    const end = Math.max(anchor, head);
+    const dir: "forward" | "backward" | "none" =
+      head < anchor ? "backward" : head > anchor ? "forward" : "none";
+    if (typeof target.setSelectionRange === "function") {
+      try {
+        target.setSelectionRange(start, end, dir);
+        return;
+      } catch {
+        // Fallback below on mocks that reject direction argument.
+      }
+    }
+    target.selectionStart = start;
+    target.selectionEnd = end;
+    target.selectionDirection = dir;
+  }
+
+  private readNativeInputAnchorHead(target: HTMLInputElement | HTMLTextAreaElement): {
+    anchor: number;
+    head: number;
+  } {
+    const len = (typeof target.value === "string" ? target.value : "").length;
+    const rawStart = typeof target.selectionStart === "number" ? target.selectionStart : len;
+    const rawEnd = typeof target.selectionEnd === "number" ? target.selectionEnd : rawStart;
+    const start = Math.max(0, Math.min(len, Math.min(rawStart, rawEnd)));
+    const end = Math.max(start, Math.min(len, Math.max(rawStart, rawEnd)));
+    if (target.selectionDirection === "backward") {
+      return { anchor: end, head: start };
+    }
+    return { anchor: start, head: end };
   }
 
   private async replayCapturedUserInputs(
@@ -2920,13 +4038,26 @@ export class UiControlService {
     if (captured.length === 0 || target.isConnected === false) {
       return;
     }
+    const ops = this.extractUserInputOps(captured);
     const isElectron =
       typeof process !== "undefined" &&
       Boolean((process as { versions?: { electron?: string } }).versions?.electron);
     const wc = this.getWebContents();
     this.replayingUserInput = true;
     try {
-      if (isElectron && wc && !preserveCurrentFocus && this.win.document.activeElement === target) {
+      // 1) Terminal adapter: deliver UTF-8 key bytes directly to owning PtySession without moving focus.
+      if (this.deliverToTerminal && this.findClosestElement(target, HERDR_TERMINAL_PROTECTED_SELECTOR)) {
+        const bytes = this.encodeOpsForTerminal(ops);
+        if (bytes.length > 0) {
+          const handled = await this.deliverToTerminal(target, bytes);
+          if (handled !== false) {
+            return;
+          }
+        }
+      }
+
+      // 2) Live Electron when focus was restored back to the user control.
+      if (isElectron && wc && !preserveCurrentFocus && this.deepActiveElement() === target) {
         let lastKeyChar: string | null = null;
         for (const ev of captured) {
           if (ev.type === "keydown") {
@@ -2949,7 +4080,7 @@ export class UiControlService {
               lastKeyChar = press.text;
             } catch {
               if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-                await wc.insertText(key);
+                await this.insertTextWithTimeout(wc, key);
                 lastKeyChar = key;
               }
             }
@@ -2959,7 +4090,7 @@ export class UiControlService {
               continue;
             }
             if (ch.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-              await wc.insertText(ch);
+              await this.insertTextWithTimeout(wc, ch);
               lastKeyChar = ch;
             }
           } else if (ev.type === "beforeinput") {
@@ -2972,56 +4103,132 @@ export class UiControlService {
               continue;
             }
             lastKeyChar = null;
-            await wc.insertText(data);
+            await this.insertTextWithTimeout(wc, data);
           }
         }
         return;
       }
 
+      // 3) CodeMirror editor adapter: apply transactions & navigation at user selection without focus.
+      const cm = this.findEditorCmForReplay(target);
+      if (cm) {
+        const unhandled = this.replayCodeMirrorOps(target, cm, ops);
+        if (unhandled.length > 0 && preserveCurrentFocus) {
+          this.deferredUserInputs.push(...unhandled);
+        } else if (unhandled.length > 0) {
+          const dispatcher = target as unknown as { dispatchEvent?: (event: unknown) => boolean };
+          for (const ev of unhandled) {
+            dispatcher.dispatchEvent?.(this.buildReplayDomEvent(ev));
+          }
+        }
+        return;
+      }
+
+      // 4) Native input/textarea adapter & DOM event fallback (all captured DOM events + ordered nav/edits).
       const dispatcher = target as unknown as { dispatchEvent?: (event: unknown) => boolean };
       const nativeTarget = isInputOrTextarea(target) ? target : null;
-      let insertedForKey: string | null = null;
+      if (nativeTarget) {
+        const navKeyMap: Record<string, "left" | "right" | "up" | "down" | "home" | "end"> = {
+          ArrowLeft: "left",
+          Left: "left",
+          ArrowRight: "right",
+          Right: "right",
+          ArrowUp: "up",
+          Up: "up",
+          ArrowDown: "down",
+          Down: "down",
+          Home: "home",
+          End: "end",
+        };
+        const unhandled: CapturedUserEvent[] = [];
+        let insertedForKey: string | null = null;
+        for (const ev of captured) {
+          const domEv = this.buildReplayDomEvent(ev);
+          const notCanceled =
+            typeof dispatcher.dispatchEvent === "function" ? dispatcher.dispatchEvent(domEv) !== false : true;
+          if (!notCanceled) {
+            continue;
+          }
+          if (ev.type === "keydown") {
+            const key = ev.key ?? "";
+            if (!key || key === "Shift" || key === "Control" || key === "Alt" || key === "Meta") {
+              continue;
+            }
+            const isPrimaryMod =
+              this.platform === "darwin" ? Boolean(ev.metaKey && !ev.ctrlKey) : Boolean(ev.ctrlKey && !ev.metaKey);
+            if (isPrimaryMod && !ev.altKey && (key === "a" || key === "A")) {
+              const val = typeof nativeTarget.value === "string" ? nativeTarget.value : "";
+              this.applySelectionToNativeInput(nativeTarget, 0, val.length);
+              insertedForKey = null;
+            } else if (Object.prototype.hasOwnProperty.call(navKeyMap, key)) {
+              const val = typeof nativeTarget.value === "string" ? nativeTarget.value : "";
+              const { anchor, head } = this.readNativeInputAnchorHead(nativeTarget);
+              const next = this.computeNextTextSelection(val, anchor, head, navKeyMap[key], {
+                extend: Boolean(ev.shiftKey),
+                word: this.platform === "darwin" ? Boolean(ev.altKey) : Boolean(ev.ctrlKey),
+                lineEdge: this.platform === "darwin" ? Boolean(ev.metaKey) : false,
+              });
+              this.applySelectionToNativeInput(nativeTarget, next.anchor, next.head);
+              insertedForKey = null;
+            } else if (key === "Backspace" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+              this.applyTextToNativeInput(nativeTarget, "", "backspace");
+              insertedForKey = null;
+            } else if ((key === "Delete" || key === "Del") && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+              this.applyTextToNativeInput(nativeTarget, "", "delete");
+              insertedForKey = null;
+            } else if (
+              (key === "Enter" || key === "Return") &&
+              (nativeTarget.tagName ?? "").toUpperCase() === "TEXTAREA" &&
+              !ev.ctrlKey &&
+              !ev.altKey &&
+              !ev.metaKey
+            ) {
+              this.applyTextToNativeInput(nativeTarget, "\n", "insert");
+              insertedForKey = "\n";
+            } else if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+              this.applyTextToNativeInput(nativeTarget, key, "insert");
+              insertedForKey = key;
+            } else {
+              insertedForKey = null;
+              unhandled.push(ev);
+            }
+          } else if (ev.type === "keypress") {
+            const ch = ev.key || ev.data || "";
+            if (insertedForKey !== null && ch === insertedForKey) {
+              continue;
+            }
+            if (ch.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+              this.applyTextToNativeInput(nativeTarget, ch, "insert");
+              insertedForKey = ch;
+            }
+          } else if (ev.type === "beforeinput") {
+            const data = typeof ev.data === "string" ? ev.data : "";
+            if (data && data === insertedForKey) {
+              insertedForKey = null;
+              continue;
+            }
+            insertedForKey = null;
+            if (ev.inputType === "deleteContentBackward") {
+              this.applyTextToNativeInput(nativeTarget, "", "backspace");
+            } else if (ev.inputType === "deleteContentForward") {
+              this.applyTextToNativeInput(nativeTarget, "", "delete");
+            } else if (data) {
+              this.applyTextToNativeInput(nativeTarget, data, "insert");
+            }
+          }
+        }
+        if (unhandled.length > 0 && preserveCurrentFocus) {
+          this.deferredUserInputs.push(...unhandled);
+        }
+        return;
+      }
+
+      if (preserveCurrentFocus) {
+        this.deferredUserInputs.push(...captured);
+        return;
+      }
       for (const ev of captured) {
-        const domEv = this.buildReplayDomEvent(ev);
-        const notCanceled =
-          typeof dispatcher.dispatchEvent === "function" ? dispatcher.dispatchEvent(domEv) !== false : true;
-        if (!nativeTarget || !notCanceled) {
-          continue;
-        }
-        if (ev.type === "keydown") {
-          const key = ev.key ?? "";
-          if (key === "Backspace" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-            this.applyTextToNativeInput(nativeTarget, "", true);
-            insertedForKey = null;
-          } else if (key === "Enter" && (nativeTarget.tagName ?? "").toUpperCase() === "TEXTAREA" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-            this.applyTextToNativeInput(nativeTarget, "\n");
-            insertedForKey = "\n";
-          } else if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-            this.applyTextToNativeInput(nativeTarget, key);
-            insertedForKey = key;
-          } else {
-            insertedForKey = null;
-          }
-        } else if (ev.type === "keypress") {
-          const ch = ev.key || ev.data || "";
-          if (insertedForKey !== null && ch === insertedForKey) {
-            continue;
-          }
-          if (ch.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-            this.applyTextToNativeInput(nativeTarget, ch);
-            insertedForKey = ch;
-          }
-        } else if (ev.type === "beforeinput") {
-          const data = typeof ev.data === "string" ? ev.data : "";
-          if (data && data === insertedForKey) {
-            insertedForKey = null;
-            continue;
-          }
-          insertedForKey = null;
-          if (data) {
-            this.applyTextToNativeInput(nativeTarget, data);
-          }
-        }
+        dispatcher.dispatchEvent?.(this.buildReplayDomEvent(ev));
       }
     } finally {
       this.replayingUserInput = false;
@@ -3031,8 +4238,8 @@ export class UiControlService {
   /**
    * Preserves the user's keyboard focus across an agent action that borrows DOM
    * focus: attaches a continuous input shield for the entire borrowed-focus
-   * interval, restores focus afterward unless a modal was opened, and retains
-   * or re-delivers captured user keystrokes in either outcome.
+   * interval, restores focus afterward unless a modal or nested rename kept focus,
+   * and retains or re-delivers captured user keystrokes in either outcome.
    */
   private async withFocusRestore<T>(task: () => Promise<T>): Promise<T> {
     const before = this.captureFocusSnapshot();
@@ -3054,25 +4261,28 @@ export class UiControlService {
         shieldSession.detach?.();
         shieldSession.detach = null;
         this.activeShield = null;
+        this.expectedAgentLedger = [];
       }
       const beforeEl = before.element;
-      const doc = this.win.document;
-      const afterEl = (doc.activeElement as HTMLElement | null) ?? null;
+      const afterEl = (this.deepActiveElement() as HTMLElement | null) ?? null;
       let blockedByModal = false;
+      let preserveNestedRename = false;
       if (beforeEl && beforeEl.isConnected !== false && afterEl !== beforeEl) {
         const afterModals = this.visibleModalElements();
         const openedNewModal = afterModals.some((el) => !before.visibleModals.has(el));
         const beforeInModal = Boolean(beforeEl.closest?.(MODAL_SELECTOR));
         const afterInModal = Boolean(afterEl?.closest?.(MODAL_SELECTOR));
         blockedByModal = openedNewModal || (afterInModal && !beforeInModal);
-        if (!blockedByModal) {
+        preserveNestedRename = shouldPreserveNestedFocus(beforeEl, afterEl);
+        if (!blockedByModal && !preserveNestedRename) {
           this.restoreElementFocusAndSelection(beforeEl, before);
         }
       }
+      const keepCurrentFocus = blockedByModal || preserveNestedRename;
       if (ownsShield && shieldSession.captured.length > 0) {
         if (beforeEl && beforeEl.isConnected !== false) {
-          await this.replayCapturedUserInputs(beforeEl, shieldSession.captured, blockedByModal);
-          if (blockedByModal && afterEl && afterEl.isConnected !== false && doc.activeElement !== afterEl) {
+          await this.replayCapturedUserInputs(beforeEl, shieldSession.captured, keepCurrentFocus);
+          if (keepCurrentFocus && afterEl && afterEl.isConnected !== false && this.deepActiveElement() !== afterEl) {
             try {
               afterEl.focus?.({ preventScroll: true });
             } catch {
@@ -3105,6 +4315,90 @@ export class UiControlService {
     }
   }
 
+  private isTableOrPropertyElement(el: Element | null | undefined): boolean {
+    if (!el) {
+      return false;
+    }
+    const kind = classifyNestedEditable(el);
+    if (kind === "table-cell" || kind === "property-key" || kind === "property-value") {
+      return true;
+    }
+    return Boolean(
+      this.findClosestElement(el, ".cm-table-widget, .metadata-container, .metadata-property")
+    );
+  }
+
+  private findSelectedActivationElements(activeEl: Element | null): Element[] {
+    if (!activeEl) {
+      return [];
+    }
+    const seen = new Set<Element>();
+    const out: Element[] = [];
+    const pushIfShown = (cand: Element | null | undefined): void => {
+      if (!cand || seen.has(cand) || (cand as { isConnected?: boolean }).isConnected === false) {
+        return;
+      }
+      if (typeof this.win.getComputedStyle === "function") {
+        try {
+          const style = this.win.getComputedStyle(cand);
+          if (style?.display === "none" || style?.visibility === "hidden") {
+            return;
+          }
+        } catch {
+          // Ignore mock style errors.
+        }
+      }
+      seen.add(cand);
+      out.push(cand);
+    };
+
+    const doc = this.win.document as Document & { getElementById?: (id: string) => Element | null };
+    const activeDescId =
+      typeof activeEl.getAttribute === "function"
+        ? (activeEl.getAttribute("aria-activedescendant") ?? "").trim()
+        : "";
+    if (activeDescId) {
+      const byId =
+        doc.getElementById?.(activeDescId) ??
+        (() => {
+          try {
+            return doc.querySelector?.(`[id="${activeDescId.replace(/["\\]/g, "\\$&")}"]`) ?? null;
+          } catch {
+            return null;
+          }
+        })();
+      pushIfShown(byId);
+    }
+
+    const scope = this.findClosestElement(
+      activeEl,
+      '.prompt, .modal-container, .modal, .suggestion-container, .menu, [role="dialog"], [role="menu"], [role="listbox"]'
+    );
+    const selectedSelector =
+      '.suggestion-item.is-selected, .menu-item.selected, .menu-item.is-selected, [role="option"][aria-selected="true"], [role="menuitem"][aria-selected="true"], [role="menuitem"].is-selected, [aria-selected="true"], .is-selected';
+    const scopeQueryAll = (scope as { querySelectorAll?: (sel: string) => ArrayLike<Element> } | null)
+      ?.querySelectorAll;
+    if (scope && typeof scopeQueryAll === "function") {
+      try {
+        for (const item of Array.from(scopeQueryAll.call(scope, selectedSelector))) {
+          pushIfShown(item);
+        }
+      } catch {
+        // Ignore query errors on minimal mocks.
+      }
+    } else if (
+      this.findClosestElement(activeEl, ".prompt-input, .menu, .suggestion-container") ||
+      (typeof activeEl.matches === "function" && activeEl.matches(".prompt-input"))
+    ) {
+      for (const item of this.queryAll(
+        `.prompt ${selectedSelector}, .suggestion-container ${selectedSelector}, .menu ${selectedSelector}`
+      )) {
+        pushIfShown(item);
+      }
+    }
+    return out;
+  }
+
   private detectProtectedArea(el: Element | null | undefined): string | null {
     if (!el) {
       return null;
@@ -3117,6 +4411,67 @@ export class UiControlService {
     }
     if (this.findClosestElement(el, SETTINGS_MODAL_PROTECTED_SELECTOR)) {
       return "the Obsidian Settings modal";
+    }
+    if (this.findClosestElement(el, WINDOW_CONTROL_PROTECTED_SELECTOR)) {
+      return "Obsidian window controls";
+    }
+    if (
+      this.findClosestElement(el, APP_QUIT_PROTECTED_SELECTOR) ||
+      Boolean(el.querySelector?.(APP_QUIT_PROTECTED_SELECTOR))
+    ) {
+      return "app quit controls";
+    }
+    if (
+      this.findClosestElement(el, SETTINGS_OPEN_PROTECTED_SELECTOR) ||
+      Boolean(el.querySelector?.(SETTINGS_OPEN_PROTECTED_SELECTOR))
+    ) {
+      return "Obsidian Settings controls";
+    }
+    const ariaHost = this.findClosestElement(el, "[aria-label]") ?? el;
+    const aria =
+      typeof ariaHost.getAttribute === "function"
+        ? (ariaHost.getAttribute("aria-label") ?? "").trim().toLowerCase()
+        : "";
+    if (
+      aria === "close window" ||
+      aria === "minimize" ||
+      aria === "maximize" ||
+      aria === "restore" ||
+      aria === "quit" ||
+      aria === "quit obsidian"
+    ) {
+      return "Obsidian window and quit controls";
+    }
+    if (aria === "settings" || aria === "open settings") {
+      return "Obsidian Settings controls";
+    }
+    const cmdMenu = this.findClosestElement(
+      el,
+      '.menu-item, .suggestion-item, [role="option"], [role="menuitem"]'
+    );
+    if (cmdMenu) {
+      if (cmdMenu.querySelector?.(APP_QUIT_PROTECTED_SELECTOR)) {
+        return "app quit controls";
+      }
+      if (cmdMenu.querySelector?.(SETTINGS_OPEN_PROTECTED_SELECTOR)) {
+        return "Obsidian Settings controls";
+      }
+      const rawTitle =
+        cmdMenu.querySelector?.(".menu-item-title, .suggestion-title")?.textContent ??
+        cmdMenu.textContent ??
+        "";
+      const firstLine = (rawTitle.split(/\r?\n/)[0] ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      if (
+        firstLine === "quit" ||
+        firstLine === "quit obsidian" ||
+        firstLine === "close window" ||
+        /^(quit obsidian|close window)\b/.test(firstLine)
+      ) {
+        return "app quit controls";
+      }
+      if (firstLine === "open settings" || /^open settings\b/.test(firstLine)) {
+        return "Obsidian Settings controls";
+      }
     }
     const modal = this.findClosestElement(el, '.modal, .modal-container, [role="dialog"]');
     if (modal) {
@@ -3313,22 +4668,23 @@ export class UiControlService {
   }
 
   focusState(): FocusState {
-    const el = this.win.document.activeElement as HTMLElement | null;
+    const el = this.deepActiveElement() as HTMLElement | null;
     if (!el || el === this.win.document.body) {
       return { tag: el ? el.tagName.toLowerCase() : null, label: "", editable: false, password: false };
     }
     const input = el as HTMLInputElement;
-    const password = el.matches('input[type="password"]');
+    const matchesFn = typeof el.matches === "function" ? (sel: string) => el.matches(sel) : () => false;
+    const password = matchesFn('input[type="password"]');
     const editable =
       !input.readOnly &&
       !input.disabled &&
       (el.isContentEditable ||
-        el.matches(
+        matchesFn(
           'textarea,input:not([type]),input[type="text"],input[type="search"],input[type="email"],input[type="url"],input[type="tel"],input[type="number"]'
         ));
     return {
       tag: el.tagName.toLowerCase(),
-      label: el.getAttribute("aria-label") ?? "",
+      label: typeof el.getAttribute === "function" ? (el.getAttribute("aria-label") ?? "") : "",
       editable,
       password,
     };
@@ -3887,7 +5243,7 @@ export class UiControlService {
     preferredCm?: CodeMirrorViewLike | null,
     explicitPos?: number
   ): Promise<boolean> {
-    const activeEl = this.win.document.activeElement ?? null;
+    const activeEl = this.deepActiveElement();
     const view = preferredCm ?? this.findFocusedCodeMirrorView(activeEl);
     if (view) {
       const hasExplicitPos = typeof explicitPos === "number" && Number.isFinite(explicitPos);
@@ -4553,7 +5909,13 @@ export class UiControlService {
     paneId: string | null,
     caller: string,
     task: () => Promise<T>,
-    extra?: { targetView?: unknown; targetCm?: CodeMirrorViewLike | null }
+    extra?: {
+      targetView?: unknown;
+      targetCm?: CodeMirrorViewLike | null;
+      targetElement?: Element | null;
+      targetFilePath?: string;
+      expectedFileOperation?: { kind: "trash"; path: string };
+    }
   ): Promise<T> {
     let complete: MutationCompleteCallback | void = undefined;
     if (this.beforeMutation) {
@@ -4564,6 +5926,11 @@ export class UiControlService {
         caller,
         ...(extra?.targetView !== undefined ? { targetView: extra.targetView } : {}),
         ...(extra?.targetCm !== undefined ? { targetCm: extra.targetCm } : {}),
+        ...(extra?.targetElement !== undefined ? { targetElement: extra.targetElement } : {}),
+        ...(extra?.targetFilePath !== undefined ? { targetFilePath: extra.targetFilePath } : {}),
+        ...(extra?.expectedFileOperation !== undefined
+          ? { expectedFileOperation: extra.expectedFileOperation }
+          : {}),
       });
     }
     const prevRun = this.activeMutationRun;
@@ -4669,7 +6036,7 @@ export class UiControlService {
     view: WorkspaceLeafLike["view"] | null;
     cm: CodeMirrorViewLike | null;
   } {
-    const activeEl = this.win.document.activeElement ?? null;
+    const activeEl = this.deepActiveElement();
     if (activeEl) {
       if (this.findClosestElement(activeEl, MODAL_SELECTOR)) {
         return {

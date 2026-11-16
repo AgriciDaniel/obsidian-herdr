@@ -10,7 +10,16 @@ const outfile = path.join(tmpDir, "all.test.cjs");
 
 try {
   await build({
-    entryPoints: ["tests/all.test.ts"],
+    stdin: {
+      contents: [
+        'import "./tests/all.test.ts";',
+        'import "./tests/raw-key-regressions.test.ts";',
+        'import "./tests/html-drag.test.ts";',
+        'import "./tests/nested-editors.test.ts";',
+      ].join("\n"),
+      resolveDir: process.cwd(),
+      loader: "ts",
+    },
     bundle: true,
     format: "cjs",
     platform: "node",
