@@ -579,6 +579,9 @@ export class HerdrCoordinator {
       await this.startVaultHerdrSession();
     }
 
+    // The session the agent is started in. The initial prompt goes by name, so it is sent only
+    // while that is still the session: otherwise it could reach an agent of that name elsewhere.
+    const bound = this.sessionBinding();
     const cwd = this.vaultOps.getVaultBasePath() || os.homedir();
     let pane: PaneInfo;
     const currentSnap = this.snapshot ?? (await this.socket.getSnapshot());
@@ -635,7 +638,13 @@ export class HerdrCoordinator {
     if (options.initialPrompt && options.initialPrompt.trim()) {
       // An agent waiting at a question (Claude Code's first-run folder trust check, where Enter
       // picks "No, exit") must not get the prompt: its Enter would answer the question.
-      if (!(await this.waitWhileBlocked(agent))) {
+      const ready = await this.waitWhileBlocked(agent, bound);
+      if (this.disposed || this.sessionBinding() !== bound) {
+        throw new Error(
+          `Started '${options.agentName}', but the Herdr session changed meanwhile, so the initial prompt was not sent. Switch back to that session and send the prompt.`
+        );
+      }
+      if (!ready) {
         await this.refreshAll(false);
         throw new Error(
           `Started '${options.agentName}', but it was waiting at a question (for example Claude Code's folder trust check), so the initial prompt was not sent. Answer it in the agent's terminal, then send the prompt.`
@@ -651,9 +660,14 @@ export class HerdrCoordinator {
   /**
    * Waits, at most two minutes, while a just started agent is blocked at a question, and tells
    * the member once to answer it. True once it is ready (or was never blocked); false when it
-   * stayed blocked, left, or the plugin closed.
+   * stayed blocked, left, the plugin closed, or the session changed.
    */
-  private async waitWhileBlocked(agent: AgentInfo): Promise<boolean> {
+  /** The session and socket an action is bound to; a change means another session. */
+  private sessionBinding(): string {
+    return `${this.getActiveSessionName()}\u0000${this.socket.getSocketPath()}`;
+  }
+
+  private async waitWhileBlocked(agent: AgentInfo, bound: string = this.sessionBinding()): Promise<boolean> {
     if (agent.agent_status !== "blocked") {
       return true;
     }
@@ -664,6 +678,9 @@ export class HerdrCoordinator {
     const deadline = Date.now() + 120000;
     while (Date.now() < deadline && !this.disposed) {
       await new Promise((r) => window.setTimeout(r, 500));
+      if (this.sessionBinding() !== bound) {
+        return false;
+      }
       let now: AgentInfo | undefined;
       try {
         now = (await this.socket.listAgents()).find((a) => a.pane_id === agent.pane_id && a.name === agent.name);

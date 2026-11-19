@@ -9,6 +9,8 @@ Windows fixes from member reports on the AIMH home repository (issues #73, #74, 
 - The embedded terminal takes typing on Windows 10 1809 or later through a small pseudoconsole (ConPTY) driver run by Windows PowerShell; without it the old plain pipes are used. Linux and macOS are unchanged (#76).
 - An agent waiting at a question when it starts (Claude Code's first-run folder trust check) no longer gets the initial prompt typed into it; a notice asks the member to answer, and the prompt is sent once the agent is ready, waiting up to two minutes (#74).
 - Herdr commands and the detached Herdr server no longer open console windows on Windows.
+- On Windows the terminal starts only a .exe given as a full path or found in a folder named in full on PATH, never one in the vault folder, and never a .cmd or .bat file (those run through cmd.exe); otherwise it says why and starts nothing. The program runs in a Windows job that ends it when the terminal closes, so it is not left running, and a resize is capped at 1000 columns and rows.
+- The initial prompt of a new agent is sent only while its Herdr session is still the active one, so it never reaches an agent of the same name in another session.
 
 ## 0.3.0 (2026-11-16)
 

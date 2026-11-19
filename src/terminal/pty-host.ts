@@ -187,6 +187,28 @@ public static class HerdrObsConPty
     [StructLayout(LayoutKind.Sequential)]
     struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount;
+        public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CreatePipe(out IntPtr readEnd, out IntPtr writeEnd, IntPtr attributes, int size);
     [DllImport("kernel32.dll")]
@@ -209,6 +231,35 @@ public static class HerdrObsConPty
     static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll")]
     static extern void GetStartupInfoW(out STARTUPINFO startupInfo);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, int size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint ResumeThread(IntPtr thread);
+
+    // A job that ends the child when this process ends, however it ends (the plugin kills
+    // PowerShell right after closing its stdin, and Obsidian may quit or crash): without it the
+    // child, for example a Herdr client, would keep running with no window. The job handle is
+    // never closed here; Windows closes it when this process exits. 0x2000 is
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; 0x1000 is JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, so only
+    // the child is in the job and not what it starts (a Herdr server it starts must outlive it).
+    // 9 is JobObjectExtendedLimitInformation.
+    static IntPtr KillOnCloseJob()
+    {
+        IntPtr job = CreateJobObjectW(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) return IntPtr.Zero;
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = 0x00002000 | 0x00001000;
+        if (!SetInformationJobObject(job, 9, ref info, Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
+        {
+            CloseHandle(job);
+            return IntPtr.Zero;
+        }
+        return job;
+    }
 
     static COORD Size(int cols, int rows)
     {
@@ -256,7 +307,9 @@ public static class HerdrObsConPty
         return thread;
     }
 
-    public static int Run(int cols, int rows, string commandLine)
+    // application is the absolute path of a .exe, checked by the plugin: CreateProcessW then
+    // never searches for the program, so nothing in the current folder (the vault) is run.
+    public static int Run(int cols, int rows, string application, string commandLine)
     {
         IntPtr inputRead, inputWrite, outputRead, outputWrite;
         if (!CreatePipe(out inputRead, out inputWrite, IntPtr.Zero, 0) || !CreatePipe(out outputRead, out outputWrite, IntPtr.Zero, 0))
@@ -282,9 +335,13 @@ public static class HerdrObsConPty
             throw new InvalidOperationException("Pseudoconsole attribute failed: " + Marshal.GetLastWin32Error());
 
         PROCESS_INFORMATION process;
-        // 0x00080000 is EXTENDED_STARTUPINFO_PRESENT.
-        if (!CreateProcessW(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, 0x00080000, IntPtr.Zero, null, ref startup, out process))
-            throw new InvalidOperationException("Could not start '" + commandLine + "': Windows error " + Marshal.GetLastWin32Error());
+        // 0x00080000 is EXTENDED_STARTUPINFO_PRESENT; 0x00000004 is CREATE_SUSPENDED, so the child
+        // is in the job before it runs a single instruction.
+        if (!CreateProcessW(application, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, 0x00080000 | 0x00000004, IntPtr.Zero, null, ref startup, out process))
+            throw new InvalidOperationException("Could not start '" + application + "': Windows error " + Marshal.GetLastWin32Error());
+        IntPtr job = KillOnCloseJob();
+        if (job != IntPtr.Zero) AssignProcessToJobObject(job, process.hProcess);
+        ResumeThread(process.hThread);
         CloseHandle(process.hThread);
 
         Stream consoleInput = new FileStream(new SafeFileHandle(inputWrite, true), FileAccess.Write, 1, false);
@@ -307,8 +364,9 @@ public static class HerdrObsConPty
                     string line;
                     while ((line = reader.ReadLine()) != null)
                     {
-                        Match c = Regex.Match(line, "\"cols\"\\s*:\\s*(\\d+)");
-                        Match r = Regex.Match(line, "\"rows\"\\s*:\\s*(\\d+)");
+                        // At most five digits, so int.Parse never overflows (an exception would end resizing).
+                        Match c = Regex.Match(line, "\"cols\"\\s*:\\s*(\\d{1,5})(?!\\d)");
+                        Match r = Regex.Match(line, "\"rows\"\\s*:\\s*(\\d{1,5})(?!\\d)");
                         if (line.Contains("\"resize\"") && c.Success && r.Success)
                             ResizePseudoConsole(console, Size(int.Parse(c.Groups[1].Value), int.Parse(r.Groups[1].Value)));
                     }
@@ -334,6 +392,69 @@ public static class HerdrObsConPty
 `;
 
 const WINDOWS_CONPTY_MIN_BUILD = 17763; // Windows 10 1809, the first release with CreatePseudoConsole
+
+/** The largest terminal, in columns or rows, a resize asks for. */
+export const MAX_TERMINAL_CELLS = 1000;
+
+function cells(value: number, min: number): number {
+  return Math.min(MAX_TERMINAL_CELLS, Math.max(min, Math.round(Number.isFinite(value) ? value : min)));
+}
+
+function isRegularFile(target: string): boolean {
+  try {
+    return fs.statSync(target).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** A drive path (C:\...) or a UNC path (\\server\share\...): never relative to the current folder. */
+function fullyQualifiedWindowsPath(p: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(p) || /^\\\\[^\\/]/.test(p);
+}
+
+/**
+ * The program a Windows terminal starts, as the absolute path of a .exe, or why it is refused.
+ * A bare name is looked up only in fully qualified PATH folders, never in the current folder
+ * (the vault, where a synced herdr.exe could have been planted) and never in a relative PATH
+ * entry such as ".". A .cmd, .bat or .com file is refused: Windows runs those through cmd.exe,
+ * which reads % ^ & | in the arguments its own way, and session names can come from links.
+ */
+export function resolveConPtyApplication(
+  command: string,
+  pathValue: string = buildHostNormalizedEnv(process.env).PATH || "",
+  isFile: (p: string) => boolean = isRegularFile
+): { ok: true; application: string } | { ok: false; reason: string } {
+  const name = command.trim();
+  const ext = path.win32.extname(name).toLowerCase();
+  if (!name) {
+    return { ok: false, reason: "No program was given." };
+  }
+  if (ext && ext !== ".exe") {
+    return {
+      ok: false,
+      reason: `'${name}' is not a .exe program. On Windows the terminal starts only .exe programs, so a .cmd or .bat file never runs through cmd.exe.`,
+    };
+  }
+  const file = ext ? name : `${name}.exe`;
+  if (fullyQualifiedWindowsPath(name)) {
+    return isFile(file) ? { ok: true, application: file } : { ok: false, reason: `'${file}' was not found.` };
+  }
+  if (/[\\/:]/.test(name)) {
+    return { ok: false, reason: `'${name}' is not a full path. Give the full path, for example C:\\Tools\\herdr.exe.` };
+  }
+  for (const raw of pathValue.split(";")) {
+    const dir = raw.trim().replace(/^"(.*)"$/, "$1");
+    if (!dir || !fullyQualifiedWindowsPath(dir)) {
+      continue;
+    }
+    const candidate = path.win32.join(dir, file);
+    if (isFile(candidate)) {
+      return { ok: true, application: candidate };
+    }
+  }
+  return { ok: false, reason: `'${file}' was not found in a folder on PATH. Give its full path in settings.` };
+}
 
 /** Quote one argument the way CommandLineToArgvW and the C runtime parse it back. */
 export function quoteWindowsArg(arg: string): string {
@@ -401,8 +522,8 @@ export class PtySession {
   private readonly decoder = new TextDecoder("utf-8");
 
   constructor(options: PtySpawnOptions) {
-    this.cols = Math.max(20, Math.round(options.cols || 80));
-    this.rows = Math.max(5, Math.round(options.rows || 24));
+    this.cols = cells(options.cols || 80, 20);
+    this.rows = cells(options.rows || 24, 5);
     this.start(options);
   }
 
@@ -440,6 +561,11 @@ export class PtySession {
         this.ctrlStream = fd3;
       }
     } else if (powershell) {
+      const resolved = resolveConPtyApplication(options.command);
+      if (!resolved.ok) {
+        this.refuseStart(options, resolved.reason);
+        return;
+      }
       // The driver source and the child command line travel in environment variables: no temp
       // file to clean up, and an inline -Command is not subject to the script execution policy.
       // shortcut: Add-Type compiles the driver on every start (about a second), cache the
@@ -447,9 +573,9 @@ export class PtySession {
       // A machine that blocks Add-Type (Constrained Language Mode) shows the bridge error and
       // the terminal ends; it does not fall back to plain pipes.
       const bootstrap =
-        "$ErrorActionPreference='Stop';$s=$env:HERDR_OBS_CONPTY_SOURCE;$c=$env:HERDR_OBS_CONPTY_COMMAND;" +
-        "Remove-Item Env:HERDR_OBS_CONPTY_SOURCE,Env:HERDR_OBS_CONPTY_COMMAND;" +
-        `try{Add-Type -TypeDefinition $s;exit [HerdrObsConPty]::Run(${this.cols},${this.rows},$c)}` +
+        "$ErrorActionPreference='Stop';$s=$env:HERDR_OBS_CONPTY_SOURCE;$a=$env:HERDR_OBS_CONPTY_APP;$c=$env:HERDR_OBS_CONPTY_COMMAND;" +
+        "Remove-Item Env:HERDR_OBS_CONPTY_SOURCE,Env:HERDR_OBS_CONPTY_APP,Env:HERDR_OBS_CONPTY_COMMAND;" +
+        `try{Add-Type -TypeDefinition $s;exit [HerdrObsConPty]::Run(${this.cols},${this.rows},$a,$c)}` +
         "catch{[Console]::Error.WriteLine('[ConPTY bridge error: '+$_.Exception.Message+']');exit 1}";
       this.proc = spawn(
         powershell,
@@ -459,7 +585,8 @@ export class PtySession {
           env: {
             ...mergedEnv,
             HERDR_OBS_CONPTY_SOURCE: WINDOWS_CONPTY_BRIDGE,
-            HERDR_OBS_CONPTY_COMMAND: [options.command, ...options.args].map(quoteWindowsArg).join(" "),
+            HERDR_OBS_CONPTY_APP: resolved.application,
+            HERDR_OBS_CONPTY_COMMAND: [resolved.application, ...options.args].map(quoteWindowsArg).join(" "),
           },
           stdio: ["pipe", "pipe", "pipe", "pipe"],
           windowsHide: true,
@@ -470,8 +597,18 @@ export class PtySession {
         this.ctrlStream = fd3;
       }
     } else {
-      // Last resort when neither driver is available: plain pipes, no keyboard for full-screen programs
-      this.proc = spawn(options.command, options.args, {
+      // Last resort when neither driver is available: plain pipes, no keyboard for full-screen programs.
+      // On Windows the same check as above: Node would also look in the current folder first.
+      let command = options.command;
+      if (process.platform === "win32") {
+        const resolved = resolveConPtyApplication(options.command);
+        if (!resolved.ok) {
+          this.refuseStart(options, resolved.reason);
+          return;
+        }
+        command = resolved.application;
+      }
+      this.proc = spawn(command, options.args, {
         cwd: safeCwd,
         env: mergedEnv,
         stdio: ["pipe", "pipe", "pipe"],
@@ -512,6 +649,16 @@ export class PtySession {
     });
   }
 
+  /** Tells the terminal why nothing was started, after the constructor returned. */
+  private refuseStart(options: PtySpawnOptions, reason: string): void {
+    window.setTimeout(() => {
+      if (!this.disposed) {
+        options.onData(`\r\n[Could not start the terminal: ${reason}]\r\n`);
+        options.onExit(1, null);
+      }
+    }, 0);
+  }
+
   write(data: string): void {
     if (this.disposed || !this.proc?.stdin || this.proc.stdin.destroyed) {
       return;
@@ -535,8 +682,8 @@ export class PtySession {
   }
 
   resize(cols: number, rows: number): void {
-    const nextCols = Math.max(10, Math.round(cols));
-    const nextRows = Math.max(3, Math.round(rows));
+    const nextCols = cells(cols, 10);
+    const nextRows = cells(rows, 3);
     if (nextCols === this.cols && nextRows === this.rows) {
       return;
     }
