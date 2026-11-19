@@ -61,13 +61,18 @@ function isExecutableFile(target: string): boolean {
 }
 
 export function resolveExecutableOnNormalizedPath(name: string): string | null {
-  const exeName = process.platform === "win32" && !name.endsWith(".exe") ? `${name}.exe` : name;
+  // On Windows npm installs command shims (codex.cmd, claude.cmd), not only .exe files.
+  const names = process.platform === "win32" && !path.extname(name)
+    ? [".exe", ".cmd", ".bat", ".com"].map((ext) => name + ext)
+    : [name];
   const norm = buildHostNormalizedEnv(process.env);
   const dirs = (norm.PATH || "").split(path.delimiter).filter(Boolean);
   for (const dir of dirs) {
-    const candidate = path.join(dir, exeName);
-    if (isExecutableFile(candidate)) {
-      return candidate;
+    for (const file of names) {
+      const candidate = path.join(dir, file);
+      if (isExecutableFile(candidate)) {
+        return candidate;
+      }
     }
   }
   return null;
@@ -113,7 +118,22 @@ export function buildHostNormalizedEnv(
     ...overrides,
   };
 
-  if (process.platform !== "win32") {
+  if (process.platform === "win32") {
+    // Windows names the variable `Path`, and a plain copy of process.env is case-sensitive, so
+    // `merged.PATH` would read nothing and an override could leave two keys. Keep one PATH:
+    // the override's value when it has one, else the base's.
+    const pathValue =
+      overrides[Object.keys(overrides).find((key) => key.toUpperCase() === "PATH") ?? ""] ??
+      baseEnv[Object.keys(baseEnv).find((key) => key.toUpperCase() === "PATH") ?? ""];
+    for (const key of Object.keys(merged)) {
+      if (key.toUpperCase() === "PATH") {
+        delete merged[key];
+      }
+    }
+    if (pathValue !== undefined) {
+      merged.PATH = pathValue;
+    }
+  } else {
     const home = os.homedir();
     const candidateDirs = [
       path.join(home, ".local", "bin"),

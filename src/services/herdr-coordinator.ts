@@ -174,7 +174,8 @@ export class HerdrCoordinator {
       return process.env.HERDR_SOCKET_PATH;
     }
     if (process.platform === "win32") {
-      return "\\\\.\\pipe\\herdr";
+      // Herdr's own folder on Windows is under %APPDATA%; the socket client adds the pipe prefix.
+      return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "herdr", "herdr.sock");
     }
     return path.join(os.homedir(), ".config", "herdr", "herdr.sock");
   }
@@ -632,11 +633,51 @@ export class HerdrCoordinator {
     }
 
     if (options.initialPrompt && options.initialPrompt.trim()) {
+      // An agent waiting at a question (Claude Code's first-run folder trust check, where Enter
+      // picks "No, exit") must not get the prompt: its Enter would answer the question.
+      if (!(await this.waitWhileBlocked(agent))) {
+        await this.refreshAll(false);
+        throw new Error(
+          `Started '${options.agentName}', but it was waiting at a question (for example Claude Code's folder trust check), so the initial prompt was not sent. Answer it in the agent's terminal, then send the prompt.`
+        );
+      }
       await this.socket.promptAgent(options.agentName, options.initialPrompt.trim());
     }
 
     await this.refreshAll(false);
     return agent;
+  }
+
+  /**
+   * Waits, at most two minutes, while a just started agent is blocked at a question, and tells
+   * the member once to answer it. True once it is ready (or was never blocked); false when it
+   * stayed blocked, left, or the plugin closed.
+   */
+  private async waitWhileBlocked(agent: AgentInfo): Promise<boolean> {
+    if (agent.agent_status !== "blocked") {
+      return true;
+    }
+    new Notice(
+      `'${agent.name || agent.pane_id}' is asking a question first (for example Claude Code's folder trust check). Answer it in its terminal; the initial prompt is sent once the agent is ready.`,
+      15000
+    );
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline && !this.disposed) {
+      await new Promise((r) => window.setTimeout(r, 500));
+      let now: AgentInfo | undefined;
+      try {
+        now = (await this.socket.listAgents()).find((a) => a.pane_id === agent.pane_id && a.name === agent.name);
+      } catch {
+        continue;
+      }
+      if (!now) {
+        return false;
+      }
+      if (now.agent_status !== "blocked" && now.interactive_ready) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async buildActiveNoteContextPack(options: {

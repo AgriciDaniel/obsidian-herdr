@@ -27,6 +27,7 @@ try {
     outfile,
     alias: {
       obsidian: path.resolve("tests/obsidian-mock.ts"),
+      electron: path.resolve("tests/electron-mock.ts"),
     },
     external: ["node:*", ...builtinModules],
     logLevel: "warning",

@@ -59,6 +59,21 @@ const DEFAULT_SUBSCRIPTIONS = [
   { type: "layout.updated" },
 ];
 
+const WINDOWS_PIPE_PREFIX = /^\\\\[.?]\\pipe\\/i;
+
+/**
+ * The address `net.connect` takes for a Herdr socket path. On Windows Herdr (0.9.5) reports a
+ * file path whose file is only a pointer (`<pid>:<token>`); it serves its API on the named pipe
+ * of that exact path, so the pipe prefix goes in front, the path unchanged. A path that already
+ * is a pipe name, and every path on other systems, is returned as it is.
+ */
+export function herdrConnectPath(socketPath: string, platform: NodeJS.Platform = process.platform): string {
+  if (!socketPath || platform !== "win32" || WINDOWS_PIPE_PREFIX.test(socketPath)) {
+    return socketPath;
+  }
+  return "\\\\.\\pipe\\" + socketPath;
+}
+
 /**
  * Newline-delimited JSON client for Herdr's local Unix socket / Windows named pipe API.
  */
@@ -100,12 +115,13 @@ export class HerdrSocketClient {
     if (!this.socketPath) {
       return false;
     }
-    if (process.platform === "win32" && this.socketPath.startsWith("\\\\.\\pipe\\")) {
+    if (process.platform === "win32" && WINDOWS_PIPE_PREFIX.test(this.socketPath)) {
       return true;
     }
     try {
       const stat = fs.statSync(this.socketPath);
-      return stat.isSocket();
+      // On Windows the reported path is a pointer file beside the named pipe.
+      return process.platform === "win32" ? stat.isFile() : stat.isSocket();
     } catch {
       return false;
     }
@@ -146,7 +162,7 @@ export class HerdrSocketClient {
       let settled = false;
       let buffer = "";
 
-      const socket = net.createConnection({ path: this.socketPath });
+      const socket = net.createConnection({ path: herdrConnectPath(this.socketPath) });
       const timer = window.setTimeout(() => {
         if (!settled) {
           settled = true;
@@ -223,7 +239,7 @@ export class HerdrSocketClient {
         finish(
           new HerdrSocketError(
             err.code || "socket_error",
-            `Could not connect to Herdr socket (${this.socketPath}): ${err.message}`
+            `Could not connect to Herdr socket (${herdrConnectPath(this.socketPath)}): ${err.message}`
           )
         );
       });
@@ -648,7 +664,7 @@ export class HerdrSocketClient {
       return;
     }
 
-    const sock = net.createConnection({ path: this.socketPath });
+    const sock = net.createConnection({ path: herdrConnectPath(this.socketPath) });
     this.subSocket = sock;
     this.subBuffer = "";
 
