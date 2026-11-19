@@ -241,6 +241,8 @@ export class HerdrCliClient {
           cwd: options.cwd || os.homedir(),
           timeout: options.timeoutMs ?? 8000,
           maxBuffer: 4 * 1024 * 1024,
+          // Windows: no console window flashes up for each Herdr command (no effect elsewhere).
+          windowsHide: true,
           env: buildHostNormalizedEnv(process.env, {
             ...this.customEnv,
             ...(options.extraEnv || {}),
@@ -399,6 +401,9 @@ export class HerdrCliClient {
       cwd: options.cwd,
       detached: true,
       stdio: "ignore",
+      // Windows: the detached server gets no console window of its own, which a member could
+      // close and so stop the session (no effect elsewhere).
+      windowsHide: true,
       env: buildHostNormalizedEnv(process.env, {
         ...this.customEnv,
         ...options.bridgeEnv,

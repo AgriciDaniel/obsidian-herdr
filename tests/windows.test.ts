@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { migrateSettings, type AgentInfo } from "../src/domain/types";
-import { buildHostNormalizedEnv, resolveExecutableOnNormalizedPath } from "../src/herdr/cli-client";
+import { buildHostNormalizedEnv, HerdrCliClient, resolveExecutableOnNormalizedPath } from "../src/herdr/cli-client";
 import { herdrConnectPath, HerdrSocketClient } from "../src/herdr/socket-client";
 import { HerdrCoordinator } from "../src/services/herdr-coordinator";
 import { findWindowsPowerShell, quoteWindowsArg } from "../src/terminal/pty-host";
@@ -184,5 +184,40 @@ describe("Windows: no initial prompt into an agent waiting at a question (#74)",
 
   it("gives up when the agent left (it answered No, exit)", async () => {
     assert.equal(await coordinatorWith(() => []).waitWhileBlocked(agent({})), false);
+  });
+});
+
+describe("Windows: Herdr commands and the session server open no console window", () => {
+  it("passes windowsHide to every Herdr command and to the detached server", async () => {
+    // The bundle calls execFile and spawn through the module object, so replacing them here
+    // records the options the client passes. Nothing is started.
+    const cp = process.getBuiltinModule("node:child_process") as Record<string, unknown>;
+    const realExecFile = cp.execFile;
+    const realSpawn = cp.spawn;
+    const execOptions: Array<Record<string, unknown>> = [];
+    const spawnOptions: Array<Record<string, unknown>> = [];
+    let serverUp = false;
+    cp.execFile = (_bin: string, _args: string[], options: Record<string, unknown>, done: (e: null, out: string, err: string) => void) => {
+      execOptions.push(options);
+      done(null, serverUp ? JSON.stringify({ server: { running: true, socket: "/fake/herdr.sock" } }) : "", "");
+    };
+    cp.spawn = (_bin: string, _args: string[], options: Record<string, unknown>) => {
+      spawnOptions.push(options);
+      serverUp = true;
+      return { unref: () => undefined };
+    };
+    try {
+      const cli = new HerdrCliClient(process.execPath);
+      await cli.exec(["status", "--json"]);
+      await cli.ensureHeadlessServer({ sessionName: "vault-x", cwd: os.tmpdir(), bridgeEnv: {} });
+    } finally {
+      cp.execFile = realExecFile;
+      cp.spawn = realSpawn;
+    }
+    assert.ok(execOptions.length >= 2);
+    assert.ok(execOptions.every((o) => o.windowsHide === true));
+    assert.equal(spawnOptions.length, 1);
+    assert.equal(spawnOptions[0].detached, true);
+    assert.equal(spawnOptions[0].windowsHide, true);
   });
 });
