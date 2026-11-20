@@ -583,4 +583,302 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
       fs.rmSync(symlinkTarget, { recursive: true, force: true });
     }
   });
+
+  it("C2: ui.select chooses <select> option by value or label, dispatches input+change, honors protected areas & cursor, works in ui.batch, CLI (Node+Python), and MCP", async () => {
+    const events: string[] = [];
+    const cursorEvents: Array<{ action: string; label?: string }> = [];
+
+    const makeOption = (value: string, text: string, disabled = false) => ({
+      tagName: "OPTION",
+      value,
+      label: text,
+      textContent: text,
+      disabled,
+      selected: false,
+    });
+
+    const makeSelect = (opts: {
+      id: string;
+      options: ReturnType<typeof makeOption>[];
+      initialValue: string;
+      rect?: { x: number; y: number; width: number; height: number };
+      parent?: Record<string, unknown> | null;
+    }) => {
+      let currentValue = opts.initialValue;
+      for (const o of opts.options) o.selected = o.value === currentValue;
+      const el = makeFakeElement({
+        tag: "select",
+        label: opts.id,
+        text: opts.options.map((o) => o.textContent).join(" "),
+        classes: ["dropdown"],
+        rect: opts.rect,
+        parent: opts.parent ?? null,
+      });
+      Object.defineProperty(el, "value", {
+        get: () => currentValue,
+        set: (v: string) => {
+          currentValue = String(v);
+          for (const o of opts.options) o.selected = o.value === currentValue;
+        },
+        enumerable: true,
+      });
+      el.options = opts.options;
+      el.selectedIndex = 0;
+      el.dispatchEvent = (ev: { type?: string }) => {
+        events.push(`${opts.id}:${ev?.type ?? "unknown"}`);
+        return true;
+      };
+      return el;
+    };
+
+    const normalSelect = makeSelect({
+      id: "runtime-select",
+      options: [
+        makeOption("claude", "Claude Code"),
+        makeOption("codex", "Codex CLI"),
+        makeOption("agy", "Antigravity"),
+      ],
+      initialValue: "claude",
+      rect: { x: 10, y: 10, width: 120, height: 28 },
+    });
+
+    const settingsModal = makeFakeElement({ tag: "div", classes: ["modal", "mod-settings"] });
+    const protectedSelect = makeSelect({
+      id: "protected-select",
+      options: [makeOption("a", "Alpha"), makeOption("b", "Beta")],
+      initialValue: "a",
+      rect: { x: 10, y: 100, width: 120, height: 28 },
+      parent: settingsModal,
+    });
+
+    const plainBtn = makeFakeElement({
+      tag: "button",
+      label: "Not a select",
+      text: "Click",
+      rect: { x: 10, y: 200, width: 120, height: 28 },
+    });
+
+    const allTestEls = [normalSelect, protectedSelect, plainBtn];
+    const bySelector: Record<string, unknown[]> = {
+      "#runtime-select": [normalSelect],
+      "#protected-select": [protectedSelect],
+      "#plain-btn": [plainBtn],
+    };
+
+    const win = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      devicePixelRatio: 1,
+      setTimeout,
+      clearTimeout,
+      Event: class FakeEvent {
+        readonly type: string;
+        readonly bubbles: boolean;
+        constructor(type: string, init?: { bubbles?: boolean }) {
+          this.type = type;
+          this.bubbles = Boolean(init?.bubbles);
+        }
+      },
+      document: {
+        body: { innerText: "" },
+        querySelectorAll: (sel: string) => bySelector[sel] ?? [],
+        elementFromPoint: (x: number, y: number) =>
+          allTestEls.find((e) => {
+            const r = (e.getBoundingClientRect as () => { left: number; right: number; top: number; bottom: number })();
+            return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+          }) ?? null,
+      },
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    } as unknown as Window;
+
+    const fakeOverlay = {
+      pulseClick: (
+        _caller: string,
+        _x: number,
+        _y: number,
+        label?: string
+      ) => {
+        cursorEvents.push({ action: "click", label });
+      },
+      moveTo: (
+        _caller: string,
+        _x: number,
+        _y: number,
+        label?: string
+      ) => {
+        cursorEvents.push({ action: "move", label });
+      },
+      whenSettled: () => Promise.resolve(),
+      exitAgent: () => undefined,
+    };
+
+    const svc = new UiControlService({
+      win,
+      getWebContents: () => ({
+        capturePage: async () => ({ toPNG: () => Buffer.alloc(0), getSize: () => ({ width: 1, height: 1 }) }),
+        sendInputEvent: () => undefined,
+        insertText: async () => undefined,
+      }),
+      sleep: async () => undefined,
+      cursorOverlay: fakeOverlay as unknown as never,
+    });
+
+    const selectFn = (
+      svc as unknown as {
+        select?: (params: Record<string, unknown>, caller?: string) => Promise<Record<string, unknown>>;
+      }
+    ).select;
+    assert.equal(typeof selectFn, "function", "UiControlService.select must exist");
+
+    // 1. Select by value
+    const res1 = await selectFn!.call(
+      svc,
+      { target: { selector: "#runtime-select" }, value: "codex" },
+      "test-c2"
+    );
+    assert.equal(res1.selected, true);
+    assert.equal(res1.value, "codex");
+    assert.equal(res1.label, "Codex CLI");
+    assert.equal(res1.previousValue, "claude");
+    assert.equal(normalSelect.value, "codex");
+    assert.deepEqual(events, ["runtime-select:input", "runtime-select:change"]);
+    assert.ok(cursorEvents.length > 0, "select must move/show the cursor overlay");
+
+    // 2. Select by label
+    events.length = 0;
+    const res2 = await selectFn!.call(
+      svc,
+      { target: { selector: "#runtime-select" }, label: "Antigravity" },
+      "test-c2"
+    );
+    assert.equal(res2.value, "agy");
+    assert.equal(res2.label, "Antigravity");
+    assert.deepEqual(events, ["runtime-select:input", "runtime-select:change"]);
+
+    // 3. Batch step {"action": "select", ...}
+    events.length = 0;
+    const batchRes = (await svc.batch(
+      {
+        steps: [
+          { action: "select", target: { selector: "#runtime-select" }, value: "claude" },
+        ],
+      },
+      "test-c2"
+    )) as { completed: boolean; results: Array<Record<string, unknown>> };
+    assert.equal(batchRes.completed, true);
+    assert.equal(batchRes.results[0].value, "claude");
+    assert.deepEqual(events, ["runtime-select:input", "runtime-select:change"]);
+
+    // 4. Protected <select> refused with ui_protected_area
+    events.length = 0;
+    await assert.rejects(
+      () => selectFn!.call(svc, { target: { selector: "#protected-select" }, value: "b" }, "test-c2"),
+      (err: { code?: string }) => err?.code === "ui_protected_area"
+    );
+    assert.equal(protectedSelect.value, "a");
+    assert.deepEqual(events, []);
+
+    // 5. Non-<select> target fails clearly
+    await assert.rejects(
+      () => selectFn!.call(svc, { target: { selector: "#plain-btn" }, value: "x" }, "test-c2"),
+      /select/i
+    );
+
+    // 6. CLI (Node + Python) and MCP exposure
+    const tmpDir = makeTempDir("fix-c2-");
+    let server: net.Server | null = null;
+    try {
+      const kit = runtimeKit.computeRuntimePaths(path.join(tmpDir, "v"), tmpDir);
+      runtimeKit.provisionRuntimeKit({
+        kit,
+        token: "b".repeat(64),
+        vaultName: "SelectVault",
+        vaultPath: tmpDir,
+        pluginVersion: "0.3.2",
+      });
+      const seenRpc: Array<{ method: string; params: Record<string, unknown> }> = [];
+      server = net.createServer((sock) => {
+        let buf = "";
+        sock.on("data", (chunk) => {
+          buf += chunk.toString("utf8");
+          const nl = buf.indexOf("\n");
+          if (nl === -1) return;
+          const req = JSON.parse(buf.slice(0, nl)) as {
+            id: string;
+            method: string;
+            params: Record<string, unknown>;
+          };
+          seenRpc.push({ method: req.method, params: req.params });
+          sock.end(
+            JSON.stringify({
+              id: req.id,
+              ok: true,
+              result: { selected: true, value: req.params.value ?? "codex", label: req.params.label ?? "Codex CLI" },
+            }) + "\n"
+          );
+        });
+      });
+      await new Promise<void>((resolve) => server!.listen(kit.socketPath, resolve));
+
+      const coreMjs = path.join(kit.binDir, "obs-herdr-core.mjs");
+      const corePy = path.join(kit.binDir, "obs-herdr-core.py");
+      const baseEnv = { ...process.env, OBSIDIAN_HERDR_CONNECTION_FILE: kit.connectionFilePath };
+
+      for (const [label, bin, args] of [
+        ["node", process.execPath, [coreMjs]],
+        ["python", "python3", [corePy]],
+      ] as Array<[string, string, string[]]>) {
+        const help = await execFileAsync(bin, [...args, "ui", "select", "--help"], { env: baseEnv });
+        assert.ok(help.stdout.includes("obs-herdr ui select"), `${label} ui select --help`);
+
+        const outVal = await execFileAsync(
+          bin,
+          [...args, "ui", "select", "--selector", "#runtime-select", "--value", "codex"],
+          { env: baseEnv }
+        );
+        assert.equal(JSON.parse(outVal.stdout).value, "codex");
+
+        const outLabel = await execFileAsync(
+          bin,
+          [...args, "ui", "select", "--selector", "#runtime-select", "--label", "Codex CLI"],
+          { env: baseEnv }
+        );
+        assert.equal(JSON.parse(outLabel.stdout).label, "Codex CLI");
+
+        // MCP exposes obsidian_select
+        const mcpTools = await new Promise<Array<{ name: string }>>((resolve, reject) => {
+          const child = spawn(bin, [...args, "mcp"], { env: baseEnv });
+          let rem = "";
+          let tools: Array<{ name: string }> = [];
+          child.stdout.on("data", (d) => {
+            rem += d.toString("utf8");
+            let idx = rem.indexOf("\n");
+            while (idx !== -1) {
+              const ln = rem.slice(0, idx).trim();
+              rem = rem.slice(idx + 1);
+              if (ln) {
+                const msg = JSON.parse(ln) as { id?: number; result?: { tools?: Array<{ name: string }> } };
+                if (msg.id === 2 && msg.result?.tools) tools = msg.result.tools;
+              }
+              idx = rem.indexOf("\n");
+            }
+          });
+          child.on("error", reject);
+          child.on("close", () => resolve(tools));
+          child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) + "\n");
+          child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) + "\n");
+          child.stdin.end();
+        });
+        assert.ok(
+          mcpTools.some((t) => t.name === "obsidian_select"),
+          `${label} MCP must expose obsidian_select`
+        );
+      }
+
+      assert.equal(seenRpc.filter((r) => r.method === "ui.select").length, 4);
+    } finally {
+      if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

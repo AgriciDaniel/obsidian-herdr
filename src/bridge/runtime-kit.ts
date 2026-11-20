@@ -723,9 +723,25 @@ const SHARED_MCP_TOOLS = [
     rpc: "ui.drag",
   },
   {
+    name: "obsidian_select",
+    description:
+      "Choose an option in a visible <select> dropdown by value or label, dispatching input and change events. Refuses protected areas.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: UI_TARGET_SCHEMA,
+        value: { type: "string", description: "Exact option value attribute to select." },
+        label: { type: "string", description: "Visible option label text to select." },
+      },
+      required: ["target"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    rpc: "ui.select",
+  },
+  {
     name: "obsidian_ui_batch",
     description:
-      "Run up to 20 UI steps (click, type, press_key, scroll, drag, wait_for, insert_line) atomically inside the serialized UI lock so parallel agents do not interleave.",
+      "Run up to 20 UI steps (click, select, type, press_key, scroll, drag, wait_for, insert_line) atomically inside the serialized UI lock so parallel agents do not interleave.",
     inputSchema: {
       type: "object",
       properties: {
@@ -736,9 +752,11 @@ const SHARED_MCP_TOOLS = [
             properties: {
               action: {
                 type: "string",
-                enum: ["click", "type", "press_key", "scroll", "drag", "wait_for", "insert_line"],
+                enum: ["click", "select", "type", "press_key", "scroll", "drag", "wait_for", "insert_line"],
               },
               target: UI_TARGET_SCHEMA,
+              value: { type: "string" },
+              label: { type: "string" },
               text: { type: "string" },
               key: { type: "string" },
               modifiers: { type: "array", items: { type: "string" } },
@@ -768,6 +786,7 @@ const UI_BATCH_SCHEMA_LINES = [
   "Steps (max 20, executed inside one serialized lock):",
   '  insert_line: {"action":"insert_line","target":<anchor>,"text":"<line>"}',
   '  click:       {"action":"click","target":<target>,"button"?:"left"|"right"|"middle","count"?:<n>}',
+  '  select:      {"action":"select","target":<target>,"value"?:"<v>","label"?:"<text>"}',
   '  type:        {"action":"type","text":"<text>","target"?:<target>}',
   '  press_key:   {"action":"press_key","key":"<Key>","modifiers"?:["Mod"|"Ctrl"|"Alt"|"Shift"|"Meta"]}',
   '  scroll:      {"action":"scroll","target":<target>,"deltaX"?:<n>,"deltaY"?:<n>}',
@@ -825,6 +844,7 @@ const SHARED_SKILL_TEXT = [
   "  obs-herdr ui insert-line --note <path> (--line <n> | --after <text> | --heading <h>) [--at end|start] (--text <t> | --stdin)   # atomic anchor + insert inside UI lock; returns proof (path, pane, line, text, heading, durationMs)",
   "  obs-herdr ui wait <text> [--selector <css>] [--timeout <ms>]",
   "  obs-herdr ui click (--note <path> (--line <n> | --after <t> | --heading <h>) [--at start|end] | --selector <css> | --x <n> --y <n>) [--button left|right|middle] [--count <n>]",
+  "  obs-herdr ui select --selector <css> (--value <v> | --label <text>)",
   "  obs-herdr ui type [<text> | --text <t> | --stdin] [--note <path> (--line <n> | --after <t> | --heading <h>) [--at start|end] | --selector <css> | --x <n> --y <n>]",
   "  obs-herdr ui key <Key|Mod+Key>   # e.g. Enter, Escape, Mod+P, Mod+Shift+F",
   "  obs-herdr ui scroll (--note <path> ... | --selector <css> | --x <n> --y <n>) [--dy <n>] [--dx <n>]   # positive dy scrolls down",
@@ -905,6 +925,7 @@ const SHARED_COMMAND_HELP = {
       "  obs-herdr ui insert-line --note <path> (--line <n> | --after <text> | --heading <h>) [--at end|start] (--text <t> | --stdin)",
       "  obs-herdr ui wait <text> [--selector <css>] [--timeout <ms>]",
       "  obs-herdr ui click (--note <path> ... | --selector <css> | --x <n> --y <n>) [--button left|right|middle] [--count <n>]",
+      "  obs-herdr ui select --selector <css> (--value <v> | --label <text>)",
       "  obs-herdr ui type [<text> | --text <t> | --stdin] [--note <path> ... | --selector <css> | --x <n> --y <n>]",
       "  obs-herdr ui key <Key|Mod+Key>",
       "  obs-herdr ui scroll (--note <path> ... | --selector <css> | --x <n> --y <n>) [--dy <n>] [--dx <n>]",
@@ -951,6 +972,7 @@ const SHARED_COMMAND_HELP = {
     "ui insert-line": "Usage: obs-herdr ui insert-line --note <path> (--line <n> | --after <text> | --heading <h>) [--at end|start] (--text <t> | --stdin)\n\nAtomically resolves the anchor inside the serialized UI lock, places the caret, and inserts a newline plus text without list double-bullets. Returns proof (path, pane, line, text, heading, durationMs) so no separate read-back is needed.",
     "ui wait": "Usage: obs-herdr ui wait <text> [--selector <css>] [--timeout <ms>]\n\nWaits up to 20000 ms for visible text.",
     "ui click": "Usage: obs-herdr ui click (--note <path> (--line <n> | --after <t> | --heading <h>) [--at end|start] | --selector <css> | --x <n> --y <n>) [--button left|right|middle] [--count <n>]",
+    "ui select": "Usage: obs-herdr ui select --selector <css> (--value <v> | --label <text>)\n\nSelects an option in a <select> dropdown by value or label and dispatches input and change events.",
     "ui type": "Usage: obs-herdr ui type [<text> | --text <t> | --stdin] [--note <path> (--line <n> | --after <t> | --heading <h>) [--at end|start] | --selector <css> | --x <n> --y <n>]",
     "ui key": "Usage: obs-herdr ui key <Key|Mod+Key>\n\nExamples: Enter, End, Escape, Mod+P, Mod+Shift+F",
     "ui scroll": "Usage: obs-herdr ui scroll (--note <path> ... | --selector <css> | --x <n> --y <n>) [--dy <n>] [--dx <n>]\n\nPositive dy scrolls down; positive dx scrolls right.",
@@ -975,6 +997,7 @@ const SHARED_UI_ALLOWED_FLAGS: Record<string, string[]> = {
   "insert-line": ["note", "path", "line", "after", "heading", "at", "text", "stdin"],
   wait: ["selector", "timeout"],
   click: [...prefixUiTargetFlags(""), "button", "count"],
+  select: [...prefixUiTargetFlags(""), "value", "label"],
   type: [...prefixUiTargetFlags(""), "text", "stdin"],
   key: [],
   scroll: [...prefixUiTargetFlags(""), "dx", "dy"],
@@ -1892,6 +1915,12 @@ async function main() {
     result = await callBridge("ui.wait_for", { text: pos.join(" "), selector: flags.selector, timeoutMs: parseNonNegativeInt(flags.timeout, "timeout") });
   } else if (group === "ui" && sub === "click") {
     result = await callBridge("ui.click", { target: uiTarget(flags, ""), button: flags.button, count: parsePositiveInt(flags.count, "count") });
+  } else if (group === "ui" && sub === "select") {
+    result = await callBridge("ui.select", {
+      target: uiTarget(flags, ""),
+      ...(flags.value !== undefined ? { value: String(flags.value) } : {}),
+      ...(flags.label !== undefined ? { label: String(flags.label) } : {}),
+    });
   } else if (group === "ui" && sub === "type") {
     const typeText = flags.stdin ? readStdin() : (flags.text !== undefined ? String(flags.text) : pos.join(" "));
     result = await callBridge("ui.type", { text: typeText, target: uiTarget(flags, "") });
@@ -2726,6 +2755,13 @@ def main():
         res = call_bridge("ui.wait_for", {"text": " ".join(pos), "selector": flags.get("selector"), "timeoutMs": parse_non_negative_int(flags.get("timeout"), "timeout")})
     elif group == "ui" and sub == "click":
         res = call_bridge("ui.click", {"target": ui_target(flags, ""), "button": flags.get("button"), "count": parse_positive_int(flags.get("count"), "count")})
+    elif group == "ui" and sub == "select":
+        sel_params = {"target": ui_target(flags, "")}
+        if "value" in flags:
+            sel_params["value"] = str(flags["value"])
+        if "label" in flags:
+            sel_params["label"] = str(flags["label"])
+        res = call_bridge("ui.select", sel_params)
     elif group == "ui" and sub == "type":
         text_val = sys.stdin.read() if flags.get("stdin") else (str(flags["text"]) if "text" in flags else " ".join(pos))
         res = call_bridge("ui.type", {"text": text_val, "target": ui_target(flags, "")})

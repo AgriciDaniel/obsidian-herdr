@@ -729,6 +729,119 @@ export class UiControlService {
     return this.executeUiAction(() => this.clickNow(params, caller), true);
   }
 
+  select(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
+    return this.executeUiAction(() => this.selectNow(params, caller), false, true);
+  }
+
+  private async selectNow(
+    params: Record<string, unknown>,
+    caller: string
+  ): Promise<Record<string, unknown>> {
+    return this.timedAsync(async () => {
+      const hasValue = typeof params.value === "string";
+      const hasLabel = typeof params.label === "string";
+      if (!hasValue && !hasLabel) {
+        throw new UiControlError(
+          "invalid_params",
+          "ui.select requires 'value' or 'label'."
+        );
+      }
+      const targetParam =
+        params.target ??
+        (typeof params.selector === "string" && params.selector.trim()
+          ? { selector: params.selector.trim() }
+          : undefined);
+      const resolved = await this.resolveTargetAsync(targetParam);
+      const rawEl = resolved.element ?? resolved.containerEl ?? null;
+      if (!rawEl || rawEl.tagName.toLowerCase() !== "select") {
+        throw new UiControlError(
+          "invalid_params",
+          `ui.select target must be a <select> element (got ${rawEl ? `<${rawEl.tagName.toLowerCase()}>` : "none"}).`
+        );
+      }
+      this.assertElementNotProtected(rawEl, "select");
+      this.assertPointReceiverSafe(resolved.point, "select", this.expectedTargetContainer(resolved));
+
+      const selectEl = rawEl as HTMLSelectElement;
+      if (selectEl.disabled) {
+        throw new UiControlError("ui_target_disabled", "Target <select> element is disabled.");
+      }
+      const options: HTMLOptionElement[] = selectEl.options
+        ? Array.from(selectEl.options)
+        : Array.from(selectEl.querySelectorAll?.("option") ?? []);
+
+      const optionLabel = (opt: HTMLOptionElement): string =>
+        (opt.textContent ?? opt.label ?? "").trim();
+
+      let matched: HTMLOptionElement | undefined;
+      if (hasValue) {
+        const wanted = String(params.value);
+        matched = options.find((opt) => opt.value === wanted);
+      } else {
+        const wanted = String(params.label).trim();
+        matched =
+          options.find((opt) => optionLabel(opt) === wanted) ??
+          options.find((opt) => optionLabel(opt).toLowerCase() === wanted.toLowerCase());
+      }
+      if (!matched) {
+        const avail = options
+          .slice(0, 12)
+          .map((opt) => `${JSON.stringify(opt.value)} (${JSON.stringify(optionLabel(opt))})`)
+          .join(", ");
+        throw new UiControlError(
+          "ui_option_not_found",
+          `No matching <option> found for ${hasValue ? `value=${JSON.stringify(params.value)}` : `label=${JSON.stringify(params.label)}`}. Available: ${avail || "none"}.`
+        );
+      }
+      if (matched.disabled) {
+        throw new UiControlError(
+          "ui_option_disabled",
+          `Option ${JSON.stringify(matched.value)} is disabled.`
+        );
+      }
+
+      const docCtx = this.docContextForResolvedTarget(resolved);
+      this.showCursor(
+        caller,
+        "click",
+        resolved.point.x,
+        resolved.point.y,
+        "select",
+        params,
+        docCtx
+      );
+
+      const previousValue = selectEl.value;
+      selectEl.value = matched.value;
+      matched.selected = true;
+
+      const makeEvent = (type: string): Event => {
+        const EventCtor = (this.win as unknown as { Event?: typeof Event }).Event ?? Event;
+        return new EventCtor(type, { bubbles: true });
+      };
+      selectEl.dispatchEvent(makeEvent("input"));
+      selectEl.dispatchEvent(makeEvent("change"));
+
+      if (selectEl.value !== matched.value) {
+        throw new UiControlError(
+          "ui_effect_failed",
+          `Expected <select> value '${matched.value}', but element kept '${selectEl.value}'.`
+        );
+      }
+      await this.waitForCursorSettled(caller);
+
+      return {
+        selected: true,
+        value: selectEl.value,
+        label: optionLabel(matched),
+        previousValue,
+        changed: selectEl.value !== previousValue,
+        point: resolved.point,
+        selector: this.selectorPath(selectEl),
+      };
+    });
+  }
+
   private async dispatchResolvedClick(
     wc: WebContentsLike,
     resolved: ResolvedUiTarget,
@@ -2225,6 +2338,8 @@ export class UiControlService {
             const action = typeof step.action === "string" ? step.action : "";
             if (action === "click") {
               results.push(await this.clickNow(step, caller));
+            } else if (action === "select") {
+              results.push(await this.selectNow(step, caller));
             } else if (action === "hover") {
               results.push(await this.hoverNow(step, caller));
             } else if (action === "type") {

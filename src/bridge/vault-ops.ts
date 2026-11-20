@@ -116,6 +116,7 @@ const UI_OBSERVE_METHODS = new Set<string>(["ui.screenshot", "ui.inspect", "ui.w
 /** Operating the window can do anything a person can, so it needs Full plus the UI control setting. */
 const UI_INPUT_METHODS = new Set<string>([
   "ui.click",
+  "ui.select",
   "ui.type",
   "ui.press_key",
   "ui.scroll",
@@ -724,6 +725,9 @@ export class VaultOpsService {
     if (method === "ui.click") {
       result = await ui.click(params, caller);
       summary = "Clicked in the Obsidian window.";
+    } else if (method === "ui.select") {
+      result = await ui.select(params, caller);
+      summary = "Selected an option in the Obsidian window.";
     } else if (method === "ui.type") {
       result = await ui.type(params, caller);
       summary = `Typed ${asStr(params.text).length} characters in the Obsidian window.`;

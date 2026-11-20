@@ -579,4 +579,255 @@ describe("fix-coordinator: agyA review fixes (A1-A10)", () => {
     assert.ok(bridgeIdx >= 0, "expected stopVaultBridge() to be called");
     assert.ok(uiIdx < bridgeIdx, `expected uiControl.dispose() before stopVaultBridge(), got ${JSON.stringify(order)}`);
   });
+
+  it("C1: splitAndStartAgent waits for settled interactive_ready status, retries once on missed delivery, and errors if undelivered", async () => {
+    const makeAgent = (over: Partial<AgentInfo>): AgentInfo =>
+      ({
+        pane_id: "w1:p5",
+        name: "codex-c1",
+        agent: "codex",
+        agent_status: "unknown",
+        interactive_ready: false,
+        launch_pending: true,
+        focused: false,
+        ...over,
+      }) as AgentInfo;
+
+    // 1. Waits through unknown -> working -> done before sending prompt, then confirms in pane.
+    {
+      const timeline: string[] = [];
+      let polls = 0;
+      let paneText = "codex booting...";
+      const coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        sessionStartInFlight: null,
+        socketReachable: true,
+        snapshot: { workspaces: [{}], panes: [{}] },
+        vaultOps: { getVaultBasePath: () => "/v" },
+        app: { vault: { getName: () => "v" } },
+        ensureBridgeReady: async () => undefined,
+        waitForPaneShellReady: async () => undefined,
+        buildAgentSpawnArgs: () => [],
+        getBridgeEnv: () => ({}),
+        refreshAll: async () => undefined,
+        getActiveSessionName: () => "vault",
+        promptSettlePollMs: 10,
+        promptConfirmPollMs: 10,
+        promptConfirmTimeoutMs: 60,
+        socket: {
+          getSocketPath: () => "/sock",
+          splitPane: async () => ({ pane_id: "w1:p5" }),
+          startAgent: async () => {
+            timeline.push("start:unknown");
+            return makeAgent({ agent_status: "unknown", interactive_ready: false });
+          },
+          listAgents: async () => {
+            polls += 1;
+            if (polls === 1) {
+              timeline.push("poll:working");
+              return [makeAgent({ agent_status: "working", interactive_ready: true, launch_pending: false })];
+            }
+            timeline.push("poll:done");
+            return [makeAgent({ agent_status: "done", interactive_ready: true, launch_pending: false })];
+          },
+          promptAgent: async (_t: string, text: string) => {
+            timeline.push(`prompt:${text}`);
+            paneText = `codex> ${text}`;
+          },
+          readPane: async () => paneText,
+        },
+      });
+
+      await coord.splitAndStartAgent({
+        agentName: "codex-c1",
+        agentKind: "codex",
+        direction: "right",
+        initialPrompt: "PING-OK",
+      });
+      assert.deepEqual(
+        timeline,
+        ["start:unknown", "poll:working", "poll:done", "prompt:PING-OK"],
+        "must wait for settled status (idle/done) before sending initialPrompt"
+      );
+    }
+
+    // 2. Retries once when first prompt does not appear in pane, and succeeds when retry appears.
+    {
+      let promptCount = 0;
+      let paneText = "codex> ";
+      const coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        sessionStartInFlight: null,
+        socketReachable: true,
+        snapshot: { workspaces: [{}], panes: [{}] },
+        vaultOps: { getVaultBasePath: () => "/v" },
+        app: { vault: { getName: () => "v" } },
+        ensureBridgeReady: async () => undefined,
+        waitForPaneShellReady: async () => undefined,
+        buildAgentSpawnArgs: () => [],
+        getBridgeEnv: () => ({}),
+        refreshAll: async () => undefined,
+        getActiveSessionName: () => "vault",
+        promptSettlePollMs: 10,
+        promptConfirmPollMs: 10,
+        promptConfirmTimeoutMs: 50,
+        socket: {
+          getSocketPath: () => "/sock",
+          splitPane: async () => ({ pane_id: "w1:p5" }),
+          startAgent: async () => makeAgent({ agent_status: "idle", interactive_ready: true, launch_pending: false }),
+          listAgents: async () => [makeAgent({ agent_status: "idle", interactive_ready: true, launch_pending: false })],
+          promptAgent: async (_t: string, text: string) => {
+            promptCount += 1;
+            if (promptCount === 2) {
+              paneText = `codex> ${text}`;
+            }
+          },
+          readPane: async () => paneText,
+        },
+      });
+
+      await coord.splitAndStartAgent({
+        agentName: "codex-c1",
+        agentKind: "codex",
+        direction: "right",
+        initialPrompt: "RETRY-TOKEN-42",
+      });
+      assert.equal(promptCount, 2, "must retry promptAgent once when first delivery is not seen in pane");
+    }
+
+    // 3. Throws clear error when prompt never appears in pane even after retry.
+    {
+      let promptCount = 0;
+      const coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        sessionStartInFlight: null,
+        socketReachable: true,
+        snapshot: { workspaces: [{}], panes: [{}] },
+        vaultOps: { getVaultBasePath: () => "/v" },
+        app: { vault: { getName: () => "v" } },
+        ensureBridgeReady: async () => undefined,
+        waitForPaneShellReady: async () => undefined,
+        buildAgentSpawnArgs: () => [],
+        getBridgeEnv: () => ({}),
+        refreshAll: async () => undefined,
+        getActiveSessionName: () => "vault",
+        promptSettlePollMs: 10,
+        promptConfirmPollMs: 10,
+        promptConfirmTimeoutMs: 50,
+        socket: {
+          getSocketPath: () => "/sock",
+          splitPane: async () => ({ pane_id: "w1:p5" }),
+          startAgent: async () => makeAgent({ agent_status: "done", interactive_ready: true, launch_pending: false }),
+          listAgents: async () => [makeAgent({ agent_status: "done", interactive_ready: true, launch_pending: false })],
+          promptAgent: async () => {
+            promptCount += 1;
+          },
+          readPane: async () => "codex> (composer stayed empty)",
+        },
+      });
+
+      await assert.rejects(
+        coord.splitAndStartAgent({
+          agentName: "codex-c1",
+          agentKind: "codex",
+          direction: "right",
+          initialPrompt: "NEVER-LANDED",
+        }),
+        /not delivered/i
+      );
+      assert.equal(promptCount, 2, "must attempt initial send plus one retry before throwing");
+    }
+
+    // 4. Multi-line prompt collapsed to '[Pasted text #1 +3 lines]' and status -> working sends exactly once.
+    {
+      let promptCount = 0;
+      let status: AgentInfo["agent_status"] = "idle";
+      let paneText = "claude> ";
+      const coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        sessionStartInFlight: null,
+        socketReachable: true,
+        snapshot: { workspaces: [{}], panes: [{}] },
+        vaultOps: { getVaultBasePath: () => "/v" },
+        app: { vault: { getName: () => "v" } },
+        ensureBridgeReady: async () => undefined,
+        waitForPaneShellReady: async () => undefined,
+        buildAgentSpawnArgs: () => [],
+        getBridgeEnv: () => ({}),
+        refreshAll: async () => undefined,
+        getActiveSessionName: () => "vault",
+        promptSettlePollMs: 10,
+        promptConfirmPollMs: 10,
+        promptConfirmTimeoutMs: 60,
+        socket: {
+          getSocketPath: () => "/sock",
+          splitPane: async () => ({ pane_id: "w1:p5" }),
+          startAgent: async () => makeAgent({ name: "claude-c1", agent: "claude", agent_status: "idle", interactive_ready: true, launch_pending: false }),
+          listAgents: async () => [makeAgent({ name: "claude-c1", agent: "claude", agent_status: status, interactive_ready: true, launch_pending: false })],
+          promptAgent: async () => {
+            promptCount += 1;
+            paneText = "claude> [Pasted text #1 +3 lines]";
+            status = "working";
+          },
+          readPane: async () => paneText,
+        },
+      });
+
+      await coord.splitAndStartAgent({
+        agentName: "claude-c1",
+        agentKind: "claude",
+        direction: "right",
+        initialPrompt: "Line 1\nLine 2\nLine 3\nLine 4",
+      });
+      assert.equal(promptCount, 1, "collapsed pasted prompt with working status must send exactly once");
+    }
+
+    // 5. Prompt that never shows in pane and status stays idle retries once then errors.
+    {
+      let promptCount = 0;
+      const coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        sessionStartInFlight: null,
+        socketReachable: true,
+        snapshot: { workspaces: [{}], panes: [{}] },
+        vaultOps: { getVaultBasePath: () => "/v" },
+        app: { vault: { getName: () => "v" } },
+        ensureBridgeReady: async () => undefined,
+        waitForPaneShellReady: async () => undefined,
+        buildAgentSpawnArgs: () => [],
+        getBridgeEnv: () => ({}),
+        refreshAll: async () => undefined,
+        getActiveSessionName: () => "vault",
+        promptSettlePollMs: 10,
+        promptConfirmPollMs: 10,
+        promptConfirmTimeoutMs: 50,
+        socket: {
+          getSocketPath: () => "/sock",
+          splitPane: async () => ({ pane_id: "w1:p5" }),
+          startAgent: async () => makeAgent({ name: "claude-idle", agent: "claude", agent_status: "idle", interactive_ready: true, launch_pending: false }),
+          listAgents: async () => [makeAgent({ name: "claude-idle", agent: "claude", agent_status: "idle", interactive_ready: true, launch_pending: false })],
+          promptAgent: async () => {
+            promptCount += 1;
+          },
+          readPane: async () => "claude> ",
+        },
+      });
+
+      await assert.rejects(
+        coord.splitAndStartAgent({
+          agentName: "claude-idle",
+          agentKind: "claude",
+          direction: "right",
+          initialPrompt: "Still never delivered",
+        }),
+        /not delivered/i
+      );
+      assert.equal(promptCount, 2, "undelivered prompt with idle status must retry once then throw");
+    }
+  });
 });

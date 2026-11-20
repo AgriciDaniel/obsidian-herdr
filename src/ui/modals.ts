@@ -120,7 +120,7 @@ export class SpawnAgentModal extends Modal {
     new Setting(contentEl)
       .setName("Attach live vault MCP tools")
       .setDesc(
-        "Auto-register the 24-tool vault stdio MCP server when launching Codex or Claude Code."
+        "Auto-register the vault MCP tools when launching an agent that supports them (Codex, Claude Code)."
       )
       .addToggle((tog) =>
         tog.setValue(this.attachVaultMcp).onChange((val) => {

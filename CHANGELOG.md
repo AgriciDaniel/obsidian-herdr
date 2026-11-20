@@ -14,6 +14,8 @@ Reliability fixes from a full code and live review. The aim: agents keep working
 - New panes from saved layouts get the vault command on PATH too. The Herdr agent and remote terminal profiles fall back to a shell when Herdr is missing, and the terminal says so when full-screen apps cannot work because Python 3 is missing.
 - While a new agent waits at a question, the Spawn window can be cancelled; the initial prompt is then not sent.
 - One failing view no longer stops the others from updating, and UI control stops cleanly when the plugin unloads.
+- The initial prompt typed in the Spawn window is sent only once the agent has settled and is ready for input, and the plugin checks it arrived (its text, a pasted-text marker, or the agent starting work), sending once more at most. Before, a prompt sent while Codex was still starting could be lost.
+- New `obs-herdr ui select` (and a `select` batch step) chooses an option in a dropdown by value or label, with the same protections as a click. The MCP server now has 26 tools.
 - Smaller: the note graph and backlinks skip `node_modules`, `.git` and the settings folder; `ui inspect` marks protected elements such as window controls and lists them last; the MCP server reports the real plugin version.
 
 ## 0.3.1 (2026-11-19)

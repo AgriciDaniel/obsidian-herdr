@@ -101,6 +101,10 @@ export class HerdrCoordinator {
   private readonly notePaneIds = new WeakMap<MarkdownView, string>();
   private notePaneSeq = 0;
   private disposed = false;
+  private promptSettleTimeoutMs = 45000;
+  private promptSettlePollMs = 400;
+  private promptConfirmTimeoutMs = 3000;
+  private promptConfirmPollMs = 250;
 
   constructor(options: {
     app: App;
@@ -736,31 +740,229 @@ export class HerdrCoordinator {
     }
 
     if (options.initialPrompt && options.initialPrompt.trim()) {
-      // An agent waiting at a question (Claude Code's first-run folder trust check, where Enter
-      // picks "No, exit") must not get the prompt: its Enter would answer the question.
-      const ready = await this.waitWhileBlocked(agent, bound, options.signal);
-      if (options.signal?.aborted) {
+      const trimmedPrompt = options.initialPrompt.trim();
+      // Wait for both blocked-question resolution and a settled interactive_ready status
+      // (idle or done, never unknown or working) before sending the initial prompt.
+      const settle = await this.waitForAgentSettledForPrompt(agent, bound, options.signal);
+      if (settle === "cancelled" || options.signal?.aborted) {
         await this.refreshAll(false);
         throw new Error(
           `Started '${options.agentName}', but waiting for it was cancelled, so the initial prompt was not sent.`
         );
       }
-      if (this.disposed || this.sessionBinding() !== bound) {
+      if (settle === "session_changed" || this.disposed || this.sessionBinding() !== bound) {
         throw new Error(
           `Started '${options.agentName}', but the Herdr session changed meanwhile, so the initial prompt was not sent. Switch back to that session and send the prompt.`
         );
       }
-      if (!ready) {
+      if (settle === "blocked") {
         await this.refreshAll(false);
         throw new Error(
           `Started '${options.agentName}', but it was waiting at a question (for example Claude Code's folder trust check), so the initial prompt was not sent. Answer it in the agent's terminal, then send the prompt.`
         );
       }
-      await this.socket.promptAgent(options.agentName, options.initialPrompt.trim());
+      if (settle === "exited") {
+        await this.refreshAll(false);
+        throw new Error(
+          `Started '${options.agentName}', but it exited before becoming ready, so the initial prompt was not sent.`
+        );
+      }
+      if (settle === "timeout") {
+        await this.refreshAll(false);
+        throw new Error(
+          `Started '${options.agentName}', but it did not settle into an interactive ready state in time, so the initial prompt was not sent. Send the prompt manually in its terminal.`
+        );
+      }
+
+      const beforePastedCount = await this.countPanePastedMarkers(pane.pane_id);
+      await this.socket.promptAgent(options.agentName, trimmedPrompt);
+      let delivered = await this.waitForPromptDelivery(
+        agent,
+        trimmedPrompt,
+        beforePastedCount,
+        bound,
+        options.signal
+      );
+      if (!delivered && !options.signal?.aborted && !this.disposed && this.sessionBinding() === bound) {
+        const retryPastedCount = await this.countPanePastedMarkers(pane.pane_id);
+        await this.socket.promptAgent(options.agentName, trimmedPrompt);
+        delivered = await this.waitForPromptDelivery(
+          agent,
+          trimmedPrompt,
+          retryPastedCount,
+          bound,
+          options.signal
+        );
+      }
+      if (!delivered) {
+        if (options.signal?.aborted) {
+          await this.refreshAll(false);
+          throw new Error(
+            `Started '${options.agentName}', but waiting for prompt delivery was cancelled.`
+          );
+        }
+        if (this.disposed || this.sessionBinding() !== bound) {
+          throw new Error(
+            `Started '${options.agentName}', but the Herdr session changed while confirming the initial prompt.`
+          );
+        }
+        await this.refreshAll(false);
+        throw new Error(
+          `Started '${options.agentName}', but the initial prompt was not delivered to pane '${pane.pane_id}' after retrying. Send the prompt manually in its terminal.`
+        );
+      }
     }
 
     await this.refreshAll(false);
     return agent;
+  }
+
+  private isAgentSettledForPrompt(agent: AgentInfo): boolean {
+    return (
+      Boolean(agent.interactive_ready) &&
+      (agent.agent_status === "idle" || agent.agent_status === "done")
+    );
+  }
+
+  private async waitForAgentSettledForPrompt(
+    agent: AgentInfo,
+    bound: string,
+    signal?: AbortSignal
+  ): Promise<"ready" | "cancelled" | "session_changed" | "blocked" | "exited" | "timeout"> {
+    if (signal?.aborted) {
+      return "cancelled";
+    }
+    if (this.disposed || this.sessionBinding() !== bound) {
+      return "session_changed";
+    }
+    if (agent.agent_status === "blocked") {
+      const unblocked = await this.waitWhileBlocked(agent, bound, signal);
+      if (signal?.aborted) {
+        return "cancelled";
+      }
+      if (this.disposed || this.sessionBinding() !== bound) {
+        return "session_changed";
+      }
+      if (!unblocked) {
+        return "blocked";
+      }
+    } else if (this.isAgentSettledForPrompt(agent)) {
+      return "ready";
+    }
+
+    const deadline = Date.now() + (this.promptSettleTimeoutMs || 45000);
+    const pollMs = this.promptSettlePollMs || 400;
+    while (Date.now() < deadline && !this.disposed && !signal?.aborted) {
+      let now: AgentInfo | undefined;
+      try {
+        now = (await this.socket.listAgents()).find(
+          (a) => a.pane_id === agent.pane_id && a.name === agent.name
+        );
+      } catch {
+        await this.waitPollDelay(pollMs, signal);
+        continue;
+      }
+      if (signal?.aborted) {
+        return "cancelled";
+      }
+      if (this.disposed || this.sessionBinding() !== bound) {
+        return "session_changed";
+      }
+      if (!now) {
+        return "exited";
+      }
+      if (now.agent_status === "blocked") {
+        const unblocked = await this.waitWhileBlocked(now, bound, signal);
+        if (signal?.aborted) {
+          return "cancelled";
+        }
+        if (this.disposed || this.sessionBinding() !== bound) {
+          return "session_changed";
+        }
+        if (!unblocked) {
+          return "blocked";
+        }
+        continue;
+      }
+      if (this.isAgentSettledForPrompt(now)) {
+        return "ready";
+      }
+      await this.waitPollDelay(pollMs, signal);
+    }
+
+    if (signal?.aborted) {
+      return "cancelled";
+    }
+    if (this.disposed || this.sessionBinding() !== bound) {
+      return "session_changed";
+    }
+    return "timeout";
+  }
+
+  private promptAppearsInPane(paneText: string, prompt: string): boolean {
+    const firstLine = prompt
+      .split(/\r?\n/)
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .find((line) => line.length > 0);
+    if (!firstLine) {
+      return true;
+    }
+    const probe = firstLine.slice(0, 48);
+    return paneText.replace(/\s+/g, " ").includes(probe);
+  }
+
+  private async countPanePastedMarkers(paneId: string): Promise<number> {
+    if (typeof this.socket.readPane !== "function") {
+      return 0;
+    }
+    try {
+      const text = await this.socket.readPane(paneId, "recent_unwrapped", 80);
+      return (text.match(/\[Pasted text\b/g) || []).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async waitForPromptDelivery(
+    agent: AgentInfo,
+    prompt: string,
+    baselinePastedCount: number,
+    bound: string,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    if (typeof this.socket.readPane !== "function") {
+      return true;
+    }
+    const deadline = Date.now() + (this.promptConfirmTimeoutMs || 3000);
+    const pollMs = this.promptConfirmPollMs || 250;
+    while (Date.now() < deadline && !this.disposed && !signal?.aborted) {
+      if (this.sessionBinding() !== bound) {
+        return false;
+      }
+      try {
+        const text = await this.socket.readPane(agent.pane_id, "recent_unwrapped", 80);
+        const pastedCount = (text.match(/\[Pasted text\b/g) || []).length;
+        if (this.promptAppearsInPane(text, prompt) || pastedCount > baselinePastedCount) {
+          return true;
+        }
+      } catch {
+        // Ignore transient pane read error while confirming delivery
+      }
+      if (typeof this.socket.listAgents === "function") {
+        try {
+          const now = (await this.socket.listAgents()).find(
+            (a) => a.pane_id === agent.pane_id && a.name === agent.name
+          );
+          if (now?.agent_status === "working") {
+            return true;
+          }
+        } catch {
+          // Ignore transient status poll error while confirming delivery
+        }
+      }
+      await this.waitPollDelay(pollMs, signal);
+    }
+    return false;
   }
 
   /**

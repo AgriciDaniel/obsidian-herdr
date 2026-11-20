@@ -483,7 +483,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(mcpResponses.length, 3);
       const toolsList = (mcpResponses[1].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(toolsList.length, 25, "Node MCP server should expose all 25 tools");
+      assert.equal(toolsList.length, 26, "Node MCP server should expose all 26 tools");
       assert.ok(toolsList.some((t) => t.name === "obsidian_read_note"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_patch_frontmatter"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_backlinks"));
@@ -565,7 +565,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(pyMcpResponses.length, 2);
       const pyTools = (pyMcpResponses[0].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(pyTools.length, 25, "Python MCP server must expose all 25 tools");
+      assert.equal(pyTools.length, 26, "Python MCP server must expose all 26 tools");
 
       // 6. Verify concurrent multi-agent vault & canvas writes preserve all updates
       await Promise.all([
@@ -831,7 +831,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         useNativeInsertLine = false;
 
         const mainHelp = await execFileAsync(cmd, [...baseArgs, "--help"], { env });
-        assert.ok(mainHelp.stdout.includes("25 tools"), `${cmd} --help derives 25 tools`);
+        assert.ok(mainHelp.stdout.includes("26 tools"), `${cmd} --help derives 26 tools`);
         assert.ok(mainHelp.stdout.includes("press_key") && mainHelp.stdout.includes("insert_line"), `${cmd} --help includes ui batch schema with insert_line`);
         assert.ok(
           mainHelp.stdout.includes("obs-herdr ui insert-line") &&
@@ -1190,7 +1190,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       }
 
       const readme = fs.readFileSync(path.resolve("README.md"), "utf8");
-      assert.ok(readme.includes("obs-herdr mcp   # stdio MCP server, 25 tools"), "README.md must list 25 MCP tools");
+      assert.ok(readme.includes("obs-herdr mcp   # stdio MCP server, 26 tools"), "README.md must list 26 MCP tools");
       assert.ok(!readme.includes("24 tools"), "README.md must not contain stale 24 tools count");
       assert.ok(readme.includes("allowUiInProtectedAreas") || readme.includes("protected areas"), "README.md must document protected-area limits");
       assert.ok(readme.includes("uiTypingSpeed") || readme.includes("Visible") && readme.includes("Fast"), "README.md must document typing speed setting");
