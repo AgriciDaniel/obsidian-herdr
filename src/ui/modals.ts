@@ -6,6 +6,89 @@ import type {
 } from "../domain/types";
 import type { HerdrCoordinator } from "../services/herdr-coordinator";
 
+export interface ConfirmActionOptions {
+  title: string;
+  body: string;
+  confirmText: string;
+  danger?: boolean;
+}
+
+class ConfirmActionModal extends Modal {
+  private readonly opts: ConfirmActionOptions;
+  private readonly resolve: (confirmed: boolean) => void;
+  private settled = false;
+
+  constructor(
+    app: App,
+    opts: ConfirmActionOptions,
+    resolve: (confirmed: boolean) => void
+  ) {
+    super(app);
+    this.opts = opts;
+    this.resolve = resolve;
+  }
+
+  private settle(confirmed: boolean): void {
+    if (this.settled) {
+      return;
+    }
+    this.settled = true;
+    this.resolve(confirmed);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("herdr-modal", "herdr-confirm-modal");
+
+    new Setting(contentEl).setName(this.opts.title).setHeading();
+    contentEl.createEl("p", {
+      cls: "herdr-confirm-body",
+      text: this.opts.body,
+    });
+
+    this.scope?.register([], "Escape", () => {
+      this.settle(false);
+      this.close();
+      return false;
+    });
+
+    new Setting(contentEl)
+      .addButton((btn) =>
+        btn.setButtonText("Cancel").onClick(() => {
+          this.settle(false);
+          this.close();
+        })
+      )
+      .addButton((btn) => {
+        btn.setButtonText(this.opts.confirmText);
+        if (this.opts.danger) {
+          btn.setClass("mod-warning");
+        } else {
+          btn.setCta();
+        }
+        btn.onClick(() => {
+          this.settle(true);
+          this.close();
+        });
+      });
+  }
+
+  onClose(): void {
+    this.settle(false);
+    this.contentEl.empty();
+  }
+}
+
+export function confirmAction(
+  app: App,
+  opts: ConfirmActionOptions
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    new ConfirmActionModal(app, opts, resolve).open();
+  });
+}
+
 export class SpawnAgentModal extends Modal {
   private readonly coordinator: HerdrCoordinator;
   private readonly onSpawned?: () => void;

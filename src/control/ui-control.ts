@@ -63,7 +63,7 @@ const MAX_TYPING_CHUNKS = 40;
 const TYPING_BUDGET_PER_100_CHARS_MS = 1400;
 const CARET_SCROLL_MARGIN_LINES = 3;
 const DEFAULT_LINE_HEIGHT_PX = 22;
-const MODAL_SELECTOR = '.modal-container, .modal, .prompt, [role="dialog"]';
+const MODAL_SELECTOR = '.modal-container, .modal, .prompt, .menu, [role="dialog"], [role="menu"]';
 const HERDR_TERMINAL_PROTECTED_SELECTOR =
   '.herdr-terminal-pane, [data-type="herdr-terminal-view"], .herdr-terminal-host, .xterm, .xterm-helper-textarea';
 const COMMUNITY_PLUGIN_PROTECTED_SELECTOR =
@@ -1905,6 +1905,78 @@ export class UiControlService {
     return Boolean(fn.call(winWithApp.app?.commands, commandId));
   }
 
+  private dismissRemainingMenusOnEscape(): void {
+    const visibleMenus = () =>
+      this.queryAll('.menu, [role="menu"]').filter((el) => this.isVisible(el));
+    let menus = visibleMenus();
+    if (menus.length === 0) {
+      return;
+    }
+    const winRec = this.win as unknown as {
+      KeyboardEvent?: new (type: string, init?: Record<string, unknown>) => Event;
+      MouseEvent?: new (type: string, init?: Record<string, unknown>) => Event;
+      PointerEvent?: new (type: string, init?: Record<string, unknown>) => Event;
+    };
+    const makeEsc = (): Event => {
+      const init = {
+        key: "Escape",
+        code: "Escape",
+        keyCode: 27,
+        which: 27,
+        bubbles: true,
+        cancelable: true,
+      };
+      if (typeof winRec.KeyboardEvent === "function") {
+        return new winRec.KeyboardEvent("keydown", init);
+      }
+      return { type: "keydown", ...init } as unknown as Event;
+    };
+    const topMenu = menus[menus.length - 1];
+    try {
+      topMenu.dispatchEvent?.(makeEsc());
+    } catch {
+      // Ignore synthetic dispatch error
+    }
+    menus = visibleMenus();
+    if (menus.length === 0) {
+      return;
+    }
+    const doc = this.win.document as unknown as {
+      dispatchEvent?: (ev: Event) => boolean;
+      body?: Element | null;
+    };
+    try {
+      doc.dispatchEvent?.(makeEsc());
+    } catch {
+      // Ignore synthetic dispatch error
+    }
+    menus = visibleMenus();
+    if (menus.length === 0) {
+      return;
+    }
+    const body = doc.body;
+    if (body && typeof body.dispatchEvent === "function") {
+      const makeMouse = (type: string): Event => {
+        const Ctor =
+          type === "pointerdown" && typeof winRec.PointerEvent === "function"
+            ? winRec.PointerEvent
+            : typeof winRec.MouseEvent === "function"
+              ? winRec.MouseEvent
+              : null;
+        if (Ctor) {
+          return new Ctor(type, { bubbles: true, cancelable: true, clientX: 0, clientY: 0 });
+        }
+        return { type, bubbles: true, cancelable: true, clientX: 0, clientY: 0 } as unknown as Event;
+      };
+      try {
+        body.dispatchEvent(makeMouse("pointerdown"));
+        body.dispatchEvent(makeMouse("mousedown"));
+      } catch {
+        // Ignore outside-click dismiss error
+      }
+    }
+  }
+
   private isAppQuitShortcut(keyCode: string, modifiers: readonly string[]): boolean {
     if (keyCode === "Q") {
       return (modifiers.includes("control") || modifiers.includes("meta")) && !modifiers.includes("alt");
@@ -1969,6 +2041,10 @@ export class UiControlService {
           const beforeCtx = this.buildDocContext();
           this.showCursor(caller, "move", pt.x, pt.y, combo || "key", params, beforeCtx);
           let executedCommandId: string | null = null;
+          const isPlainEscape = press.keyCode === "Escape" && press.modifiers.length === 0;
+          const openMenusBefore = isPlainEscape
+            ? this.queryAll('.menu, [role="menu"]').filter((el) => this.isVisible(el))
+            : [];
           const keyLedgerEntries: ExpectedAgentEvent[] = [];
           try {
             if (acceleratorCommandId && this.executeObsidianCommandById(acceleratorCommandId)) {
@@ -2004,6 +2080,9 @@ export class UiControlService {
             const settleMs = this.actionDelayMs(80, 10);
             if (settleMs > 0) {
               await this.sleep(settleMs);
+            }
+            if (openMenusBefore.length > 0) {
+              this.dismissRemainingMenusOnEscape();
             }
           } finally {
             for (const entry of keyLedgerEntries) {

@@ -251,24 +251,24 @@ export class HerdrSettingTab extends PluginSettingTab {
         heading: "Vault Control Bridge and notifications",
         items: [
           {
-            name: "Enable local Vault Control Bridge",
-            desc: "Start a mode-0600 authenticated local socket and inject obs-herdr into panes.",
+            name: "Enable vault access for agents",
+            desc: "Let Herdr panes and coding agents access this vault through obs-herdr.",
             control: {
               type: "toggle",
               key: "vaultBridgeEnabled",
             },
           },
           {
-            name: "Vault permission tier",
-            desc: "Controls whether agents can only inspect notes, mutate notes via safe APIs, or invoke non-restricted commands.",
+            name: "Vault access level",
+            desc: "Off blocks vault access. Read only allows reading and searching. Edit notes allows creating, editing, renaming, and trashing notes. Full control adds Obsidian commands and window control.",
             control: {
               type: "dropdown",
               key: "vaultPermissionMode",
               options: {
-                "read-only": "Read-only (inspect and search)",
-                "read-write": "Read-write (atomic note, frontmatter, and link-safe rename)",
-                full: "Full (adds allowed workspace commands)",
-                off: "Disabled",
+                off: "Off: agents cannot access vault notes",
+                "read-only": "Read only: agents can read and search notes",
+                "read-write": "Edit notes: agents can create, edit, rename, and trash notes",
+                full: "Full control: adds Obsidian commands and window control",
               },
             },
           },

@@ -1144,4 +1144,263 @@ describe("fix-coordinator: agyA review fixes (A1-A10)", () => {
     assert.equal(helper!("claude", preSend), preSend.message);
     assert.equal(helper!("claude", postSend), postSend.message);
   });
+
+  it("MC: redesigned HerdrDashboardView renders 3 tabs, layout map, attention banner, Vault Edits filter, Doctor sessions, and confirms Stop session", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-mc-dom-"));
+    try {
+      const stubPath = path.join(tmpDir, "obsidian-mc-stub.cjs");
+      fs.writeFileSync(
+        stubPath,
+        `
+const makeEl = (tag, opts = {}) => {
+  const classes = new Set((opts.cls || "").split(/\\s+/).filter(Boolean));
+  const attrs = { ...(opts.attr || {}) };
+  const listeners = {};
+  const el = {
+    tagName: tag.toUpperCase(),
+    textContent: opts.text || "",
+    value: "",
+    disabled: false,
+    style: {},
+    children: [],
+    classList: { contains: (c) => classes.has(c) },
+    get className() { return [...classes].join(" "); },
+    addClass: (...cs) => cs.forEach((c) => c.split(/\\s+/).filter(Boolean).forEach((x) => classes.add(x))),
+    removeClass: (...cs) => cs.forEach((c) => classes.delete(c)),
+    setText: (t) => { el.textContent = String(t); },
+    setAttr: (k, v) => { attrs[k] = String(v); },
+    getAttr: (k) => attrs[k],
+    empty: () => { el.children.length = 0; el.textContent = ""; },
+    createDiv: (o) => { const c = makeEl("div", o); el.children.push(c); return c; },
+    createSpan: (o) => { const c = makeEl("span", o); el.children.push(c); return c; },
+    createEl: (t, o) => { const c = makeEl(t, o); el.children.push(c); return c; },
+    addEventListener: (ev, fn) => { (listeners[ev] ||= []).push(fn); },
+    click: () => { for (const fn of (listeners.click || [])) fn({}); },
+  };
+  return el;
+};
+class Menu {
+  constructor() { this.items = []; (globalThis.__mcMenus ||= []).push(this); }
+  addItem(fn) {
+    const item = {
+      title: "", icon: "", disabled: false, warning: false, handler: null,
+      setTitle(t) { this.title = t; return this; },
+      setIcon(i) { this.icon = i; return this; },
+      setDisabled(d) { this.disabled = Boolean(d); return this; },
+      setWarning(w) { this.warning = Boolean(w); return this; },
+      onClick(h) { this.handler = h; return this; },
+    };
+    fn(item);
+    this.items.push(item);
+    return this;
+  }
+  addSeparator() { this.items.push({ sep: true }); return this; }
+  showAtMouseEvent() {}
+}
+class ItemView {
+  constructor(leaf) { this.leaf = leaf; this.app = leaf.app; this.contentEl = makeEl("div"); }
+  async setState() {}
+}
+class Modal {
+  constructor(app) { this.app = app; this.contentEl = makeEl("div"); this.scope = { register: () => {} }; }
+  open() { this.onOpen && this.onOpen(); }
+  close() { this.onClose && this.onClose(); }
+}
+class Setting {
+  constructor(el) { this.el = el; this.buttons = []; }
+  setName() { return this; }
+  setHeading() { return this; }
+  setDesc() { return this; }
+  setClass() { return this; }
+  addText(fn) { fn({ inputEl: {}, setValue: () => ({ onChange: () => {} }), setPlaceholder: () => ({ setValue: () => ({ onChange: () => {} }) }) }); return this; }
+  addTextArea(fn) { fn({ inputEl: {}, setValue: () => ({ onChange: () => {} }), setPlaceholder: () => ({ setValue: () => ({ onChange: () => {} }) }) }); return this; }
+  addDropdown(fn) { const d = { addOption: () => d, setValue: () => d, onChange: () => d }; fn(d); return this; }
+  addToggle(fn) { fn({ setValue: () => ({ onChange: () => {} }) }); return this; }
+  addButton(fn) {
+    const btn = { buttonEl: makeEl("button"), text: "", handler: null, setButtonText(t) { this.text = t; return this; }, setCta() { return this; }, setWarning() { return this; }, onClick(h) { this.handler = h; return this; } };
+    fn(btn);
+    this.buttons.push(btn);
+    return this;
+  }
+}
+class Notice { constructor(msg) { this.msg = msg; } }
+class TFile {}
+module.exports = { ItemView, Menu, Modal, Setting, Notice, TFile, setIcon: () => {}, __makeEl: makeEl };
+`,
+        "utf8"
+      );
+
+      const runnerScript = `
+const esbuild = require("esbuild");
+esbuild.buildSync({
+  entryPoints: [${JSON.stringify(path.resolve("src/ui/dashboard-view.ts"))}],
+  bundle: true,
+  format: "cjs",
+  platform: "node",
+  target: "es2022",
+  outfile: ${JSON.stringify(path.join(tmpDir, "dash.cjs"))},
+  alias: { obsidian: ${JSON.stringify(stubPath)} },
+  external: ["node:*", "electron"],
+});
+const stub = require(${JSON.stringify(stubPath)});
+const { HerdrDashboardView } = require(${JSON.stringify(path.join(tmpDir, "dash.cjs"))});
+
+const findAll = (node, pred, out = []) => {
+  if (pred(node)) out.push(node);
+  for (const c of (node.children || [])) findAll(c, pred, out);
+  return out;
+};
+
+let stopCalls = 0;
+const state = {
+  binaryPath: "/usr/bin/herdr",
+  activeSessionName: "vault-test",
+  socketPath: "/tmp/herdr.sock",
+  serverRunning: true,
+  socketSubscribed: true,
+  usingOfflinePreview: false,
+  protocolWarning: "Protocol mismatch test",
+  snapshot: {
+    version: "0.8.2",
+    protocol: 20,
+    focused_workspace_id: "w1",
+    focused_tab_id: "w1:t1",
+    focused_pane_id: "w1:p1",
+    workspaces: [{ workspace_id: "w1", number: 1, label: "Vault", focused: true, pane_count: 2, tab_count: 1, active_tab_id: "w1:t1", agent_status: "blocked" }],
+    tabs: [{ tab_id: "w1:t1", workspace_id: "w1", number: 1, label: "Main", focused: true, pane_count: 2, agent_status: "blocked" }],
+    panes: [
+      { pane_id: "w1:p1", tab_id: "w1:t1", label: "agyA", focused: true, agent_status: "working", revision: 1 },
+      { pane_id: "w1:p2", tab_id: "w1:t1", label: "agyB", focused: false, agent_status: "blocked", revision: 1 },
+    ],
+    layouts: [{
+      workspace_id: "w1", tab_id: "w1:t1", zoomed: false, focused_pane_id: "w1:p1",
+      area: { x: 0, y: 0, width: 100, height: 100 },
+      panes: [
+        { pane_id: "w1:p1", focused: true, rect: { x: 0, y: 0, width: 50, height: 100 } },
+        { pane_id: "w1:p2", focused: false, rect: { x: 50, y: 0, width: 50, height: 100 } },
+      ],
+      splits: [],
+    }],
+    agents: [
+      { pane_id: "w1:p1", name: "agy-1", agent: "agy", agent_status: "working", interactive_ready: true, launch_pending: false, focused: true, revision: 1, state_change_seq: 1 },
+      { pane_id: "w1:p2", name: "agy-2", agent: "agy", agent_status: "blocked", interactive_ready: true, launch_pending: false, focused: false, revision: 1, state_change_seq: 1 },
+    ],
+  },
+  statusPayload: { client: { version: "0.8.2", protocol: 20 }, server: { running: true, version: "0.8.2", protocol: 20 } },
+  sessions: [
+    { name: "vault-test", status: "running", directory: "/v", socket: "/tmp/herdr.sock" },
+    { name: "old-session", status: "stopped", directory: "/old", socket: "/tmp/old.sock" },
+  ],
+  integrations: [],
+  installedPlugins: [],
+  worktrees: [],
+  bridgeRunning: true,
+  bridgeSocketPath: "/tmp/b.sock",
+  cliScriptPath: "/tmp/obs-herdr",
+  herdrPluginManifestPath: "/tmp/herdr-plugin.toml",
+  lastError: null,
+  lastUpdated: Date.now(),
+};
+
+const audit = [
+  { id: "1", timestamp: Date.now(), method: "vault.info", caller: "a", allowed: true, summary: "Read info" },
+  { id: "2", timestamp: Date.now(), method: "vault.update_note", caller: "a", allowed: true, summary: "Edited note.md", snapshot: { kind: "modified", path: "note.md", previousContent: "" } },
+];
+
+const coord = {
+  getState: () => state,
+  onChange: () => () => {},
+  refreshAll: async () => {},
+  stopVaultHerdrSession: async () => { stopCalls += 1; },
+  vaultOps: { onAuditUpdated: () => () => {}, getAuditLog: () => audit, clearAuditLog: () => {}, getVaultBasePath: () => "/v" },
+  socket: {},
+  getBridgeEnv: () => ({}),
+};
+
+const view = new HerdrDashboardView({
+  leaf: { app: { vault: { getAbstractFileByPath: () => null } } },
+  coordinator: coord,
+  getSettings: () => ({ vaultPermissionMode: "full", defaultAgentKind: "claude" }),
+  updateSettings: async () => {},
+  openTerminalLeaf: async () => {},
+});
+
+(async () => {
+  await view.onOpen();
+  const tabLabels = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-tab")).map((n) => n.textContent);
+  const attentionText = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-attention")).map((n) => findAll(n, (x) => x.textContent).map((x) => x.textContent).join(" "));
+  const mapPanes = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-layoutmap-pane")).map((n) => ({ text: n.textContent, left: n.style.left, width: n.style.width }));
+  const agentNames = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-agent-name")).map((n) => n.textContent);
+
+  // Switch to Vault tab and check default Edits filter vs Show all activity
+  const vaultTab = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-tab") && n.textContent === "Vault")[0];
+  vaultTab.click();
+  const editsCount = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-log-row")).length;
+  const showAllBtn = findAll(view.contentEl, (n) => n.tagName === "BUTTON" && n.textContent === "Show all activity")[0];
+  showAllBtn.click();
+  const allCount = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-log-row")).length;
+  const tierLabels = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-segmented"))[0].children.map((c) => c.textContent);
+
+  // Switch to Doctor tab and verify stopped sessions and optional hooks collapsed in <details>, and session tooltips
+  const tabsBar = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-tabs"))[0];
+  const tabsAriaLabel = tabsBar.getAttr("aria-label") || null;
+  const doctorTab = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-tab") && n.textContent === "Doctor")[0];
+  doctorTab.click();
+  const doctorSummaries = findAll(view.contentEl, (n) => n.tagName === "SUMMARY").map((n) => n.textContent);
+  const sessionTitles = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-session-row")).map((n) => n.getAttr("title"));
+
+  // Open header more menu and verify Stop session item exists with warning styling
+  const headerMore = findAll(view.contentEl, (n) => n.classList.contains("herdr-mc-more"))[0];
+  headerMore.click();
+  const menus = globalThis.__mcMenus || [];
+  const lastMenuItems = menus[menus.length - 1].items;
+  const menuTitles = lastMenuItems.filter((i) => !i.sep).map((i) => i.title);
+  const stopWarning = Boolean(lastMenuItems.find((i) => i.title === "Stop session")?.warning);
+
+  process.stdout.write(JSON.stringify({ tabLabels, tabsAriaLabel, attentionText, mapPanes, agentNames, editsCount, allCount, tierLabels, doctorSummaries, sessionTitles, menuTitles, stopWarning, stopCalls }));
+})();
+`;
+
+      const out = execFileSync(process.execPath, ["-e", runnerScript], {
+        encoding: "utf8",
+        timeout: 15000,
+      });
+      const parsed = JSON.parse(out) as {
+        tabLabels: string[];
+        tabsAriaLabel: string | null;
+        attentionText: string[];
+        mapPanes: Array<{ text: string; left: string; width: string }>;
+        agentNames: string[];
+        editsCount: number;
+        allCount: number;
+        tierLabels: string[];
+        doctorSummaries: string[];
+        sessionTitles: string[];
+        menuTitles: string[];
+        stopWarning: boolean;
+        stopCalls: number;
+      };
+
+      assert.deepEqual(parsed.tabLabels, ["Agents", "Vault", "Doctor"]);
+      assert.equal(parsed.tabsAriaLabel, null, "tabs row must not have aria-label hover tooltip");
+      assert.ok(parsed.attentionText[0]?.includes("agyB needs input"));
+      assert.deepEqual(parsed.mapPanes, [
+        { text: "agyA", left: "0.00%", width: "50.00%" },
+        { text: "agyB", left: "50.00%", width: "50.00%" },
+      ]);
+      assert.deepEqual(parsed.agentNames, ["agyA", "agyB"]);
+      assert.equal(parsed.editsCount, 1, "Vault tab defaults to Edits filter");
+      assert.equal(parsed.allCount, 2, "Show all activity reveals read entries");
+      assert.deepEqual(parsed.tierLabels, ["Off", "Read only", "Edit notes", "Full control"]);
+      assert.deepEqual(parsed.doctorSummaries, ["Stopped sessions (1)", "Optional agent hooks (0)"]);
+      assert.ok(parsed.sessionTitles[0]?.startsWith("vault-test"), "session row tooltip must start with full session name");
+      assert.ok(parsed.menuTitles.includes("Stop session"));
+      assert.equal(parsed.stopWarning, true, "Stop session menu item must be marked warning");
+      assert.ok(parsed.menuTitles.includes("Open terminal"));
+      assert.equal(parsed.stopCalls, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

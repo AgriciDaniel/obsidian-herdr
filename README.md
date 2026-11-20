@@ -121,7 +121,7 @@ obs-herdr mcp   # stdio MCP server, 26 tools
 
 UI control goes through Electron's own capture and input APIs from inside the plugin, so it needs no debugging port and no extra install. Selectors must match exactly one visible, uncovered element, password fields are refused, protected areas (`ui_protected_area`: Herdr terminal views, Settings modal, community plugin toggles) are blocked unless `allowUiInProtectedAreas` is enabled, `uiTypingSpeed` selects `visible` or `fast` typing, and input from several agents is queued inside one serialized lock so it never interleaves.
 
-To connect an MCP client, click **Copy MCP JSON config** in Mission Control, Vault Bridge.
+To connect an MCP client, click **Copy MCP JSON config** in Mission Control, Vault tab, under Connection details.
 
 ### How the bridge is protected
 

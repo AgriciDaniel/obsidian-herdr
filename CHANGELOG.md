@@ -4,6 +4,11 @@
 
 Reliability fixes from a full code and live review. The aim: agents keep working, and when something fails they are told so instead of being left hanging.
 
+- Mission Control is simpler: one status line instead of five tiles, three tabs (Agents, Vault, Doctor) instead of five, a compact layout map with one row per agent under its pane name, and the less used tools in `⋯` menus. Nothing was removed; see the header menu and each agent's menu.
+- Stop session now asks first and names the session, since it stops every agent in it.
+- The Vault tab uses plain permission names (Off, Read only, Edit notes, Full control, also in Settings), shows note edits by default with "Show all activity" for the rest, and folds the connection paths under "Connection details". The Doctor tab wraps long values and folds stopped sessions and optional hooks away.
+- Agents pressing Escape now close Obsidian menus. The Doctor tab no longer scans PATH on every refresh (cached for a minute), which could slow Obsidian down.
+
 - Deleting a note through the bridge now checks that the note is really gone. If system trash is not available (common in the Flatpak), it falls back to Obsidian's own `.trash` folder in the vault; if that fails too, it reports `trash_failed` instead of a false success. Undo of a created note uses the same check.
 - Renaming a linked note no longer stops at Obsidian's "Update links" question. Links are updated without a prompt and without changing your settings; pass `updateLinks: false` to rename without touching links.
 - The `obs-herdr` command and its MCP server time out (60 seconds by default, `OBS_HERDR_TIMEOUT_MS` to change it) and report an error when Obsidian closes the connection early, instead of hanging or exiting as if it had worked.

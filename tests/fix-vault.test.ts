@@ -1287,4 +1287,186 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
       (err: { code?: string }) => err?.code === "ui_option_disabled"
     );
   });
+
+  it("MC redesign: confirmAction resolves true on confirm (with danger warning), false on cancel, and false on Escape/close", async () => {
+    const tmpDir = makeTempDir("fix-mc-confirm-");
+    try {
+      const stubPath = path.join(tmpDir, "obsidian-modal-stub.js");
+      fs.writeFileSync(
+        stubPath,
+        [
+          "const instances = (globalThis.__mcModalInstances = globalThis.__mcModalInstances || []);",
+          "exports.__instances = instances;",
+          "class FakeEl {",
+          "  constructor() { this.classes = []; this.children = []; this.text = ''; }",
+          "  empty() { this.children = []; }",
+          "  addClass(...cls) { this.classes.push(...cls); }",
+          "  createEl(tag, opts) { const el = { tag, ...(opts || {}) }; this.children.push(el); return el; }",
+          "}",
+          "class Modal {",
+          "  constructor(app) {",
+          "    this.app = app;",
+          "    this.contentEl = new FakeEl();",
+          "    this.scopeHandlers = {};",
+          "    this.scope = { register: (_mods, key, cb) => { this.scopeHandlers[key] = cb; } };",
+          "    instances.push(this);",
+          "  }",
+          "  open() { this.onOpen(); }",
+          "  close() { this.onClose(); }",
+          "  onOpen() {}",
+          "  onClose() {}",
+          "}",
+          "class Setting {",
+          "  constructor(containerEl) { this.containerEl = containerEl; this.buttons = []; containerEl.children.push(this); }",
+          "  setName(n) { this.name = n; return this; }",
+          "  setDesc(d) { this.desc = d; return this; }",
+          "  setHeading() { this.heading = true; return this; }",
+          "  addButton(cb) {",
+          "    const btn = {",
+          "      text: '', classes: [], cta: false, handler: null,",
+          "      setButtonText(t) { this.text = t; return this; },",
+          "      setClass(c) { this.classes.push(c); return this; },",
+          "      setCta() { this.cta = true; return this; },",
+          "      onClick(fn) { this.handler = fn; return this; },",
+          "    };",
+          "    cb(btn);",
+          "    this.buttons.push(btn);",
+          "    return this;",
+          "  }",
+          "}",
+          "exports.Modal = Modal;",
+          "exports.Setting = Setting;",
+          "exports.Notice = class Notice { constructor(m) { this.message = m; } };",
+        ].join("\n"),
+        "utf8"
+      );
+      const outPath = path.join(tmpDir, "modals.cjs");
+      const runnerScript = [
+        'const esbuild = require("esbuild");',
+        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/ui/modals.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(outPath)}, alias: { obsidian: ${JSON.stringify(stubPath)} } });`,
+        `const stub = require(${JSON.stringify(stubPath)});`,
+        `const { confirmAction } = require(${JSON.stringify(outPath)});`,
+        "(async () => {",
+        "  // 1. Confirm with danger: true",
+        '  const p1 = confirmAction({}, { title: "Stop session?", body: "All agents stop.", confirmText: "Stop session", danger: true });',
+        "  const m1 = stub.__instances[0];",
+        "  const btnSetting1 = m1.contentEl.children.find((c) => Array.isArray(c.buttons) && c.buttons.length > 0);",
+        '  const confirmBtn1 = btnSetting1.buttons.find((b) => b.text === "Stop session");',
+        "  const dangerFlag = confirmBtn1.classes.includes('mod-warning');",
+        "  confirmBtn1.handler();",
+        "  const r1 = await p1;",
+        "  // 2. Cancel button",
+        '  const p2 = confirmAction({}, { title: "Confirm", body: "Proceed?", confirmText: "OK" });',
+        "  const m2 = stub.__instances[1];",
+        "  const btnSetting2 = m2.contentEl.children.find((c) => Array.isArray(c.buttons) && c.buttons.length > 0);",
+        '  const cancelBtn2 = btnSetting2.buttons.find((b) => b.text === "Cancel");',
+        "  cancelBtn2.handler();",
+        "  const r2 = await p2;",
+        "  // 3. Escape key",
+        '  const p3 = confirmAction({}, { title: "Escape test", body: "Close with Esc", confirmText: "Yes" });',
+        "  const m3 = stub.__instances[2];",
+        '  m3.scopeHandlers["Escape"]();',
+        "  const r3 = await p3;",
+        "  process.stdout.write(JSON.stringify({ r1, dangerFlag, r2, r3 }));",
+        "})();",
+      ].join("\n");
+      const out = await execFileAsync(process.execPath, ["-e", runnerScript], { cwd: process.cwd() });
+      const parsed = JSON.parse(out.stdout) as {
+        r1: boolean;
+        dangerFlag: boolean;
+        r2: boolean;
+        r3: boolean;
+      };
+      assert.equal(parsed.r1, true, "confirm button must resolve true");
+      assert.equal(parsed.dangerFlag, true, "danger: true must apply warning style (mod-warning)");
+      assert.equal(parsed.r2, false, "cancel button must resolve false");
+      assert.equal(parsed.r3, false, "Escape key must resolve false");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("Polish 3: press_key Escape closes an open Obsidian .menu even when Electron sendInputEvent alone does not dismiss it", async () => {
+    let menuOpen = true;
+    const menuEl = makeFakeElement({
+      tag: "div",
+      classes: ["menu"],
+      rect: { x: 100, y: 100, width: 180, height: 140 },
+    });
+    menuEl.dispatchEvent = (ev: { type?: string; key?: string }) => {
+      if (ev?.type === "keydown" && ev?.key === "Escape") {
+        menuOpen = false;
+        menuEl.isConnected = false;
+      }
+      return true;
+    };
+
+    const bodyEl = makeFakeElement({
+      tag: "body",
+      rect: { x: 0, y: 0, width: 1280, height: 800 },
+    });
+    bodyEl.dispatchEvent = (ev: { type?: string }) => {
+      if (ev?.type === "mousedown" || ev?.type === "pointerdown") {
+        menuOpen = false;
+        menuEl.isConnected = false;
+      }
+      return true;
+    };
+
+    const win = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      devicePixelRatio: 1,
+      setTimeout,
+      clearTimeout,
+      KeyboardEvent: class FakeKeyboardEvent {
+        readonly type: string;
+        readonly key: string;
+        readonly code: string;
+        readonly keyCode: number;
+        readonly which: number;
+        readonly bubbles: boolean;
+        readonly cancelable: boolean;
+        constructor(type: string, init?: Record<string, unknown>) {
+          this.type = type;
+          this.key = String(init?.key ?? "");
+          this.code = String(init?.code ?? "");
+          this.keyCode = Number(init?.keyCode ?? 0);
+          this.which = Number(init?.which ?? 0);
+          this.bubbles = Boolean(init?.bubbles);
+          this.cancelable = Boolean(init?.cancelable);
+        }
+      },
+      MouseEvent: class FakeMouseEvent {
+        readonly type: string;
+        readonly bubbles: boolean;
+        constructor(type: string, init?: Record<string, unknown>) {
+          this.type = type;
+          this.bubbles = Boolean(init?.bubbles);
+        }
+      },
+      document: {
+        activeElement: bodyEl,
+        body: bodyEl,
+        querySelectorAll: (sel: string) =>
+          menuOpen && (sel.includes(".menu") || sel.includes('[role="menu"]')) ? [menuEl] : [],
+        elementFromPoint: () => (menuOpen ? menuEl : bodyEl),
+      },
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    } as unknown as Window;
+
+    const svc = new UiControlService({
+      win,
+      getWebContents: () => ({
+        capturePage: async () => ({ toPNG: () => Buffer.alloc(0), getSize: () => ({ width: 1, height: 1 }) }),
+        // Simulate Electron sendInputEvent not closing the Obsidian Menu on its own
+        sendInputEvent: () => undefined,
+        insertText: async () => undefined,
+      }),
+      sleep: async () => undefined,
+    });
+
+    await svc.pressKey({ key: "Escape" }, "test-polish3");
+    assert.equal(menuOpen, false, "press_key Escape must close an open Obsidian .menu");
+  });
 });

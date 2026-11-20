@@ -1,5 +1,6 @@
 import {
   ItemView,
+  Menu,
   Notice,
   TFile,
   setIcon,
@@ -10,17 +11,88 @@ import type {
   AgentInfo,
   HerdrLayoutNode,
   HerdrPluginSettings,
+  PaneInfo,
   PaneLayoutSnapshot,
   SessionSnapshot,
+  VaultAuditEntry,
   VaultPermissionMode,
 } from "../domain/types";
-import type { CoordinatorState, HerdrCoordinator } from "../services/herdr-coordinator";
 import { resolveExecutableOnNormalizedPath } from "../herdr/cli-client";
-import { CreateWorktreeModal, DispatchNoteModal, SpawnAgentModal } from "./modals";
+import type { CoordinatorState, HerdrCoordinator } from "../services/herdr-coordinator";
+import {
+  CreateWorktreeModal,
+  DispatchNoteModal,
+  SpawnAgentModal,
+  confirmAction,
+} from "./modals";
 
 export const VIEW_TYPE_HERDR_DASHBOARD = "herdr-view";
 
-type DashboardTabId = "agents" | "topology" | "bridge" | "dispatch" | "doctor";
+type DashboardTabId = "agents" | "vault" | "doctor";
+
+interface TierMeta {
+  id: VaultPermissionMode;
+  label: string;
+  description: string;
+}
+
+const VAULT_TIERS: readonly TierMeta[] = [
+  {
+    id: "off",
+    label: "Off",
+    description: "Agents cannot read or change anything in this vault.",
+  },
+  {
+    id: "read-only",
+    label: "Read only",
+    description: "Agents can read and search notes, but cannot change files or control Obsidian.",
+  },
+  {
+    id: "read-write",
+    label: "Edit notes",
+    description: "Agents can create, edit, rename, and trash notes with undo, but cannot run commands or click the UI.",
+  },
+  {
+    id: "full",
+    label: "Full control",
+    description: "Agents can edit notes, run Obsidian commands, and control the window when UI control is enabled.",
+  },
+];
+
+const EDIT_ACTIVITY_METHODS = new Set<string>([
+  "vault.create_note",
+  "vault.update_note",
+  "vault.patch_frontmatter",
+  "vault.rename_note",
+  "vault.trash_note",
+  "canvas.upsert_node",
+  "editor.insert_at_cursor",
+  "editor.replace_selection",
+]);
+
+function tierLabelFor(mode: VaultPermissionMode, bridgeRunning: boolean): string {
+  if (!bridgeRunning || mode === "off") {
+    return "Off";
+  }
+  return VAULT_TIERS.find((t) => t.id === mode)?.label ?? mode;
+}
+
+function isEditActivity(entry: VaultAuditEntry): boolean {
+  return Boolean(entry.snapshot) || EDIT_ACTIVITY_METHODS.has(entry.method);
+}
+
+function normalizeTabId(raw: unknown): DashboardTabId | null {
+  if (raw === "agents" || raw === "topology" || raw === "dispatch") {
+    return "agents";
+  }
+  if (raw === "vault" || raw === "bridge") {
+    return "vault";
+  }
+  if (raw === "doctor") {
+    return "doctor";
+  }
+  return null;
+}
 
 export class HerdrDashboardView extends ItemView {
   private readonly coordinator: HerdrCoordinator;
@@ -41,10 +113,14 @@ export class HerdrDashboardView extends ItemView {
   private liveTailText = "";
   private liveTailTarget = "";
   private promptDraft = "";
+  private showAllActivity = false;
 
   private unsubCoord: (() => void) | null = null;
   private unsubAudit: (() => void) | null = null;
   private bodyHostEl: HTMLElement | null = null;
+  private rendering = false;
+  private cachedCliChecks: Array<{ label: string; found: boolean; detail: string }> | null = null;
+  private cachedCliChecksAt = 0;
 
   constructor(options: {
     leaf: WorkspaceLeaf;
@@ -86,15 +162,10 @@ export class HerdrDashboardView extends ItemView {
 
   async setState(state: unknown, result: ViewStateResult): Promise<void> {
     if (state && typeof state === "object") {
-      const s = state as { activeTab?: string; selectedWorkspaceId?: string };
-      if (
-        s.activeTab === "agents" ||
-        s.activeTab === "topology" ||
-        s.activeTab === "bridge" ||
-        s.activeTab === "dispatch" ||
-        s.activeTab === "doctor"
-      ) {
-        this.activeTab = s.activeTab;
+      const s = state as { activeTab?: unknown; selectedWorkspaceId?: unknown };
+      const normalized = normalizeTabId(s.activeTab);
+      if (normalized) {
+        this.activeTab = normalized;
       }
       if (typeof s.selectedWorkspaceId === "string") {
         this.selectedWorkspaceId = s.selectedWorkspaceId;
@@ -116,12 +187,14 @@ export class HerdrDashboardView extends ItemView {
       this.renderDashboard();
     });
     this.unsubAudit = this.coordinator.vaultOps.onAuditUpdated(() => {
-      if (this.activeTab === "bridge") {
+      if (this.activeTab === "vault") {
         this.renderDashboard();
       }
     });
 
-    void this.coordinator.refreshAll(true);
+    void this.coordinator.refreshAll(true).catch((err: unknown) => {
+      console.warn("[herdr-obs] Initial Mission Control refresh failed:", err);
+    });
     return Promise.resolve();
   }
 
@@ -136,88 +209,45 @@ export class HerdrDashboardView extends ItemView {
 
   private renderDashboard(): void {
     const host = this.bodyHostEl;
-    if (!host) {
+    if (!host || this.rendering) {
       return;
     }
-    host.empty();
+    this.rendering = true;
+    try {
+      host.empty();
 
-    const state = this.coordinator.getState();
-    this.renderTopBar(host, state);
-    this.renderSummaryStrip(host, state);
-    this.renderTabNav(host, state);
+      const state = this.coordinator.getState();
+      this.renderHeader(host, state);
+      this.renderStatusLine(host, state);
+      this.renderAttentionBanner(host, state);
+      this.renderTabs(host);
 
-    if (state.usingOfflinePreview) {
-      this.renderOfflinePreviewBanner(host, state);
-    }
-
-    const panel = host.createDiv({ cls: "herdr-tab-panel" });
-    switch (this.activeTab) {
-      case "agents":
-        this.renderAgentsTab(panel, state);
-        break;
-      case "topology":
-        this.renderTopologyTab(panel, state);
-        break;
-      case "bridge":
-        this.renderBridgeTab(panel, state);
-        break;
-      case "dispatch":
-        this.renderDispatchTab(panel, state);
-        break;
-      case "doctor":
-        this.renderDoctorTab(panel, state);
-        break;
+      const panel = host.createDiv({ cls: "herdr-tab-panel" });
+      switch (this.activeTab) {
+        case "agents":
+          this.renderAgentsTab(panel, state);
+          break;
+        case "vault":
+          this.renderVaultTab(panel, state);
+          break;
+        case "doctor":
+          this.renderDoctorTab(panel, state);
+          break;
+      }
+    } finally {
+      this.rendering = false;
     }
   }
 
-  private renderTopBar(parent: HTMLElement, state: CoordinatorState): void {
-    const top = parent.createDiv({ cls: "herdr-topbar" });
+  private renderHeader(parent: HTMLElement, state: CoordinatorState): void {
+    const header = parent.createDiv({ cls: "herdr-mc-header" });
+    header.createDiv({ cls: "herdr-mc-title", text: "Herdr Mission Control" });
 
-    const titleWrap = top.createDiv({ cls: "herdr-topbar-brand" });
-    const iconSpan = titleWrap.createSpan({ cls: "herdr-brand-icon" });
-    setIcon(iconSpan, "cpu");
-    const textWrap = titleWrap.createDiv({ cls: "herdr-brand-text" });
-    textWrap.createDiv({ cls: "herdr-topbar-title", text: "Herdr Mission Control" });
-    textWrap.createDiv({
-      cls: "herdr-topbar-subtitle",
-      text: state.serverRunning
-        ? `Connected to session '${state.activeSessionName}' (${state.snapshot?.version || "live"})`
-        : state.binaryPath
-          ? `Session '${state.activeSessionName}' is idle`
-          : "Herdr binary not detected on PATH",
-    });
-
-    const actions = top.createDiv({ cls: "herdr-topbar-actions" });
-
-    if (!state.serverRunning && state.binaryPath) {
-      const startBtn = actions.createEl("button", {
-        text: "Start session",
-        cls: "mod-cta herdr-btn-compact",
-      });
-      startBtn.addEventListener("click", () => {
-        void this.handleStartSession();
-      });
-    } else if (state.serverRunning) {
-      const stopBtn = actions.createEl("button", {
-        text: "Stop session",
-        cls: "herdr-btn-compact",
-      });
-      stopBtn.addEventListener("click", () => {
-        void this.handleStopSession();
-      });
-    }
-
-    const termBtn = actions.createEl("button", {
-      text: "Open terminal",
-      cls: state.serverRunning ? "mod-cta herdr-btn-compact" : "herdr-btn-compact",
-    });
-    termBtn.addEventListener("click", () => {
-      void this.openTerminalLeaf({ split: false });
-    });
-
+    const actions = header.createDiv({ cls: "herdr-mc-actions" });
     const spawnBtn = actions.createEl("button", {
       text: "Spawn agent",
-      cls: "herdr-btn-compact",
+      cls: "mod-cta herdr-btn-compact",
+      attr: { type: "button" },
     });
     spawnBtn.addEventListener("click", () => {
       new SpawnAgentModal(
@@ -230,87 +260,264 @@ export class HerdrDashboardView extends ItemView {
       ).open();
     });
 
-    const refreshBtn = actions.createEl("button", {
-      cls: "clickable-icon herdr-icon-btn",
-      attr: { "aria-label": "Refresh runtime snapshot", title: "Refresh runtime snapshot" },
+    const moreBtn = actions.createEl("button", {
+      cls: "clickable-icon herdr-mc-more",
+      attr: { "aria-label": "More actions", title: "More actions", type: "button" },
     });
-    setIcon(refreshBtn, "refresh-cw");
-    refreshBtn.addEventListener("click", () => {
-      void this.coordinator.refreshAll(true);
+    setIcon(moreBtn, "more-horizontal");
+    moreBtn.addEventListener("click", (ev: MouseEvent) => {
+      this.openHeaderMenu(ev, state);
     });
   }
 
-  private renderSummaryStrip(parent: HTMLElement, state: CoordinatorState): void {
-    const strip = parent.createDiv({ cls: "herdr-kpi-strip" });
-    const snap = state.snapshot;
+  private openHeaderMenu(ev: MouseEvent, state: CoordinatorState): void {
+    const snap = state.serverRunning ? state.snapshot : null;
+    const activeWsId = this.resolveActiveWorkspaceId(snap);
+    const activeWs = snap?.workspaces.find((w) => w.workspace_id === activeWsId);
+    const activeTab = this.resolveActiveTabForWorkspace(snap, activeWsId);
+
+    const menu = new Menu();
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Open terminal")
+        .setIcon("terminal")
+        .onClick(() => {
+          void this.openTerminalLeaf({ split: false }).catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Refresh")
+        .setIcon("refresh-cw")
+        .onClick(() => {
+          this.cachedCliChecks = null;
+          void this.coordinator.refreshAll(true).catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
+        })
+    );
+
+    menu.addSeparator();
+
+    menu.addItem((item) =>
+      item
+        .setTitle("New vault workspace")
+        .setIcon("folder-plus")
+        .setDisabled(!state.serverRunning)
+        .onClick(() => {
+          void this.coordinator.createVaultWorkspace().catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("New Git worktree")
+        .setIcon("git-branch")
+        .setDisabled(!state.serverRunning)
+        .onClick(() => {
+          new CreateWorktreeModal(this.app, this.coordinator).open();
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Apply layout from note")
+        .setIcon("layout")
+        .setDisabled(!state.serverRunning)
+        .onClick(() => {
+          void this.applyLayoutFromActiveNote(activeWsId || undefined);
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Save layout to note")
+        .setIcon("save")
+        .setDisabled(!state.serverRunning || !activeTab)
+        .onClick(() => {
+          if (activeTab) {
+            void this.saveTabLayoutToNote(
+              activeWs?.label || activeWsId || "workspace",
+              activeTab.tab_id,
+              activeTab.label
+            );
+          }
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Filter TUI to workspace")
+        .setIcon("filter")
+        .setDisabled(!state.serverRunning || !activeWsId)
+        .onClick(() => {
+          if (activeWsId) {
+            void this.setWorkspaceTuiFilter(activeWsId);
+          }
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Clear TUI filter")
+        .setIcon("x")
+        .setDisabled(!state.serverRunning)
+        .onClick(() => {
+          void this.clearWorkspaceTuiFilter();
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Copy active note context pack")
+        .setIcon("copy")
+        .onClick(() => {
+          void this.coordinator
+            .buildActiveNoteContextPack({ includeBacklinks: true })
+            .then((pack) => {
+              void navigator.clipboard.writeText(pack.payload).catch((err: unknown) => {
+                console.warn("[herdr-obs] Clipboard write failed:", err);
+              });
+              new Notice(`Copied context pack for '${pack.title}'.`);
+            })
+            .catch((err: unknown) => {
+              new Notice(err instanceof Error ? err.message : String(err));
+            });
+        })
+    );
+
+    menu.addSeparator();
+
+    if (state.serverRunning) {
+      menu.addItem((item) => {
+        item
+          .setTitle("Stop session")
+          .setIcon("square")
+          .onClick(() => {
+            void this.confirmAndStopSession(state.activeSessionName);
+          });
+        const warnItem = item as unknown as { setWarning?: (isWarning: boolean) => unknown };
+        warnItem.setWarning?.(true);
+      });
+    } else if (state.binaryPath) {
+      menu.addItem((item) =>
+        item
+          .setTitle("Start session")
+          .setIcon("play")
+          .onClick(() => {
+            void this.handleStartSession();
+          })
+      );
+    }
+
+    menu.showAtMouseEvent(ev);
+  }
+
+  private renderStatusLine(parent: HTMLElement, state: CoordinatorState): void {
+    const snap = state.serverRunning ? state.snapshot : null;
     const agents = snap?.agents ?? [];
-    const workingCount = agents.filter((a) => a.agent_status === "working").length;
-    const blockedCount = agents.filter((a) => a.agent_status === "blocked").length;
-    const doneCount = agents.filter((a) => a.agent_status === "done").length;
+    const working = agents.filter((a) => a.agent_status === "working").length;
+    const blocked = agents.filter((a) => a.agent_status === "blocked").length;
+    const done = agents.filter((a) => a.agent_status === "done").length;
 
-    this.createKpiCard(
-      strip,
-      "Daemon",
-      state.serverRunning ? "Live" : state.usingOfflinePreview ? "Preview" : "Stopped",
-      state.serverRunning ? "working" : "idle"
-    );
-    this.createKpiCard(
-      strip,
-      "Workspaces / panes",
-      snap ? `${snap.workspaces.length} / ${snap.panes.length}` : "0 / 0",
-      "idle"
-    );
-    this.createKpiCard(
-      strip,
-      "Working / done",
-      `${workingCount} / ${doneCount}`,
-      workingCount > 0 ? "working" : doneCount > 0 ? "done" : "idle"
-    );
-    this.createKpiCard(
-      strip,
-      "Blocked",
-      String(blockedCount),
-      blockedCount > 0 ? "blocked" : "idle"
-    );
-    this.createKpiCard(
-      strip,
-      "Vault Bridge",
-      state.bridgeRunning ? this.getSettings().vaultPermissionMode : "off",
-      state.bridgeRunning ? "done" : "idle"
-    );
-  }
+    const version =
+      state.snapshot?.version || state.statusPayload?.client?.version || "not detected";
+    const tooltip = `Session: ${state.activeSessionName} | Herdr ${version}`;
 
-  private createKpiCard(
-    parent: HTMLElement,
-    label: string,
-    value: string,
-    tone: string
-  ): void {
-    const card = parent.createDiv({ cls: `herdr-kpi-card herdr-tone-${tone}` });
-    card.createDiv({ cls: "herdr-kpi-label", text: label });
-    card.createDiv({ cls: "herdr-kpi-value", text: value });
-  }
-
-  private renderTabNav(parent: HTMLElement, state: CoordinatorState): void {
-    const nav = parent.createDiv({
-      cls: "herdr-tab-nav",
-      attr: { role: "tablist", "aria-label": "Mission Control sections" },
+    const line = parent.createDiv({
+      cls: "herdr-mc-status",
+      attr: { title: tooltip },
     });
-    const auditCount = this.coordinator.vaultOps.getAuditLog().length;
-    const agentCount = state.snapshot?.agents.length ?? 0;
+
+    const dotState = !state.serverRunning
+      ? "is-offline"
+      : blocked > 0 || Boolean(state.protocolWarning)
+        ? "is-warn"
+        : "is-live";
+    line.createSpan({ cls: `herdr-mc-status-dot ${dotState}` });
+
+    const parts: string[] = [state.serverRunning ? "Live" : "Offline"];
+    if (state.serverRunning) {
+      const noun = agents.length === 1 ? "agent" : "agents";
+      const breakdown: string[] = [];
+      if (working > 0) breakdown.push(`${working} working`);
+      if (done > 0) breakdown.push(`${done} done`);
+      if (blocked > 0) breakdown.push(`${blocked} blocked`);
+      parts.push(
+        breakdown.length > 0
+          ? `${agents.length} ${noun} (${breakdown.join(", ")})`
+          : `${agents.length} ${noun}`
+      );
+    }
+    const tierLabel = tierLabelFor(
+      this.getSettings().vaultPermissionMode,
+      state.bridgeRunning
+    );
+    parts.push(`Vault: ${tierLabel}`);
+
+    line.createSpan({ text: parts.join(" · ") });
+  }
+
+  private renderAttentionBanner(parent: HTMLElement, state: CoordinatorState): void {
+    if (!state.serverRunning || !state.snapshot) {
+      return;
+    }
+    const blockedAgents = state.snapshot.agents.filter(
+      (a) => a.agent_status === "blocked"
+    );
+    if (blockedAgents.length === 0) {
+      return;
+    }
+
+    const banner = parent.createDiv({ cls: "herdr-mc-attention" });
+    for (const agent of blockedAgents) {
+      const displayName = this.resolveAgentDisplayLabel(agent, state.snapshot.panes);
+      const targetId = agent.name || agent.pane_id;
+      const row = banner.createDiv({ cls: "herdr-blocked-bar" });
+      row.createSpan({
+        cls: "herdr-blocked-label",
+        text: `${displayName} needs input`,
+      });
+      for (const keySpec of [
+        { label: "Approve (y + Enter)", keys: ["y", "enter"] },
+        { label: "Enter", keys: ["enter"] },
+        { label: "Esc", keys: ["esc"] },
+        { label: "Cancel (Ctrl+C)", keys: ["ctrl+c"] },
+      ]) {
+        const kBtn = row.createEl("button", {
+          text: keySpec.label,
+          cls: "herdr-btn-compact",
+          attr: { type: "button" },
+        });
+        kBtn.addEventListener("click", () => {
+          void this.sendAgentQuickKeys(targetId, keySpec.keys);
+        });
+      }
+    }
+  }
+
+  private renderTabs(parent: HTMLElement): void {
+    const nav = parent.createDiv({
+      cls: "herdr-mc-tabs",
+      attr: { role: "tablist" },
+    });
 
     const tabs: Array<{ id: DashboardTabId; label: string }> = [
-      { id: "agents", label: `Agents (${agentCount})` },
-      { id: "topology", label: "Topology & worktrees" },
-      { id: "bridge", label: `Vault Bridge (${auditCount})` },
-      { id: "dispatch", label: "Context dispatch" },
-      { id: "doctor", label: "Doctor & sessions" },
+      { id: "agents", label: "Agents" },
+      { id: "vault", label: "Vault" },
+      { id: "doctor", label: "Doctor" },
     ];
 
     for (const item of tabs) {
       const btn = nav.createEl("button", {
         text: item.label,
-        cls: `herdr-nav-tab ${this.activeTab === item.id ? "is-active" : ""}`,
+        cls: `herdr-mc-tab ${this.activeTab === item.id ? "is-active" : ""}`,
         attr: {
           role: "tab",
           "aria-selected": this.activeTab === item.id ? "true" : "false",
@@ -324,167 +531,264 @@ export class HerdrDashboardView extends ItemView {
     }
   }
 
-  private renderOfflinePreviewBanner(parent: HTMLElement, state: CoordinatorState): void {
-    const banner = parent.createDiv({ cls: "herdr-preview-banner" });
-    const msg = banner.createDiv({ cls: "herdr-preview-text" });
-    msg.createEl("strong", { text: "Offline preview snapshot: " });
-    msg.createSpan({
-      text: state.binaryPath
-        ? "Showing sample Herdr layout until you start or attach to a live Herdr session."
-        : "Install Herdr from herdr.dev or use Open terminal for interactive local shells with Vault Control Bridge.",
-    });
-
-    if (state.binaryPath) {
-      const btn = banner.createEl("button", {
-        text: "Start live vault session",
-        cls: "mod-cta herdr-btn-compact",
-      });
-      btn.addEventListener("click", () => {
-        void this.handleStartSession();
-      });
-    }
-  }
-
   private renderAgentsTab(parent: HTMLElement, state: CoordinatorState): void {
-    const snap = state.snapshot;
-    const agents = snap?.agents ?? [];
-
-    if (agents.length === 0) {
-      const empty = parent.createDiv({ cls: "herdr-empty-card" });
+    if (!state.serverRunning || !state.snapshot) {
+      const empty = parent.createDiv({ cls: "herdr-mc-empty" });
       empty.createEl("p", {
-        text: state.serverRunning
-          ? "No coding agents are currently active in this Herdr session."
-          : "No active Herdr session is connected.",
+        text: state.binaryPath
+          ? "No Herdr session is running for this vault."
+          : "Herdr was not found on PATH. Install Herdr from herdr.dev, or open a local terminal below.",
       });
       const row = empty.createDiv({ cls: "herdr-action-row" });
-      if (state.serverRunning) {
-        const spawnBtn = row.createEl("button", {
-          text: "Spawn agent in split pane",
-          cls: "mod-cta",
-        });
-        spawnBtn.addEventListener("click", () => {
-          new SpawnAgentModal(
-            this.app,
-            this.coordinator,
-            this.getSettings().defaultAgentKind
-          ).open();
-        });
-      } else if (state.binaryPath) {
+      if (state.binaryPath) {
         const startBtn = row.createEl("button", {
-          text: "Start vault Herdr session",
-          cls: "mod-cta",
+          text: "Start session",
+          cls: "mod-cta herdr-btn-compact",
+          attr: { type: "button" },
         });
         startBtn.addEventListener("click", () => {
           void this.handleStartSession();
         });
       }
-      const shellBtn = row.createEl("button", { text: "Open embedded terminal" });
-      shellBtn.addEventListener("click", () => {
-        void this.openTerminalLeaf({});
+      const termBtn = row.createEl("button", {
+        text: "Open terminal",
+        cls: "herdr-btn-compact",
+        attr: { type: "button" },
+      });
+      termBtn.addEventListener("click", () => {
+        void this.openTerminalLeaf({ split: false }).catch((err: unknown) => {
+          new Notice(err instanceof Error ? err.message : String(err));
+        });
       });
       return;
     }
 
-    const grid = parent.createDiv({ cls: "herdr-agent-grid" });
-    for (const agent of agents) {
-      this.renderAgentCard(grid, agent, state);
+    const snap = state.snapshot;
+    const activeWsId = this.resolveActiveWorkspaceId(snap);
+
+    if (snap.workspaces.length > 1) {
+      const wsRow = parent.createDiv({ cls: "herdr-workspace-chips" });
+      for (const ws of snap.workspaces) {
+        const chip = wsRow.createEl("button", {
+          cls: `herdr-ws-chip ${ws.workspace_id === activeWsId ? "is-selected" : ""}`,
+          text: ws.label || ws.workspace_id,
+          attr: { title: `${ws.label} (${ws.workspace_id})`, type: "button" },
+        });
+        chip.addEventListener("click", () => {
+          this.selectedWorkspaceId = ws.workspace_id;
+          void this.coordinator.socket
+            .focusWorkspace(ws.workspace_id)
+            .then(() => this.coordinator.refreshAll(false))
+            .catch((err: unknown) => {
+              new Notice(err instanceof Error ? err.message : String(err));
+            });
+        });
+      }
+    }
+
+    const activeTab = this.resolveActiveTabForWorkspace(snap, activeWsId);
+    const activeLayout = activeTab
+      ? snap.layouts.find((l) => l.tab_id === activeTab.tab_id)
+      : snap.layouts[0];
+    if (activeLayout && activeLayout.panes.length > 0) {
+      this.renderCompactLayoutMap(parent, activeLayout, snap);
+    }
+
+    const agents = snap.agents ?? [];
+    if (agents.length === 0) {
+      const empty = parent.createDiv({ cls: "herdr-mc-empty" });
+      empty.createEl("p", { text: "No coding agents are running in this session." });
+      const spawnBtn = empty.createEl("button", {
+        text: "Spawn agent",
+        cls: "mod-cta herdr-btn-compact",
+        attr: { type: "button" },
+      });
+      spawnBtn.addEventListener("click", () => {
+        new SpawnAgentModal(
+          this.app,
+          this.coordinator,
+          this.getSettings().defaultAgentKind,
+          () => {
+            this.renderDashboard();
+          }
+        ).open();
+      });
+    } else {
+      for (const agent of agents) {
+        this.renderAgentRow(parent, agent, state, snap);
+      }
     }
 
     if (this.liveTailTarget) {
-      const tailCard = parent.createDiv({ cls: "herdr-section-card" });
-      const head = tailCard.createDiv({ cls: "herdr-card-header" });
+      const tailSection = parent.createDiv({ cls: "herdr-mc-section" });
+      const head = tailSection.createDiv({ cls: "herdr-card-header" });
       head.createSpan({
-        cls: "herdr-card-title",
-        text: `Terminal output tail: ${this.liveTailTarget}`,
+        cls: "herdr-mc-section-title",
+        text: this.liveTailTarget,
       });
       const closeBtn = head.createEl("button", {
-        text: "Close preview",
+        text: "Close",
         cls: "herdr-btn-compact",
+        attr: { type: "button" },
       });
       closeBtn.addEventListener("click", () => {
         this.liveTailTarget = "";
         this.liveTailText = "";
         this.renderDashboard();
       });
-
-      const pre = tailCard.createEl("pre", { cls: "herdr-terminal-tail" });
+      const pre = tailSection.createEl("pre", { cls: "herdr-terminal-tail" });
       pre.setText(this.liveTailText || "(empty terminal output)");
+    }
+
+    if (state.worktrees.length > 0) {
+      const wtSection = parent.createDiv({ cls: "herdr-mc-section" });
+      wtSection.createDiv({
+        cls: "herdr-mc-section-title",
+        text: "Git worktrees",
+      });
+      for (const wt of state.worktrees) {
+        const row = wtSection.createDiv({
+          cls: "herdr-mc-session-row",
+          attr: { title: wt.path },
+        });
+        row.createSpan({
+          text: wt.branch || wt.label || wt.path,
+        });
+        const openWsId = wt.open_workspace_id || wt.workspace_id || "";
+        if (!openWsId) {
+          const openBtn = row.createEl("button", {
+            text: "Open",
+            cls: "herdr-btn-compact",
+            attr: { type: "button" },
+          });
+          openBtn.addEventListener("click", () => {
+            void this.coordinator.socket
+              .openWorktree({
+                path: wt.path,
+                branch: wt.branch || undefined,
+                focus: true,
+              })
+              .then(() => this.coordinator.refreshAll(true))
+              .catch((err: unknown) => {
+                new Notice(err instanceof Error ? err.message : String(err));
+              });
+          });
+        } else if (wt.is_linked_worktree !== false && !wt.is_main) {
+          const rmBtn = row.createEl("button", {
+            text: "Remove",
+            cls: "herdr-btn-compact",
+            attr: { type: "button" },
+          });
+          rmBtn.addEventListener("click", () => {
+            void this.coordinator.socket
+              .removeWorktree(openWsId, false)
+              .then(() => this.coordinator.refreshAll(true))
+              .catch((err: unknown) => {
+                new Notice(err instanceof Error ? err.message : String(err));
+              });
+          });
+        }
+      }
     }
   }
 
-  private renderAgentCard(
+  private renderCompactLayoutMap(
+    parent: HTMLElement,
+    layout: PaneLayoutSnapshot,
+    snap: SessionSnapshot
+  ): void {
+    const originX =
+      typeof layout.area.x === "number"
+        ? layout.area.x
+        : Math.min(...layout.panes.map((p) => p.rect.x));
+    const originY =
+      typeof layout.area.y === "number"
+        ? layout.area.y
+        : Math.min(...layout.panes.map((p) => p.rect.y));
+    const totalW = Math.max(1, layout.area.width);
+    const totalH = Math.max(1, layout.area.height);
+    const canvas = parent.createDiv({ cls: "herdr-mc-layoutmap" });
+
+    for (const lp of layout.panes) {
+      const paneMeta = snap.panes.find((p) => p.pane_id === lp.pane_id);
+      const agentMeta = snap.agents.find((a) => a.pane_id === lp.pane_id);
+      const status = agentMeta?.agent_status || paneMeta?.agent_status || "idle";
+      const label =
+        paneMeta?.label ||
+        agentMeta?.name ||
+        paneMeta?.display_agent ||
+        paneMeta?.agent ||
+        lp.pane_id;
+
+      const relX = Math.max(0, lp.rect.x - originX);
+      const relY = Math.max(0, lp.rect.y - originY);
+      const cell = canvas.createEl("button", {
+        cls: `herdr-mc-layoutmap-pane is-${status}${lp.focused ? " is-focused" : ""}`,
+        text: label,
+        attr: {
+          type: "button",
+          title: `${label} (${lp.pane_id}) · ${status}${paneMeta?.cwd ? ` · ${paneMeta.cwd}` : ""}`,
+        },
+      });
+      cell.style.left = `${((relX / totalW) * 100).toFixed(2)}%`;
+      cell.style.top = `${((relY / totalH) * 100).toFixed(2)}%`;
+      cell.style.width = `${((lp.rect.width / totalW) * 100).toFixed(2)}%`;
+      cell.style.height = `${((lp.rect.height / totalH) * 100).toFixed(2)}%`;
+
+      cell.addEventListener("click", () => {
+        void this.coordinator.socket
+          .focusPane(lp.pane_id)
+          .then(() => this.coordinator.refreshAll(false))
+          .catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
+      });
+    }
+  }
+
+  private renderAgentRow(
     parent: HTMLElement,
     agent: AgentInfo,
-    state: CoordinatorState
+    state: CoordinatorState,
+    snap: SessionSnapshot
   ): void {
-    const card = parent.createDiv({
-      cls: `herdr-agent-card herdr-border-${agent.agent_status}`,
+    const label = this.resolveAgentDisplayLabel(agent, snap.panes);
+    const targetId = agent.name || agent.pane_id;
+    const tooltipParts = [`Pane: ${agent.pane_id}`, `Runtime: ${agent.agent || "shell"}`];
+    if (agent.cwd) {
+      tooltipParts.push(`CWD: ${agent.cwd}`);
+    }
+
+    const row = parent.createDiv({
+      cls: "herdr-mc-agent-row",
+      attr: { title: tooltipParts.join(" | ") },
     });
 
-    const header = card.createDiv({ cls: "herdr-card-header" });
-    const titleGroup = header.createDiv({ cls: "herdr-card-title-group" });
-    titleGroup.createSpan({
-      cls: "herdr-card-title",
-      text: agent.display_agent || agent.name || agent.agent || agent.pane_id,
-    });
-    titleGroup.createSpan({
-      cls: "herdr-mono-badge",
-      text: agent.pane_id,
-    });
+    const top = row.createDiv({ cls: "herdr-card-header" });
+    top.createSpan({ cls: "herdr-mc-agent-name", text: label });
 
-    header.createSpan({
-      cls: `herdr-status-pill herdr-status-${agent.agent_status}`,
+    const right = top.createDiv({ cls: "herdr-mc-actions" });
+    right.createSpan({
+      cls: `herdr-mc-pill is-${agent.agent_status}`,
       text: agent.agent_status,
     });
 
-    if (agent.terminal_title_stripped) {
-      card.createDiv({
-        cls: "herdr-agent-subtitle",
-        text: agent.terminal_title_stripped,
-      });
-    }
+    const moreBtn = right.createEl("button", {
+      cls: "clickable-icon herdr-mc-more",
+      attr: { "aria-label": `Actions for ${label}`, title: `Actions for ${label}`, type: "button" },
+    });
+    setIcon(moreBtn, "more-horizontal");
+    moreBtn.addEventListener("click", (ev: MouseEvent) => {
+      this.openAgentMenu(ev, agent, targetId, state.activeSessionName);
+    });
 
-    const meta = card.createDiv({ cls: "herdr-agent-meta" });
-    meta.createSpan({ text: `Runtime: ${agent.agent || "shell"}` });
-    if (agent.cwd) {
-      meta.createSpan({ text: `CWD: ${agent.cwd}` });
-    }
-
-    const targetId = agent.name || agent.pane_id;
-
-    if (agent.agent_status === "blocked") {
-      const quickBar = card.createDiv({ cls: "herdr-blocked-bar" });
-      quickBar.createSpan({
-        cls: "herdr-blocked-label",
-        text: "Agent needs input:",
-      });
-      for (const keySpec of [
-        { label: "Approve (y + Enter)", keys: ["y", "enter"] },
-        { label: "Enter", keys: ["enter"] },
-        { label: "Esc", keys: ["esc"] },
-        { label: "Cancel (Ctrl+C)", keys: ["ctrl+c"] },
-      ]) {
-        const kBtn = quickBar.createEl("button", {
-          text: keySpec.label,
-          cls: "herdr-btn-compact",
-        });
-        kBtn.disabled = state.usingOfflinePreview;
-        kBtn.addEventListener("click", () => {
-          void this.sendAgentQuickKeys(targetId, keySpec.keys);
-        });
-      }
-    }
-
-    const promptRow = card.createDiv({ cls: "herdr-prompt-row" });
+    const promptRow = row.createDiv({ cls: "herdr-mc-agent-prompt" });
     const input = promptRow.createEl("input", {
       type: "text",
       cls: "herdr-prompt-input",
-      placeholder: state.usingOfflinePreview
-        ? "Start live session to prompt agent..."
-        : `Prompt ${targetId}...`,
-      attr: { "aria-label": `Prompt ${targetId}` },
+      placeholder: `Message ${label}...`,
+      attr: { "aria-label": `Message ${label}` },
     });
-    input.disabled = state.usingOfflinePreview;
     if (this.selectedAgentKey === targetId && this.promptDraft) {
       input.value = this.promptDraft;
     }
@@ -496,8 +800,8 @@ export class HerdrDashboardView extends ItemView {
     const sendBtn = promptRow.createEl("button", {
       text: "Send",
       cls: "mod-cta herdr-btn-compact",
+      attr: { type: "button" },
     });
-    sendBtn.disabled = state.usingOfflinePreview;
     const submitPrompt = () => {
       const val = input.value.trim();
       if (!val) {
@@ -514,436 +818,301 @@ export class HerdrDashboardView extends ItemView {
         submitPrompt();
       }
     });
-
-    const actions = card.createDiv({ cls: "herdr-action-row" });
-    const tailBtn = actions.createEl("button", {
-      text: "Read output",
-      cls: "herdr-btn-compact",
-    });
-    tailBtn.addEventListener("click", () => {
-      void this.loadAgentTail(targetId, state.usingOfflinePreview);
-    });
-
-    const explainBtn = actions.createEl("button", {
-      text: "Explain state",
-      cls: "herdr-btn-compact",
-    });
-    explainBtn.disabled = state.usingOfflinePreview;
-    explainBtn.addEventListener("click", () => {
-      void this.loadAgentExplain(targetId);
-    });
-
-    const attachBtn = actions.createEl("button", {
-      text: "Attach in terminal",
-      cls: "herdr-btn-compact",
-    });
-    attachBtn.disabled = state.usingOfflinePreview;
-    attachBtn.addEventListener("click", () => {
-      void this.openTerminalLeaf({
-        agentTarget: targetId,
-        sessionName: state.activeSessionName,
-        split: true,
-      });
-    });
-
-    const sendNoteBtn = actions.createEl("button", {
-      text: "Send active note",
-      cls: "herdr-btn-compact",
-    });
-    sendNoteBtn.disabled = state.usingOfflinePreview;
-    sendNoteBtn.addEventListener("click", () => {
-      new DispatchNoteModal(this.app, this.coordinator, targetId).open();
-    });
   }
 
-  private renderTopologyTab(parent: HTMLElement, state: CoordinatorState): void {
-    const snap = state.snapshot;
-    const toolbar = parent.createDiv({ cls: "herdr-section-toolbar" });
-
-    const newWsBtn = toolbar.createEl("button", {
-      text: "New vault workspace",
-      cls: "mod-cta herdr-btn-compact",
-    });
-    newWsBtn.disabled = !state.serverRunning;
-    newWsBtn.addEventListener("click", () => {
-      void this.coordinator.createVaultWorkspace().catch((err: unknown) => {
-        new Notice(err instanceof Error ? err.message : String(err));
-      });
-    });
-
-    const wtBtn = toolbar.createEl("button", {
-      text: "New Git worktree",
-      cls: "herdr-btn-compact",
-    });
-    wtBtn.disabled = !state.serverRunning;
-    wtBtn.addEventListener("click", () => {
-      new CreateWorktreeModal(this.app, this.coordinator).open();
-    });
-
-    const applyLayoutBtn = toolbar.createEl("button", {
-      text: "Apply layout from note",
-      cls: "herdr-btn-compact",
-    });
-    applyLayoutBtn.disabled = !state.serverRunning;
-    applyLayoutBtn.addEventListener("click", () => {
-      const targetWsId =
-        (this.selectedWorkspaceId &&
-          snap?.workspaces.some((w) => w.workspace_id === this.selectedWorkspaceId)
-          ? this.selectedWorkspaceId
-          : snap?.focused_workspace_id || snap?.workspaces[0]?.workspace_id) || undefined;
-      void this.applyLayoutFromActiveNote(targetWsId);
-    });
-
-    const filterViewBtn = toolbar.createEl("button", {
-      text: "Filter TUI to workspace",
-      cls: "herdr-btn-compact",
-    });
-    filterViewBtn.disabled = !state.serverRunning || !snap?.workspaces.length;
-    filterViewBtn.addEventListener("click", () => {
-      const targetWsId =
-        this.selectedWorkspaceId &&
-        snap?.workspaces.some((w) => w.workspace_id === this.selectedWorkspaceId)
-          ? this.selectedWorkspaceId
-          : snap?.focused_workspace_id || snap?.workspaces[0]?.workspace_id || "";
-      if (targetWsId) {
-        void this.setWorkspaceTuiFilter(targetWsId);
-      }
-    });
-
-    const clearViewBtn = toolbar.createEl("button", {
-      text: "Clear TUI filter",
-      cls: "herdr-btn-compact",
-    });
-    clearViewBtn.disabled = !state.serverRunning;
-    clearViewBtn.addEventListener("click", () => {
-      void this.clearWorkspaceTuiFilter();
-    });
-
-    if (!snap || snap.workspaces.length === 0) {
-      parent.createDiv({
-        cls: "herdr-empty-card",
-        text: "No Herdr workspaces are available. Start a session to inspect workspaces, tabs, and split panes.",
-      });
-      return;
-    }
-
-    const activeWsId =
-      this.selectedWorkspaceId &&
-      snap.workspaces.some((w) => w.workspace_id === this.selectedWorkspaceId)
-        ? this.selectedWorkspaceId
-        : snap.focused_workspace_id || snap.workspaces[0].workspace_id;
-
-    const wsRow = parent.createDiv({ cls: "herdr-workspace-chips" });
-    for (const ws of snap.workspaces) {
-      const chip = wsRow.createEl("button", {
-        cls: `herdr-ws-chip ${ws.workspace_id === activeWsId ? "is-selected" : ""}`,
-        text: `${ws.label} (${ws.workspace_id})`,
-      });
-      chip.addEventListener("click", () => {
-        this.selectedWorkspaceId = ws.workspace_id;
-        if (state.serverRunning) {
-          void this.coordinator.socket
-            .focusWorkspace(ws.workspace_id)
-            .then(() => this.coordinator.refreshAll(false))
-            .catch((err: unknown) => {
-              new Notice(err instanceof Error ? err.message : String(err));
-            });
-        } else {
-          this.renderDashboard();
-        }
-      });
-    }
-
-    const selectedWs = snap.workspaces.find((w) => w.workspace_id === activeWsId);
-    if (selectedWs?.worktree) {
-      const wtBanner = parent.createDiv({ cls: "herdr-worktree-chip" });
-      wtBanner.setText(
-        `Git worktree: ${selectedWs.worktree.repo_name} -> ${selectedWs.worktree.checkout_path}`
-      );
-    }
-
-    const wsTabs = snap.tabs.filter((t) => t.workspace_id === activeWsId);
-    for (const tab of wsTabs) {
-      const tabCard = parent.createDiv({ cls: "herdr-section-card" });
-      const head = tabCard.createDiv({ cls: "herdr-card-header" });
-      head.createSpan({
-        cls: "herdr-card-title",
-        text: `Tab ${tab.number}: ${tab.label} (${tab.tab_id})`,
-      });
-      const headRight = head.createDiv({ cls: "herdr-action-row" });
-      headRight.createSpan({
-        cls: `herdr-status-pill herdr-status-${tab.agent_status}`,
-        text: tab.agent_status,
-      });
-      const saveLayoutBtn = headRight.createEl("button", {
-        text: "Save layout to note",
-        cls: "herdr-btn-compact",
-      });
-      saveLayoutBtn.disabled = !state.serverRunning;
-      saveLayoutBtn.addEventListener("click", () => {
-        void this.saveTabLayoutToNote(
-          selectedWs?.label || activeWsId,
-          tab.tab_id,
-          tab.label
-        );
-      });
-
-      const layout = snap.layouts.find((l) => l.tab_id === tab.tab_id);
-      if (layout && layout.panes.length > 0) {
-        this.renderLayoutMap(tabCard, layout, snap, state.serverRunning);
-      }
-
-      const panesInTab = snap.panes.filter(
-        (p) =>
-          p.tab_id === tab.tab_id ||
-          Boolean(layout?.panes.some((lp) => lp.pane_id === p.pane_id))
-      );
-
-      const list = tabCard.createDiv({ cls: "herdr-pane-list" });
-      for (const pane of panesInTab) {
-        const row = list.createDiv({ cls: "herdr-pane-row" });
-        const info = row.createDiv({ cls: "herdr-pane-info" });
-        info.createSpan({ cls: "herdr-mono-badge", text: pane.pane_id });
-        info.createSpan({
-          text:
-            pane.display_agent ||
-            pane.label ||
-            pane.terminal_title_stripped ||
-            pane.cwd ||
-            "shell",
-        });
-        info.createSpan({
-          cls: `herdr-status-pill herdr-status-${pane.agent_status}`,
-          text: pane.agent_status,
-        });
-
-        const controls = row.createDiv({ cls: "herdr-pane-controls" });
-        for (const act of [
-          {
-            label: "Split right",
-            fn: () =>
-              this.coordinator.socket.splitPane({
-                targetPaneId: pane.pane_id,
-                direction: "right",
-                cwd: this.coordinator.vaultOps.getVaultBasePath() || undefined,
-                env: this.coordinator.getBridgeEnv(),
-              }),
-          },
-          {
-            label: "Split down",
-            fn: () =>
-              this.coordinator.socket.splitPane({
-                targetPaneId: pane.pane_id,
-                direction: "down",
-                cwd: this.coordinator.vaultOps.getVaultBasePath() || undefined,
-                env: this.coordinator.getBridgeEnv(),
-              }),
-          },
-          {
-            label: "Zoom",
-            fn: () => this.coordinator.socket.zoomPane(pane.pane_id, "toggle"),
-          },
-        ]) {
-          const b = controls.createEl("button", {
-            text: act.label,
-            cls: "herdr-btn-compact",
-          });
-          b.disabled = !state.serverRunning;
-          b.addEventListener("click", () => {
-            void act
-              .fn()
-              .then(() => this.coordinator.refreshAll(false))
-              .catch((err: unknown) => {
-                new Notice(err instanceof Error ? err.message : String(err));
-              });
-          });
-        }
-      }
-    }
-
-    if (state.worktrees.length > 0) {
-      const wtCard = parent.createDiv({ cls: "herdr-section-card" });
-      wtCard.createDiv({
-        cls: "herdr-card-title",
-        text: `Git worktrees (${state.worktrees.length})`,
-      });
-      const wtList = wtCard.createDiv({ cls: "herdr-pane-list" });
-      for (const wt of state.worktrees) {
-        const row = wtList.createDiv({ cls: "herdr-pane-row" });
-        const info = row.createDiv({ cls: "herdr-pane-info" });
-        info.createSpan({
-          cls: "herdr-mono-badge",
-          text: wt.branch || wt.label || "worktree",
-        });
-        info.createSpan({ cls: "herdr-muted-copy", text: wt.path });
-        const openWsId = wt.open_workspace_id || wt.workspace_id || "";
-        if (openWsId) {
-          info.createSpan({
-            cls: "herdr-status-pill herdr-status-working",
-            text: openWsId,
-          });
-        }
-
-        const controls = row.createDiv({ cls: "herdr-pane-controls" });
-        if (!openWsId) {
-          const openBtn = controls.createEl("button", {
-            text: "Open worktree",
-            cls: "herdr-btn-compact",
-          });
-          openBtn.disabled = !state.serverRunning;
-          openBtn.addEventListener("click", () => {
-            void this.coordinator.socket
-              .openWorktree({
-                path: wt.path,
-                branch: wt.branch || undefined,
-                focus: true,
-              })
-              .then(() => this.coordinator.refreshAll(true))
-              .catch((err: unknown) => {
-                new Notice(err instanceof Error ? err.message : String(err));
-              });
-          });
-        } else if (wt.is_linked_worktree !== false && !wt.is_main) {
-          const rmBtn = controls.createEl("button", {
-            text: "Remove worktree",
-            cls: "herdr-btn-compact",
-          });
-          rmBtn.disabled = !state.serverRunning;
-          rmBtn.addEventListener("click", () => {
-            void this.coordinator.socket
-              .removeWorktree(openWsId, false)
-              .then(() => this.coordinator.refreshAll(true))
-              .catch((err: unknown) => {
-                new Notice(err instanceof Error ? err.message : String(err));
-              });
-          });
-        }
-      }
-    }
-  }
-
-  private renderLayoutMap(
-    parent: HTMLElement,
-    layout: PaneLayoutSnapshot,
-    snap: SessionSnapshot,
-    live: boolean
+  private openAgentMenu(
+    ev: MouseEvent,
+    agent: AgentInfo,
+    targetId: string,
+    sessionName: string
   ): void {
-    const originX =
-      typeof layout.area.x === "number"
-        ? layout.area.x
-        : Math.min(...layout.panes.map((p) => p.rect.x));
-    const originY =
-      typeof layout.area.y === "number"
-        ? layout.area.y
-        : Math.min(...layout.panes.map((p) => p.rect.y));
-    const totalW = Math.max(1, layout.area.width);
-    const totalH = Math.max(1, layout.area.height);
-    const canvas = parent.createDiv({ cls: "herdr-layout-map" });
+    const menu = new Menu();
 
-    for (const lp of layout.panes) {
-      const paneMeta = snap.panes.find((p) => p.pane_id === lp.pane_id);
-      const relX = Math.max(0, lp.rect.x - originX);
-      const relY = Math.max(0, lp.rect.y - originY);
-      const leftPct = ((relX / totalW) * 100).toFixed(2) + "%";
-      const topPct = ((relY / totalH) * 100).toFixed(2) + "%";
-      const widthPct = ((lp.rect.width / totalW) * 100).toFixed(2) + "%";
-      const heightPct = ((lp.rect.height / totalH) * 100).toFixed(2) + "%";
+    menu.addItem((item) =>
+      item
+        .setTitle("Read output")
+        .setIcon("file-text")
+        .onClick(() => {
+          void this.loadAgentTail(targetId);
+        })
+    );
 
-      const cell = canvas.createEl("button", {
-        cls: `herdr-layout-cell ${lp.focused ? "is-focused" : ""} herdr-border-${paneMeta?.agent_status || "idle"}`,
-        attr: { type: "button" },
-      });
-      cell.style.setProperty("--herdr-rect-left", leftPct);
-      cell.style.setProperty("--herdr-rect-top", topPct);
-      cell.style.setProperty("--herdr-rect-width", widthPct);
-      cell.style.setProperty("--herdr-rect-height", heightPct);
+    menu.addItem((item) =>
+      item
+        .setTitle("Attach in terminal")
+        .setIcon("terminal")
+        .onClick(() => {
+          void this.openTerminalLeaf({
+            agentTarget: targetId,
+            sessionName,
+            split: true,
+          }).catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
+        })
+    );
 
-      cell.createSpan({ cls: "herdr-mono-badge", text: lp.pane_id });
-      cell.createSpan({
-        cls: "herdr-cell-title",
-        text: paneMeta?.display_agent || paneMeta?.label || paneMeta?.agent || "shell",
-      });
+    menu.addItem((item) =>
+      item
+        .setTitle("Send active note")
+        .setIcon("send")
+        .onClick(() => {
+          new DispatchNoteModal(this.app, this.coordinator, targetId).open();
+        })
+    );
 
-      if (live) {
-        cell.addEventListener("click", () => {
+    menu.addItem((item) =>
+      item
+        .setTitle("Open context dispatcher")
+        .setIcon("share")
+        .onClick(() => {
+          new DispatchNoteModal(this.app, this.coordinator).open();
+        })
+    );
+
+    menu.addSeparator();
+
+    const cwd = this.coordinator.vaultOps.getVaultBasePath() || undefined;
+    menu.addItem((item) =>
+      item
+        .setTitle("Split right")
+        .setIcon("columns-2")
+        .onClick(() => {
           void this.coordinator.socket
-            .focusPane(lp.pane_id)
+            .splitPane({
+              targetPaneId: agent.pane_id,
+              direction: "right",
+              cwd,
+              env: this.coordinator.getBridgeEnv(),
+            })
             .then(() => this.coordinator.refreshAll(false))
             .catch((err: unknown) => {
               new Notice(err instanceof Error ? err.message : String(err));
             });
-        });
-      }
-    }
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Split down")
+        .setIcon("rows-2")
+        .onClick(() => {
+          void this.coordinator.socket
+            .splitPane({
+              targetPaneId: agent.pane_id,
+              direction: "down",
+              cwd,
+              env: this.coordinator.getBridgeEnv(),
+            })
+            .then(() => this.coordinator.refreshAll(false))
+            .catch((err: unknown) => {
+              new Notice(err instanceof Error ? err.message : String(err));
+            });
+        })
+    );
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Zoom")
+        .setIcon("maximize-2")
+        .onClick(() => {
+          void this.coordinator.socket
+            .zoomPane(agent.pane_id, "toggle")
+            .then(() => this.coordinator.refreshAll(false))
+            .catch((err: unknown) => {
+              new Notice(err instanceof Error ? err.message : String(err));
+            });
+        })
+    );
+
+    menu.addSeparator();
+
+    menu.addItem((item) =>
+      item
+        .setTitle("Why this status?")
+        .setIcon("help-circle")
+        .onClick(() => {
+          void this.loadAgentExplain(targetId);
+        })
+    );
+
+    menu.showAtMouseEvent(ev);
   }
 
-  private renderBridgeTab(parent: HTMLElement, state: CoordinatorState): void {
-    const card = parent.createDiv({ cls: "herdr-section-card" });
-    const head = card.createDiv({ cls: "herdr-card-header" });
-    head.createSpan({
-      cls: "herdr-card-title",
-      text: "Obsidian Vault Control Bridge",
-    });
-    head.createSpan({
-      cls: `herdr-status-pill ${state.bridgeRunning ? "herdr-status-done" : "herdr-status-idle"}`,
-      text: state.bridgeRunning ? "Active (authenticated)" : "Stopped",
+  private renderVaultTab(parent: HTMLElement, state: CoordinatorState): void {
+    const accessSection = parent.createDiv({ cls: "herdr-mc-section" });
+    accessSection.createDiv({
+      cls: "herdr-mc-section-title",
+      text: state.bridgeRunning ? "Vault access: active" : "Vault access: off",
     });
 
-    card.createEl("p", {
-      cls: "herdr-muted-copy",
-      text: "Lets Herdr panes and AI coding agents read, search, edit frontmatter, link-safe rename, trash, and open vault notes through native Obsidian APIs over a mode-0600 local socket.",
+    const currentMode: VaultPermissionMode = state.bridgeRunning
+      ? this.getSettings().vaultPermissionMode
+      : "off";
+
+    const seg = accessSection.createDiv({
+      cls: "herdr-mc-segmented",
+      attr: { role: "radiogroup", "aria-label": "Vault permission level" },
     });
-
-    const permRow = card.createDiv({ cls: "herdr-permission-row" });
-    permRow.createSpan({ cls: "herdr-field-label", text: "Permission tier:" });
-
-    const currentMode = this.getSettings().vaultPermissionMode;
-    const modes: Array<{ id: VaultPermissionMode; label: string }> = [
-      { id: "read-only", label: "Read-only" },
-      { id: "read-write", label: "Read-write (safe APIs)" },
-      { id: "full", label: "Full (+ commands)" },
-      { id: "off", label: "Off" },
-    ];
-    for (const m of modes) {
-      const btn = permRow.createEl("button", {
-        text: m.label,
-        cls: `herdr-btn-compact ${currentMode === m.id ? "mod-cta" : ""}`,
+    for (const tier of VAULT_TIERS) {
+      const btn = seg.createEl("button", {
+        text: tier.label,
+        cls: currentMode === tier.id ? "is-active" : "",
+        attr: {
+          type: "button",
+          role: "radio",
+          "aria-checked": currentMode === tier.id ? "true" : "false",
+        },
       });
       btn.addEventListener("click", () => {
         void this.updateSettings({
-          vaultBridgeEnabled: m.id !== "off",
-          vaultPermissionMode: m.id,
+          vaultBridgeEnabled: tier.id !== "off",
+          vaultPermissionMode: tier.id,
+        }).catch((err: unknown) => {
+          new Notice(err instanceof Error ? err.message : String(err));
         });
       });
     }
 
-    const pathGrid = card.createDiv({ cls: "herdr-kv-grid" });
-    this.addKvRow(pathGrid, "Bridge socket", state.bridgeSocketPath);
-    this.addKvRow(pathGrid, "CLI & MCP binary", state.cliScriptPath);
-    this.addKvRow(pathGrid, "Herdr plugin manifest", state.herdrPluginManifestPath);
+    const activeTier = VAULT_TIERS.find((t) => t.id === currentMode) ?? VAULT_TIERS[0];
+    accessSection.createDiv({
+      cls: "herdr-mc-hint",
+      text: activeTier.description,
+    });
 
-    const actions = card.createDiv({ cls: "herdr-action-row" });
+    // Activity list
+    const activitySection = parent.createDiv({ cls: "herdr-mc-section" });
+    const actHead = activitySection.createDiv({ cls: "herdr-card-header" });
+    actHead.createSpan({ cls: "herdr-mc-section-title", text: "Activity" });
+
+    const filterRow = actHead.createDiv({ cls: "herdr-mc-log-filter" });
+    const toggleBtn = filterRow.createEl("button", {
+      text: this.showAllActivity ? "Edits only" : "Show all activity",
+      cls: "herdr-btn-compact",
+      attr: { type: "button" },
+    });
+    toggleBtn.addEventListener("click", () => {
+      this.showAllActivity = !this.showAllActivity;
+      this.renderDashboard();
+    });
+
+    const allEntries = this.coordinator.vaultOps.getAuditLog();
+    if (allEntries.length > 0) {
+      const clearBtn = filterRow.createEl("button", {
+        text: "Clear log",
+        cls: "herdr-btn-compact",
+        attr: { type: "button" },
+      });
+      clearBtn.addEventListener("click", () => {
+        this.coordinator.vaultOps.clearAuditLog();
+      });
+    }
+
+    const visibleEntries = this.showAllActivity
+      ? allEntries
+      : allEntries.filter(isEditActivity);
+
+    if (visibleEntries.length === 0) {
+      activitySection.createDiv({
+        cls: "herdr-mc-hint",
+        text:
+          allEntries.length === 0
+            ? "No vault activity recorded in this session yet."
+            : "No note edits recorded yet. Switch to 'Show all activity' to view reads and UI actions.",
+      });
+    } else {
+      const list = activitySection.createDiv({ cls: "herdr-mc-log" });
+      for (const item of visibleEntries.slice(0, 40)) {
+        const row = list.createDiv({
+          cls: "herdr-mc-log-row",
+          attr: { title: `${item.method} (${item.caller})` },
+        });
+        row.createSpan({
+          cls: "herdr-mc-log-time",
+          text: new Date(item.timestamp).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }),
+        });
+        const summaryEl = row.createSpan({
+          cls: "herdr-mc-log-text",
+          text: item.summary,
+        });
+        if (item.targetPath) {
+          const af = this.app.vault.getAbstractFileByPath(item.targetPath);
+          if (af instanceof TFile) {
+            summaryEl.addClass("mod-clickable");
+            summaryEl.setAttr("title", `Click to open ${item.targetPath}`);
+            summaryEl.addEventListener("click", () => {
+              void this.app.workspace
+                .getLeaf(false)
+                .openFile(af)
+                .catch((err: unknown) => {
+                  new Notice(err instanceof Error ? err.message : String(err));
+                });
+            });
+          }
+        }
+        if (item.snapshot && !item.undone) {
+          const undoBtn = row.createEl("button", {
+            text: "Undo",
+            cls: "herdr-mc-log-undo",
+            attr: { type: "button" },
+          });
+          undoBtn.addEventListener("click", () => {
+            void this.coordinator.vaultOps
+              .undoMutation(item.id)
+              .then((msg) => {
+                new Notice(msg);
+                this.renderDashboard();
+              })
+              .catch((err: unknown) => {
+                new Notice(err instanceof Error ? err.message : String(err));
+              });
+          });
+        } else if (item.undone) {
+          row.createSpan({ cls: "herdr-mc-hint", text: "Undone" });
+        }
+      }
+    }
+
+    // Connection details (collapsed)
+    const details = parent.createEl("details", { cls: "herdr-mc-details" });
+    details.createEl("summary", { text: "Connection details" });
+
+    const kv = details.createDiv({ cls: "herdr-mc-kv" });
+    this.addKvRow(kv, "Socket", state.bridgeSocketPath);
+    this.addKvRow(kv, "CLI script", state.cliScriptPath);
+    this.addKvRow(kv, "Plugin manifest", state.herdrPluginManifestPath);
+
+    const actions = details.createDiv({ cls: "herdr-action-row" });
 
     const selfTestBtn = actions.createEl("button", {
-      text: "Run live bridge self-test",
+      text: "Run self-test",
       cls: "herdr-btn-compact",
+      attr: { type: "button" },
     });
     selfTestBtn.addEventListener("click", () => {
       void this.runBridgeSelfTest();
     });
 
     const copyCliBtn = actions.createEl("button", {
-      text: "Copy obs-herdr CLI path",
+      text: "Copy CLI path",
       cls: "herdr-btn-compact",
+      attr: { type: "button" },
     });
     copyCliBtn.addEventListener("click", () => {
-      void navigator.clipboard.writeText(state.cliScriptPath);
+      void navigator.clipboard.writeText(state.cliScriptPath).catch((err: unknown) => {
+        console.warn("[herdr-obs] Clipboard write failed:", err);
+      });
       new Notice("Copied obs-herdr CLI path to clipboard.");
     });
 
     const copyMcpBtn = actions.createEl("button", {
-      text: "Copy MCP JSON config",
+      text: "Copy MCP config",
       cls: "herdr-btn-compact",
+      attr: { type: "button" },
     });
     copyMcpBtn.addEventListener("click", () => {
       const mcpJson = JSON.stringify(
@@ -958,8 +1127,10 @@ export class HerdrDashboardView extends ItemView {
         null,
         2
       );
-      void navigator.clipboard.writeText(mcpJson);
-      new Notice("Copied stdio MCP server configuration to clipboard.");
+      void navigator.clipboard.writeText(mcpJson).catch((err: unknown) => {
+        console.warn("[herdr-obs] Clipboard write failed:", err);
+      });
+      new Notice("Copied MCP configuration to clipboard.");
     });
 
     if (state.serverRunning) {
@@ -970,8 +1141,9 @@ export class HerdrDashboardView extends ItemView {
           p.manifest_path === state.herdrPluginManifestPath
       );
       const linkBtn = actions.createEl("button", {
-        text: isLinked ? "Unlink obsidian.vault Herdr plugin" : "Link obsidian.vault into Herdr",
+        text: isLinked ? "Unlink from Herdr" : "Link into Herdr",
         cls: "herdr-btn-compact",
+        attr: { type: "button" },
       });
       linkBtn.addEventListener("click", () => {
         void (isLinked
@@ -982,7 +1154,7 @@ export class HerdrDashboardView extends ItemView {
             new Notice(
               isLinked
                 ? "Unlinked obsidian.vault from Herdr."
-                : "Linked obsidian.vault native actions into Herdr."
+                : "Linked obsidian.vault actions into Herdr."
             );
           })
           .catch((err: unknown) => {
@@ -990,205 +1162,95 @@ export class HerdrDashboardView extends ItemView {
           });
       });
     }
-
-    // Audit Log
-    const auditCard = parent.createDiv({ cls: "herdr-section-card" });
-    const auditHead = auditCard.createDiv({ cls: "herdr-card-header" });
-    auditHead.createSpan({
-      cls: "herdr-card-title",
-      text: "Vault Control Audit Log",
-    });
-
-    const entries = this.coordinator.vaultOps.getAuditLog();
-    if (entries.length > 0) {
-      const clearBtn = auditHead.createEl("button", {
-        text: "Clear log",
-        cls: "herdr-btn-compact",
-      });
-      clearBtn.addEventListener("click", () => {
-        this.coordinator.vaultOps.clearAuditLog();
-      });
-    }
-
-    if (entries.length === 0) {
-      auditCard.createDiv({
-        cls: "herdr-muted-copy",
-        text: "No vault bridge requests recorded in this session yet.",
-      });
-      return;
-    }
-
-    const list = auditCard.createDiv({ cls: "herdr-audit-list" });
-    for (const item of entries.slice(0, 40)) {
-      const row = list.createDiv({
-        cls: `herdr-audit-row ${item.allowed ? "is-allowed" : "is-denied"}`,
-      });
-      const main = row.createDiv({ cls: "herdr-audit-main" });
-      main.createSpan({
-        cls: "herdr-mono-badge",
-        text: new Date(item.timestamp).toLocaleTimeString(),
-      });
-      main.createSpan({ cls: "herdr-mono-badge", text: item.method });
-      main.createSpan({ text: item.summary });
-
-      const rowBtns = row.createDiv({ cls: "herdr-audit-actions" });
-      if (item.targetPath) {
-        const af = this.app.vault.getAbstractFileByPath(item.targetPath);
-        if (af instanceof TFile) {
-          const openBtn = rowBtns.createEl("button", {
-            text: "Open note",
-            cls: "herdr-btn-compact",
-          });
-          openBtn.addEventListener("click", () => {
-            void this.app.workspace
-              .getLeaf(false)
-              .openFile(af)
-              .catch((err: unknown) => {
-                new Notice(err instanceof Error ? err.message : String(err));
-              });
-          });
-        }
-      }
-      if (item.snapshot && !item.undone) {
-        const undoBtn = rowBtns.createEl("button", {
-          text: "Undo",
-          cls: "herdr-btn-compact",
-        });
-        undoBtn.addEventListener("click", () => {
-          void this.coordinator.vaultOps
-            .undoMutation(item.id)
-            .then((msg) => {
-              new Notice(msg);
-              this.renderDashboard();
-            })
-            .catch((err: unknown) => {
-              new Notice(err instanceof Error ? err.message : String(err));
-            });
-        });
-      } else if (item.undone) {
-        rowBtns.createSpan({ cls: "herdr-muted-copy", text: "Undone" });
-      }
-    }
-  }
-
-  private renderDispatchTab(parent: HTMLElement, state: CoordinatorState): void {
-    const card = parent.createDiv({ cls: "herdr-section-card" });
-    card.createDiv({
-      cls: "herdr-card-title",
-      text: "Send vault note context to Herdr",
-    });
-
-    const activeFile = this.app.workspace.getActiveFile();
-    card.createEl("p", {
-      cls: "herdr-muted-copy",
-      text: activeFile
-        ? `Active note: ${activeFile.path} (${activeFile.stat.size} bytes)`
-        : "Open any Markdown note to bundle its frontmatter, backlinks, and body for a Herdr agent.",
-    });
-
-    const row = card.createDiv({ cls: "herdr-action-row" });
-    const modalBtn = row.createEl("button", {
-      text: "Open context dispatcher",
-      cls: "mod-cta",
-    });
-    modalBtn.disabled = !state.serverRunning;
-    modalBtn.addEventListener("click", () => {
-      new DispatchNoteModal(this.app, this.coordinator).open();
-    });
-
-    const copyPackBtn = row.createEl("button", {
-      text: "Copy active note context pack",
-    });
-    copyPackBtn.addEventListener("click", () => {
-      void this.coordinator
-        .buildActiveNoteContextPack({ includeBacklinks: true })
-        .then((pack) => {
-          void navigator.clipboard.writeText(pack.payload).catch((err: unknown) => {
-            console.warn("[herdr-obs] Clipboard write failed:", err);
-          });
-          new Notice(`Copied context pack for '${pack.title}'.`);
-        })
-        .catch((err: unknown) => {
-          new Notice(err instanceof Error ? err.message : String(err));
-        });
-    });
   }
 
   private renderDoctorTab(parent: HTMLElement, state: CoordinatorState): void {
-    const diagCard = parent.createDiv({ cls: "herdr-section-card" });
-    diagCard.createDiv({ cls: "herdr-card-title", text: "Runtime diagnostics" });
-
     if (state.protocolWarning) {
-      const warnBanner = diagCard.createDiv({ cls: "herdr-preview-banner" });
-      const warnText = warnBanner.createDiv({ cls: "herdr-preview-text" });
-      warnText.createEl("strong", { text: "Herdr protocol warning: " });
-      warnText.createSpan({ text: state.protocolWarning });
+      const warn = parent.createDiv({ cls: "herdr-mc-attention" });
+      warn.createEl("strong", { text: "Herdr protocol warning: " });
+      warn.createSpan({ text: state.protocolWarning });
     }
 
-    const kv = diagCard.createDiv({ cls: "herdr-kv-grid" });
+    const diagSection = parent.createDiv({ cls: "herdr-mc-section" });
+    diagSection.createDiv({ cls: "herdr-mc-section-title", text: "Diagnostics" });
+
+    const kv = diagSection.createDiv({ cls: "herdr-mc-kv" });
     this.addKvRow(kv, "Herdr binary", state.binaryPath || "Not found on PATH");
     this.addKvRow(
       kv,
-      "Client version / protocol",
+      "Version",
       state.statusPayload?.client?.version
         ? `${state.statusPayload.client.version} (protocol ${state.statusPayload.client.protocol ?? "?"})`
         : "No data"
     );
-    this.addKvRow(kv, "Target session", state.activeSessionName);
-    this.addKvRow(kv, "Herdr socket", state.socketPath);
+    this.addKvRow(kv, "Session", state.activeSessionName);
+    this.addKvRow(kv, "Socket", state.socketPath);
     this.addKvRow(
       kv,
-      "Event stream subscription",
-      state.socketSubscribed ? "Subscribed (live push)" : "Disconnected"
+      "Live updates",
+      state.socketSubscribed ? "Connected" : "Disconnected"
     );
     if (state.lastError) {
-      this.addKvRow(kv, "Last diagnostic message", state.lastError);
+      this.addKvRow(kv, "Last error", state.lastError);
     }
 
-    const sessionsCard = parent.createDiv({ cls: "herdr-section-card" });
-    sessionsCard.createDiv({ cls: "herdr-card-title", text: "Named Herdr sessions" });
+    // Named sessions: running first, stopped collapsed
+    const sessionsSection = parent.createDiv({ cls: "herdr-mc-section" });
+    sessionsSection.createDiv({ cls: "herdr-mc-section-title", text: "Sessions" });
 
-    if (state.sessions.length === 0) {
-      sessionsCard.createDiv({
-        cls: "herdr-muted-copy",
-        text: "No named sessions reported by herdr session list.",
+    const runningSessions = state.sessions.filter((s) => s.status === "running");
+    const stoppedSessions = state.sessions.filter((s) => s.status !== "running");
+
+    if (runningSessions.length === 0 && stoppedSessions.length === 0) {
+      sessionsSection.createDiv({
+        cls: "herdr-mc-hint",
+        text: "No named Herdr sessions found.",
       });
     } else {
-      const sList = sessionsCard.createDiv({ cls: "herdr-pane-list" });
-      for (const s of state.sessions) {
-        const row = sList.createDiv({ cls: "herdr-pane-row" });
-        const info = row.createDiv({ cls: "herdr-pane-info" });
-        info.createSpan({ cls: "herdr-mono-badge", text: s.name });
-        info.createSpan({
-          cls: `herdr-status-pill ${s.status === "running" ? "herdr-status-working" : "herdr-status-idle"}`,
-          text: s.status,
+      for (const s of runningSessions) {
+        const tooltip = s.socket ? `${s.name} (${s.socket})` : s.name;
+        const row = sessionsSection.createDiv({
+          cls: "herdr-mc-session-row",
+          attr: { title: tooltip },
         });
-        info.createSpan({ cls: "herdr-muted-copy", text: s.socket });
-
+        row.createSpan({ text: s.name });
+        row.createSpan({ cls: "herdr-mc-pill is-working", text: "running" });
         const attachBtn = row.createEl("button", {
-          text: "Attach terminal",
+          text: "Attach",
           cls: "herdr-btn-compact",
+          attr: { type: "button" },
         });
         attachBtn.addEventListener("click", () => {
-          void this.openTerminalLeaf({ sessionName: s.name });
+          void this.openTerminalLeaf({ sessionName: s.name }).catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
         });
+      }
+
+      if (stoppedSessions.length > 0) {
+        const stoppedDetails = sessionsSection.createEl("details", {
+          cls: "herdr-mc-details",
+        });
+        stoppedDetails.createEl("summary", {
+          text: `Stopped sessions (${stoppedSessions.length})`,
+        });
+        for (const s of stoppedSessions) {
+          const tooltip = s.socket ? `${s.name} (${s.socket})` : s.name;
+          const row = stoppedDetails.createDiv({
+            cls: "herdr-mc-session-row",
+            attr: { title: tooltip },
+          });
+          row.createSpan({ text: s.name });
+          row.createSpan({ cls: "herdr-mc-pill is-idle", text: s.status || "stopped" });
+        }
       }
     }
 
-    const cliCard = parent.createDiv({ cls: "herdr-section-card" });
-    cliCard.createDiv({
-      cls: "herdr-card-title",
-      text: "Detected CLI runtimes",
-    });
-    const cliGrid = cliCard.createDiv({ cls: "herdr-integration-grid" });
-    const cliChecks: Array<{ label: string; found: boolean; detail: string }> = [
-      { label: "herdr", found: Boolean(state.binaryPath), detail: state.binaryPath || "" },
-      { label: "obs-herdr", found: state.bridgeRunning, detail: state.cliScriptPath },
-    ];
-    for (const cliName of ["codex", "claude", "agy", "gemini", "opencode"]) {
-      const resolved = resolveExecutableOnNormalizedPath(cliName);
-      cliChecks.push({ label: cliName, found: Boolean(resolved), detail: resolved || "" });
-    }
+    // Detected CLI runtimes (cached for 60s to avoid repeated sync filesystem scans per refresh)
+    const cliSection = parent.createDiv({ cls: "herdr-mc-section" });
+    cliSection.createDiv({ cls: "herdr-mc-section-title", text: "Detected runtimes" });
+    const cliGrid = cliSection.createDiv({ cls: "herdr-integration-grid" });
+    const cliChecks = this.getCachedCliChecks(state);
     for (const check of cliChecks) {
       const pill = cliGrid.createDiv({
         cls: "herdr-integration-item",
@@ -1196,43 +1258,98 @@ export class HerdrDashboardView extends ItemView {
       });
       pill.createSpan({ text: check.label });
       pill.createSpan({
-        cls: `herdr-status-pill ${check.found ? "herdr-status-done" : "herdr-status-idle"}`,
-        text: check.found ? "detected" : "not found",
+        cls: `herdr-mc-pill ${check.found ? "is-done" : "is-idle"}`,
+        text: check.found ? "ready" : "missing",
       });
     }
 
-    const intCard = parent.createDiv({ cls: "herdr-section-card" });
-    intCard.createDiv({
-      cls: "herdr-card-title",
-      text: "Optional Herdr lifecycle hooks (read-only)",
+    // Optional hooks (collapsed)
+    const hookDetails = parent.createEl("details", { cls: "herdr-mc-details" });
+    hookDetails.createEl("summary", {
+      text: `Optional agent hooks (${state.integrations.length})`,
     });
-    intCard.createEl("p", {
-      cls: "herdr-muted-copy",
-      text: "Optional shell hooks from Herdr. CLI agents still launch and run inside Herdr panes without them.",
-    });
-
     if (state.integrations.length === 0) {
-      intCard.createDiv({
-        cls: "herdr-muted-copy",
-        text: "Run refresh with Herdr installed to inspect agent hook statuses.",
+      hookDetails.createDiv({
+        cls: "herdr-mc-hint",
+        text: "Refresh with Herdr installed to check optional shell hooks.",
       });
     } else {
-      const grid = intCard.createDiv({ cls: "herdr-integration-grid" });
+      const grid = hookDetails.createDiv({ cls: "herdr-integration-grid" });
       for (const item of state.integrations) {
         const pill = grid.createDiv({ cls: "herdr-integration-item" });
         pill.createSpan({ text: item.target });
         pill.createSpan({
-          cls: `herdr-status-pill ${item.installed ? "herdr-status-done" : "herdr-status-idle"}`,
-          text: item.installed ? "hook active" : "optional",
+          cls: `herdr-mc-pill ${item.installed ? "is-done" : "is-idle"}`,
+          text: item.installed ? "active" : "optional",
         });
       }
     }
   }
 
+  private getCachedCliChecks(
+    state: CoordinatorState
+  ): Array<{ label: string; found: boolean; detail: string }> {
+    const now = Date.now();
+    if (!this.cachedCliChecks || now - this.cachedCliChecksAt > 60000) {
+      const scanned: Array<{ label: string; found: boolean; detail: string }> = [];
+      for (const cliName of ["codex", "claude", "agy", "gemini", "opencode"]) {
+        const resolved = resolveExecutableOnNormalizedPath(cliName);
+        scanned.push({ label: cliName, found: Boolean(resolved), detail: resolved || "" });
+      }
+      this.cachedCliChecks = scanned;
+      this.cachedCliChecksAt = now;
+    }
+    return [
+      { label: "herdr", found: Boolean(state.binaryPath), detail: state.binaryPath || "" },
+      { label: "obs-herdr", found: state.bridgeRunning, detail: state.cliScriptPath },
+      ...this.cachedCliChecks,
+    ];
+  }
+
   private addKvRow(parent: HTMLElement, key: string, value: string): void {
-    const row = parent.createDiv({ cls: "herdr-kv-row" });
-    row.createSpan({ cls: "herdr-kv-key", text: key });
-    row.createSpan({ cls: "herdr-kv-val", text: value });
+    parent.createSpan({ cls: "herdr-mc-kv-key", text: key });
+    parent.createSpan({ cls: "herdr-mc-kv-val", text: value });
+  }
+
+  private resolveActiveWorkspaceId(snap: SessionSnapshot | null): string {
+    if (!snap || snap.workspaces.length === 0) {
+      return "";
+    }
+    if (
+      this.selectedWorkspaceId &&
+      snap.workspaces.some((w) => w.workspace_id === this.selectedWorkspaceId)
+    ) {
+      return this.selectedWorkspaceId;
+    }
+    return snap.focused_workspace_id || snap.workspaces[0].workspace_id;
+  }
+
+  private resolveActiveTabForWorkspace(
+    snap: SessionSnapshot | null,
+    workspaceId: string
+  ): SessionSnapshot["tabs"][number] | null {
+    if (!snap || snap.tabs.length === 0) {
+      return null;
+    }
+    const wsTabs = workspaceId
+      ? snap.tabs.filter((t) => t.workspace_id === workspaceId)
+      : snap.tabs;
+    if (wsTabs.length === 0) {
+      return snap.tabs[0];
+    }
+    return (
+      wsTabs.find((t) => t.tab_id === snap.focused_tab_id) ||
+      wsTabs.find((t) => t.focused) ||
+      wsTabs[0]
+    );
+  }
+
+  private resolveAgentDisplayLabel(agent: AgentInfo, panes: PaneInfo[]): string {
+    const pane = panes.find((p) => p.pane_id === agent.pane_id);
+    if (pane?.label && pane.label.trim()) {
+      return pane.label.trim();
+    }
+    return agent.name || agent.display_agent || agent.agent || agent.pane_id;
   }
 
   private async handleStartSession(): Promise<void> {
@@ -1242,6 +1359,19 @@ export class HerdrDashboardView extends ItemView {
     } catch (err) {
       new Notice(`Failed to start session: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  private async confirmAndStopSession(sessionName: string): Promise<void> {
+    const confirmed = await confirmAction(this.app, {
+      title: `Stop session '${sessionName}'?`,
+      body: `All running agents and terminals in '${sessionName}' will stop immediately.`,
+      confirmText: "Stop session",
+      danger: true,
+    });
+    if (!confirmed) {
+      return;
+    }
+    await this.handleStopSession();
   }
 
   private async handleStopSession(): Promise<void> {
@@ -1257,7 +1387,7 @@ export class HerdrDashboardView extends ItemView {
   private async loadAgentExplain(target: string): Promise<void> {
     try {
       const payload = await this.coordinator.socket.explainAgent(target);
-      this.liveTailTarget = `Agent state explain (${target})`;
+      this.liveTailTarget = `Why this status (${target})`;
       this.liveTailText = JSON.stringify(payload, null, 2);
       this.renderDashboard();
     } catch (err) {
@@ -1273,7 +1403,9 @@ export class HerdrDashboardView extends ItemView {
     try {
       const exported = await this.coordinator.socket.exportLayout({ tabId });
       const safeWs = wsLabel.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
-      const safeTab = tabLabel.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || tabId.replace(/[^A-Za-z0-9_-]+/g, "-");
+      const safeTab =
+        tabLabel.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") ||
+        tabId.replace(/[^A-Za-z0-9_-]+/g, "-");
       const notePath = `Herdr Layouts/${safeWs}-${safeTab}.md`;
       const content = [
         "---",
@@ -1284,7 +1416,7 @@ export class HerdrDashboardView extends ItemView {
         "",
         `# Herdr Layout: ${wsLabel} / ${tabLabel}`,
         "",
-        "Open Mission Control -> Topology & worktrees -> **Apply layout from note** while viewing this note to recreate this split tree.",
+        "Open Mission Control -> More actions -> **Apply layout from note** while viewing this note to recreate this split tree.",
         "",
         "```json",
         JSON.stringify(exported, null, 2),
@@ -1382,26 +1514,15 @@ export class HerdrDashboardView extends ItemView {
   private async promptSingleAgent(target: string, prompt: string): Promise<void> {
     try {
       await this.coordinator.socket.promptAgent(target, prompt);
-      new Notice(`Sent prompt to '${target}'.`);
+      new Notice(`Sent message to '${target}'.`);
       await this.coordinator.refreshAll(false);
     } catch (err) {
-      new Notice(`Prompt failed: ${err instanceof Error ? err.message : String(err)}`);
+      new Notice(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  private async loadAgentTail(target: string, isPreview: boolean): Promise<void> {
-    this.liveTailTarget = target;
-    if (isPreview) {
-      this.liveTailText = [
-        "$ obs-herdr vault info",
-        `{"vaultName":"${this.app.vault.getName()}","permissionMode":"${this.getSettings().vaultPermissionMode}"}`,
-        "$ obs-herdr note search roadmap",
-        "Found 3 matching notes. Ready to update frontmatter on approval.",
-      ].join("\n");
-      this.renderDashboard();
-      return;
-    }
-
+  private async loadAgentTail(target: string): Promise<void> {
+    this.liveTailTarget = `Output (${target})`;
     try {
       const text = await this.coordinator.socket.readAgent(target, "recent_unwrapped", 60);
       this.liveTailText = text;
@@ -1428,12 +1549,16 @@ export class HerdrDashboardView extends ItemView {
         {},
         "mission-control-selftest"
       )) as { vaultName: string; markdownCount: number; permissionMode: string };
+      const label = tierLabelFor(
+        res.permissionMode as VaultPermissionMode,
+        true
+      );
       new Notice(
-        `Bridge OK: '${res.vaultName}' (${res.markdownCount} Markdown notes, mode=${res.permissionMode}).`
+        `Vault access OK: '${res.vaultName}' (${res.markdownCount} Markdown notes, level: ${label}).`
       );
       this.renderDashboard();
     } catch (err) {
-      new Notice(`Bridge self-test failed: ${err instanceof Error ? err.message : String(err)}`);
+      new Notice(`Self-test failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }
