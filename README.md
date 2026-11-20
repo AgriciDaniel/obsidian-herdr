@@ -94,6 +94,7 @@ Good to know:
 - With the Flatpak build of Obsidian, the Herdr server runs inside Obsidian's sandbox. Reloading Obsidian keeps your agents, but quitting it stops them all. Herdr saves the layout, so panes come back on the next start; the agents inside them start fresh.
 - Update Herdr with `herdr update --handoff` from a terminal outside Obsidian, so running agents are handed over instead of stopped. The plugin is tested with Herdr protocol 20 and warns in Mission Control's Doctor tab if Herdr reports another protocol.
 - If system trash is not available (common in the Flatpak), deleting a note through the bridge falls back to Obsidian's own `.trash` folder in the vault, and says so.
+- The Herdr session is named after the vault folder (`vault-<folder name>`). Two vaults with the same folder name, such as a copy or a backup, share one session unless you set a different session name in the plugin settings.
 
 <details>
 <summary><b>For developers</b></summary>

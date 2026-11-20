@@ -16,6 +16,8 @@ Reliability fixes from a full code and live review. The aim: agents keep working
 - One failing view no longer stops the others from updating, and UI control stops cleanly when the plugin unloads.
 - The initial prompt typed in the Spawn window is sent only once the agent has settled and is ready for input, and the plugin checks it arrived (its text, a pasted-text marker, or the agent starting work), sending once more at most. Before, a prompt sent while Codex was still starting could be lost.
 - New `obs-herdr ui select` (and a `select` batch step) chooses an option in a dropdown by value or label, with the same protections as a click. The MCP server now has 26 tools.
+- Agents pressing Enter, Tab, Backspace or Delete in a text box no longer lose the text they type next (the keyboard shield did not recognise these agent keys and held back about half a second of input).
+- Hardening from a cross-review: the initial prompt is sent again only when nothing at all changed after the first send, and never into an agent waiting at a question; two renames at once restore the link setting correctly; system trash that throws an error still falls back to the vault `.trash`; UI actions queued at unload are refused; a self-repair keeps the bridge token, also when two run at once; the kit check covers `connection.json` and the core scripts; on Windows the cleanup checks the bridge pipe before removing a kit, and the Python client times out on the pipe too; timeouts are kept between 1 second and 10 minutes.
 - Smaller: the note graph and backlinks skip `node_modules`, `.git` and the settings folder; `ui inspect` marks protected elements such as window controls and lists them last; the MCP server reports the real plugin version.
 
 ## 0.3.1 (2026-11-19)

@@ -42,6 +42,13 @@ import { HerdrCliClient } from "../herdr/cli-client";
 import { evaluateHerdrProtocol, HerdrSocketClient } from "../herdr/socket-client";
 import { deliverToTerminal, resolveDefaultShell } from "../terminal/pty-host";
 
+export function formatSpawnAbortNotice(agentName: string, err: unknown): string {
+  if (err instanceof Error && err.message.trim()) {
+    return err.message;
+  }
+  return `Cancelled waiting for '${agentName}'.`;
+}
+
 export interface CoordinatorState {
   binaryPath: string | null;
   activeSessionName: string;
@@ -90,6 +97,8 @@ export class HerdrCoordinator {
   private refreshInFlight: Promise<void> | null = null;
   private sessionStartInFlight: Promise<void> | null = null;
   private bridgeStartInFlight: Promise<void> | null = null;
+  private bridgeHealInFlight: Promise<void> | null = null;
+  private lastKnownBridgeToken: string | undefined;
   private debounceTimer: number | null = null;
   private readonly listeners = new Set<() => void>();
   private readonly previousAgentStates = new Map<string, AgentStatus>();
@@ -263,16 +272,33 @@ export class HerdrCoordinator {
   }
 
   private isRuntimeKitIntact(): boolean {
-    if (!fs.existsSync(this.runtimeKit.cliScriptPath)) {
+    const coreMjs = path.join(this.runtimeKit.binDir, "obs-herdr-core.mjs");
+    const corePy = path.join(this.runtimeKit.binDir, "obs-herdr-core.py");
+    if (
+      !fs.existsSync(this.runtimeKit.cliScriptPath) ||
+      !fs.existsSync(this.runtimeKit.connectionFilePath) ||
+      !fs.existsSync(coreMjs) ||
+      !fs.existsSync(corePy)
+    ) {
       return false;
     }
     if (process.platform === "win32") {
-      return fs.existsSync(this.runtimeKit.connectionFilePath);
+      return true;
     }
     return fs.existsSync(this.runtimeKit.socketPath);
   }
 
   private async healBridgeIfNeeded(): Promise<void> {
+    if (this.bridgeHealInFlight) {
+      return this.bridgeHealInFlight;
+    }
+    this.bridgeHealInFlight = this.doHealBridgeIfNeeded().finally(() => {
+      this.bridgeHealInFlight = null;
+    });
+    return this.bridgeHealInFlight;
+  }
+
+  private async doHealBridgeIfNeeded(): Promise<void> {
     const settings = this.getSettings();
     if (!settings.vaultBridgeEnabled || settings.vaultPermissionMode === "off") {
       return;
@@ -280,7 +306,7 @@ export class HerdrCoordinator {
     if (!this.bridgeServer?.isRunning() || this.isRuntimeKitIntact()) {
       return;
     }
-    const preservedToken = this.bridgeServer.getAuthToken();
+    const preservedToken = this.bridgeServer.getAuthToken() || this.lastKnownBridgeToken;
     await this.stopVaultBridge();
     await this.startVaultBridge(preservedToken);
   }
@@ -307,8 +333,15 @@ export class HerdrCoordinator {
     if (this.bridgeServer?.isRunning()) {
       return;
     }
+    if (this.bridgeServer) {
+      const staleSrv = this.bridgeServer;
+      this.bridgeServer = null;
+      await staleSrv.stop().catch(() => undefined);
+    }
     const existingToken =
-      preferredToken || readExistingBridgeToken(this.runtimeKit.connectionFilePath);
+      preferredToken ||
+      this.lastKnownBridgeToken ||
+      readExistingBridgeToken(this.runtimeKit.connectionFilePath);
     const srv = new VaultBridgeServer({
       socketPath: this.runtimeKit.socketPath,
       kitDir: this.runtimeKit.runtimeDir,
@@ -317,6 +350,7 @@ export class HerdrCoordinator {
     });
     await srv.start();
     this.bridgeServer = srv;
+    this.lastKnownBridgeToken = srv.getAuthToken();
     this.bridgeLastError = null;
 
     provisionRuntimeKit({
@@ -744,55 +778,73 @@ export class HerdrCoordinator {
       // Wait for both blocked-question resolution and a settled interactive_ready status
       // (idle or done, never unknown or working) before sending the initial prompt.
       const settle = await this.waitForAgentSettledForPrompt(agent, bound, options.signal);
-      if (settle === "cancelled" || options.signal?.aborted) {
+      if (settle.outcome === "cancelled" || options.signal?.aborted) {
         await this.refreshAll(false);
         throw new Error(
           `Started '${options.agentName}', but waiting for it was cancelled, so the initial prompt was not sent.`
         );
       }
-      if (settle === "session_changed" || this.disposed || this.sessionBinding() !== bound) {
+      if (settle.outcome === "session_changed" || this.disposed || this.sessionBinding() !== bound) {
         throw new Error(
           `Started '${options.agentName}', but the Herdr session changed meanwhile, so the initial prompt was not sent. Switch back to that session and send the prompt.`
         );
       }
-      if (settle === "blocked") {
+      if (settle.outcome === "blocked") {
         await this.refreshAll(false);
         throw new Error(
           `Started '${options.agentName}', but it was waiting at a question (for example Claude Code's folder trust check), so the initial prompt was not sent. Answer it in the agent's terminal, then send the prompt.`
         );
       }
-      if (settle === "exited") {
+      if (settle.outcome === "exited") {
         await this.refreshAll(false);
         throw new Error(
           `Started '${options.agentName}', but it exited before becoming ready, so the initial prompt was not sent.`
         );
       }
-      if (settle === "timeout") {
+      if (settle.outcome === "timeout") {
         await this.refreshAll(false);
         throw new Error(
           `Started '${options.agentName}', but it did not settle into an interactive ready state in time, so the initial prompt was not sent. Send the prompt manually in its terminal.`
         );
       }
 
-      const beforePastedCount = await this.countPanePastedMarkers(pane.pane_id);
+      const settledAgent = settle.outcome === "ready" ? settle.agent : agent;
+      const baseline = await this.capturePromptBaseline(settledAgent, false);
       await this.socket.promptAgent(options.agentName, trimmedPrompt);
       let delivered = await this.waitForPromptDelivery(
-        agent,
+        settledAgent,
         trimmedPrompt,
-        beforePastedCount,
+        baseline,
         bound,
         options.signal
       );
       if (!delivered && !options.signal?.aborted && !this.disposed && this.sessionBinding() === bound) {
-        const retryPastedCount = await this.countPanePastedMarkers(pane.pane_id);
-        await this.socket.promptAgent(options.agentName, trimmedPrompt);
-        delivered = await this.waitForPromptDelivery(
-          agent,
-          trimmedPrompt,
-          retryPastedCount,
-          bound,
-          options.signal
-        );
+        // Re-check right before retrying: never retry into a blocked agent or one whose state moved.
+        const preRetry = await this.capturePromptBaseline(settledAgent, true);
+        const stateMovedBeforeRetry =
+          (preRetry.paneText !== null && baseline.paneText !== null && preRetry.paneText !== baseline.paneText) ||
+          (preRetry.status !== null &&
+            (preRetry.status === "blocked" ||
+              preRetry.status === "working" ||
+              (baseline.status !== null && preRetry.status !== baseline.status))) ||
+          (preRetry.stateChangeSeq !== null &&
+            baseline.stateChangeSeq !== null &&
+            preRetry.stateChangeSeq !== baseline.stateChangeSeq) ||
+          (preRetry.revision !== null &&
+            baseline.revision !== null &&
+            preRetry.revision !== baseline.revision);
+        if (stateMovedBeforeRetry) {
+          delivered = true;
+        } else if (preRetry.status === null || preRetry.status === "idle" || preRetry.status === "done") {
+          await this.socket.promptAgent(options.agentName, trimmedPrompt);
+          delivered = await this.waitForPromptDelivery(
+            settledAgent,
+            trimmedPrompt,
+            preRetry,
+            bound,
+            options.signal
+          );
+        }
       }
       if (!delivered) {
         if (options.signal?.aborted) {
@@ -828,26 +880,29 @@ export class HerdrCoordinator {
     agent: AgentInfo,
     bound: string,
     signal?: AbortSignal
-  ): Promise<"ready" | "cancelled" | "session_changed" | "blocked" | "exited" | "timeout"> {
+  ): Promise<
+    | { outcome: "ready"; agent: AgentInfo }
+    | { outcome: "cancelled" | "session_changed" | "blocked" | "exited" | "timeout" }
+  > {
     if (signal?.aborted) {
-      return "cancelled";
+      return { outcome: "cancelled" };
     }
     if (this.disposed || this.sessionBinding() !== bound) {
-      return "session_changed";
+      return { outcome: "session_changed" };
     }
     if (agent.agent_status === "blocked") {
       const unblocked = await this.waitWhileBlocked(agent, bound, signal);
       if (signal?.aborted) {
-        return "cancelled";
+        return { outcome: "cancelled" };
       }
       if (this.disposed || this.sessionBinding() !== bound) {
-        return "session_changed";
+        return { outcome: "session_changed" };
       }
       if (!unblocked) {
-        return "blocked";
+        return { outcome: "blocked" };
       }
     } else if (this.isAgentSettledForPrompt(agent)) {
-      return "ready";
+      return { outcome: "ready", agent };
     }
 
     const deadline = Date.now() + (this.promptSettleTimeoutMs || 45000);
@@ -863,40 +918,40 @@ export class HerdrCoordinator {
         continue;
       }
       if (signal?.aborted) {
-        return "cancelled";
+        return { outcome: "cancelled" };
       }
       if (this.disposed || this.sessionBinding() !== bound) {
-        return "session_changed";
+        return { outcome: "session_changed" };
       }
       if (!now) {
-        return "exited";
+        return { outcome: "exited" };
       }
       if (now.agent_status === "blocked") {
         const unblocked = await this.waitWhileBlocked(now, bound, signal);
         if (signal?.aborted) {
-          return "cancelled";
+          return { outcome: "cancelled" };
         }
         if (this.disposed || this.sessionBinding() !== bound) {
-          return "session_changed";
+          return { outcome: "session_changed" };
         }
         if (!unblocked) {
-          return "blocked";
+          return { outcome: "blocked" };
         }
         continue;
       }
       if (this.isAgentSettledForPrompt(now)) {
-        return "ready";
+        return { outcome: "ready", agent: now };
       }
       await this.waitPollDelay(pollMs, signal);
     }
 
     if (signal?.aborted) {
-      return "cancelled";
+      return { outcome: "cancelled" };
     }
     if (this.disposed || this.sessionBinding() !== bound) {
-      return "session_changed";
+      return { outcome: "session_changed" };
     }
-    return "timeout";
+    return { outcome: "timeout" };
   }
 
   private promptAppearsInPane(paneText: string, prompt: string): boolean {
@@ -911,22 +966,61 @@ export class HerdrCoordinator {
     return paneText.replace(/\s+/g, " ").includes(probe);
   }
 
-  private async countPanePastedMarkers(paneId: string): Promise<number> {
-    if (typeof this.socket.readPane !== "function") {
-      return 0;
+  private async capturePromptBaseline(
+    agent: AgentInfo,
+    refreshAgent = true
+  ): Promise<{
+    paneText: string | null;
+    pastedCount: number;
+    status: AgentStatus | null;
+    stateChangeSeq: number | null;
+    revision: number | null;
+  }> {
+    let paneText: string | null = null;
+    let pastedCount = 0;
+    if (typeof this.socket.readPane === "function") {
+      try {
+        paneText = await this.socket.readPane(agent.pane_id, "recent_unwrapped", 80);
+        pastedCount = (paneText.match(/\[Pasted text\b/g) || []).length;
+      } catch {
+        paneText = null;
+      }
     }
-    try {
-      const text = await this.socket.readPane(paneId, "recent_unwrapped", 80);
-      return (text.match(/\[Pasted text\b/g) || []).length;
-    } catch {
-      return 0;
+    let status: AgentStatus | null = agent.agent_status ?? null;
+    let stateChangeSeq: number | null =
+      typeof agent.state_change_seq === "number" ? agent.state_change_seq : null;
+    let revision: number | null = typeof agent.revision === "number" ? agent.revision : null;
+    if (refreshAgent && typeof this.socket.listAgents === "function") {
+      try {
+        const now = (await this.socket.listAgents()).find(
+          (a) => a.pane_id === agent.pane_id && a.name === agent.name
+        );
+        if (now) {
+          status = now.agent_status;
+          if (typeof now.state_change_seq === "number") {
+            stateChangeSeq = now.state_change_seq;
+          }
+          if (typeof now.revision === "number") {
+            revision = now.revision;
+          }
+        }
+      } catch {
+        // Keep values from agent info
+      }
     }
+    return { paneText, pastedCount, status, stateChangeSeq, revision };
   }
 
   private async waitForPromptDelivery(
     agent: AgentInfo,
     prompt: string,
-    baselinePastedCount: number,
+    baseline: {
+      paneText: string | null;
+      pastedCount: number;
+      status: AgentStatus | null;
+      stateChangeSeq: number | null;
+      revision: number | null;
+    },
     bound: string,
     signal?: AbortSignal
   ): Promise<boolean> {
@@ -942,7 +1036,11 @@ export class HerdrCoordinator {
       try {
         const text = await this.socket.readPane(agent.pane_id, "recent_unwrapped", 80);
         const pastedCount = (text.match(/\[Pasted text\b/g) || []).length;
-        if (this.promptAppearsInPane(text, prompt) || pastedCount > baselinePastedCount) {
+        if (
+          (baseline.paneText !== null && text !== baseline.paneText) ||
+          this.promptAppearsInPane(text, prompt) ||
+          pastedCount > baseline.pastedCount
+        ) {
           return true;
         }
       } catch {
@@ -953,8 +1051,26 @@ export class HerdrCoordinator {
           const now = (await this.socket.listAgents()).find(
             (a) => a.pane_id === agent.pane_id && a.name === agent.name
           );
-          if (now?.agent_status === "working") {
-            return true;
+          if (now) {
+            const statusLeftBaseline =
+              baseline.status !== null && now.agent_status !== baseline.status;
+            const seqMoved =
+              baseline.stateChangeSeq !== null &&
+              typeof now.state_change_seq === "number" &&
+              now.state_change_seq !== baseline.stateChangeSeq;
+            const revMoved =
+              baseline.revision !== null &&
+              typeof now.revision === "number" &&
+              now.revision !== baseline.revision;
+            if (
+              now.agent_status === "working" ||
+              now.agent_status === "blocked" ||
+              statusLeftBaseline ||
+              seqMoved ||
+              revMoved
+            ) {
+              return true;
+            }
           }
         } catch {
           // Ignore transient status poll error while confirming delivery

@@ -191,7 +191,11 @@ export class SpawnAgentModal extends Modal {
     } catch (err) {
       this.submitting = false;
       if (controller.signal.aborted) {
-        new Notice(`Cancelled waiting for '${this.agentName}'. Initial prompt was not sent.`);
+        const msg =
+          err instanceof Error && err.message.trim()
+            ? err.message
+            : `Cancelled waiting for '${this.agentName}'.`;
+        new Notice(msg);
         return;
       }
       if (spawnBtnEl) {

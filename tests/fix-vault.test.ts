@@ -694,19 +694,21 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
     const fakeOverlay = {
       pulseClick: (
         _caller: string,
+        label: string,
         _x: number,
         _y: number,
-        label?: string
+        action = "clicking"
       ) => {
-        cursorEvents.push({ action: "click", label });
+        cursorEvents.push({ action, label });
       },
       moveTo: (
         _caller: string,
+        label: string,
         _x: number,
         _y: number,
-        label?: string
+        action = "moving"
       ) => {
-        cursorEvents.push({ action: "move", label });
+        cursorEvents.push({ action, label });
       },
       whenSettled: () => Promise.resolve(),
       exitAgent: () => undefined,
@@ -880,5 +882,409 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
       if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it("Part 2 (Enter quirk): ui.batch with press_key Enter between type steps inserts newlines and never swallows subsequent text in a textarea", async () => {
+    const docListeners = new Map<string, Set<(ev: unknown) => void>>();
+    const dispatchDocEvent = (ev: Record<string, unknown>): boolean => {
+      let prevented = false;
+      const fullEv = {
+        isTrusted: true,
+        ...ev,
+        preventDefault: () => {
+          prevented = true;
+        },
+        stopImmediatePropagation: () => undefined,
+        stopPropagation: () => undefined,
+      };
+      for (const fn of Array.from(docListeners.get(String(ev.type)) ?? [])) {
+        fn(fullEv);
+      }
+      return !prevented;
+    };
+
+    const modal = makeFakeElement({ tag: "div", classes: ["modal"] });
+    const textarea = makeFakeElement({
+      tag: "textarea",
+      label: "Initial prompt",
+      rect: { x: 20, y: 20, width: 300, height: 100 },
+      parent: modal,
+    });
+    textarea.value = "";
+    textarea.selectionStart = 0;
+    textarea.selectionEnd = 0;
+    textarea.focus = () => {
+      (win.document as unknown as { activeElement: unknown }).activeElement = textarea;
+    };
+
+    const prevHost = makeFakeElement({ tag: "div", classes: ["workspace"] });
+
+    const win = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      devicePixelRatio: 1,
+      setTimeout,
+      clearTimeout,
+      document: {
+        activeElement: prevHost,
+        body: { innerText: "" },
+        querySelectorAll: (sel: string) => (sel === "#prompt-area" ? [textarea] : []),
+        elementFromPoint: () => textarea,
+        addEventListener: (type: string, fn: (ev: unknown) => void) => {
+          if (!docListeners.has(type)) docListeners.set(type, new Set());
+          docListeners.get(type)!.add(fn);
+        },
+        removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+          docListeners.get(type)?.delete(fn);
+        },
+      },
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    } as unknown as Window;
+
+    const svc = new UiControlService({
+      win,
+      getWebContents: () => ({
+        capturePage: async () => ({ toPNG: () => Buffer.alloc(0), getSize: () => ({ width: 1, height: 1 }) }),
+        sendInputEvent: (ev: Record<string, unknown>) => {
+          if (ev.type === "mouseDown") {
+            (textarea.focus as () => void)();
+          } else if (ev.type === "keyDown" && ev.keyCode === "Return") {
+            dispatchDocEvent({ type: "keydown", key: "Enter", shiftKey: false, ctrlKey: false, altKey: false, metaKey: false });
+          } else if (ev.type === "char" && ev.keyCode === "\r") {
+            const kpOk = dispatchDocEvent({ type: "keypress", key: "Enter", shiftKey: false, ctrlKey: false, altKey: false, metaKey: false });
+            if (kpOk) {
+              const biOk = dispatchDocEvent({ type: "beforeinput", inputType: "insertLineBreak", data: null });
+              if (biOk) {
+                textarea.value = String(textarea.value) + "\n";
+                textarea.selectionStart = String(textarea.value).length;
+                textarea.selectionEnd = String(textarea.value).length;
+              }
+            }
+          }
+        },
+        insertText: async (chunk: string) => {
+          const ok = dispatchDocEvent({ type: "beforeinput", inputType: "insertText", data: chunk });
+          if (ok) {
+            textarea.value = String(textarea.value) + chunk;
+            textarea.selectionStart = String(textarea.value).length;
+            textarea.selectionEnd = String(textarea.value).length;
+          }
+        },
+      }),
+      sleep: async () => undefined,
+      getUiTypingSpeed: () => "fast",
+    });
+
+    await svc.batch(
+      {
+        steps: [
+          { action: "click", target: { selector: "#prompt-area" } },
+          { action: "type", text: "Line one." },
+          { action: "press_key", key: "Enter" },
+          { action: "type", text: "Line two." },
+          { action: "press_key", key: "Enter" },
+          { action: "type", text: "Reply else." },
+        ],
+      },
+      "test-enter"
+    );
+
+    assert.equal(textarea.value, "Line one.\nLine two.\nReply else.");
+  });
+
+  it("R3-B1: concurrent vault.rename_note calls ref-count alwaysUpdateLinks so original value restores only after last finishes", async () => {
+    const tmpDir = makeTempDir("fix-r3b1-");
+    try {
+      const mockApp = createMockObsidianApp(tmpDir, "ConcurrentRenameVault");
+      await mockApp.vault.create("a.md", "# A");
+      await mockApp.vault.create("b.md", "# B");
+
+      const vaultAny = mockApp.vault as unknown as { config: Record<string, unknown> };
+      vaultAny.config = { alwaysUpdateLinks: false };
+
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+      let firstStarted!: () => void;
+      const firstEntered = new Promise<void>((r) => {
+        firstStarted = r;
+      });
+      let releaseSecond!: () => void;
+      const secondGate = new Promise<void>((r) => {
+        releaseSecond = r;
+      });
+      let secondStarted!: () => void;
+      const secondEntered = new Promise<void>((r) => {
+        secondStarted = r;
+      });
+      let observedAfterFirstFinished: unknown = "unset";
+
+      const origRename = mockApp.fileManager.renameFile;
+      mockApp.fileManager.renameFile = async (file: TFile, newPath: string) => {
+        if (file.path === "a.md") {
+          firstStarted();
+          await firstGate;
+        } else if (file.path === "b.md") {
+          secondStarted();
+          await secondGate;
+          observedAfterFirstFinished = vaultAny.config.alwaysUpdateLinks;
+        }
+        return origRename(file, newPath);
+      };
+
+      const ops = new VaultOpsService({
+        app: mockApp as unknown as App,
+        getPermissionMode: () => "full",
+        getAllowUiControl: () => false,
+        getAllowUiInProtectedAreas: () => false,
+        getAllowHiddenReads: () => false,
+        onAuditChanged: () => undefined,
+      });
+
+      const p1 = ops.dispatch("vault.rename_note", { path: "a.md", newPath: "a2.md" }, "test");
+      await firstEntered;
+      const p2 = ops.dispatch("vault.rename_note", { path: "b.md", newPath: "b2.md" }, "test");
+      await secondEntered;
+      releaseFirst();
+      await p1;
+      releaseSecond();
+      await p2;
+
+      assert.equal(
+        observedAfterFirstFinished,
+        true,
+        "alwaysUpdateLinks must stay true while second concurrent rename is still running"
+      );
+      assert.equal(
+        vaultAny.config.alwaysUpdateLinks,
+        false,
+        "alwaysUpdateLinks must restore to original value once all renames finish"
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-B2: trashFileVerified catches throwing fileManager.trashFile, falls back to vault.trash, fixes audit summary, and includes original error on trash_failed", async () => {
+    const tmpDir = makeTempDir("fix-r3b2-");
+    try {
+      const mockApp = createMockObsidianApp(tmpDir, "TrashThrowVault");
+      await mockApp.vault.create("throw-fallback.md", "body");
+      await mockApp.vault.create("throw-both.md", "body");
+
+      mockApp.fileManager.trashFile = async () => {
+        throw new Error("XDG_TRASH_BROKEN");
+      };
+
+      const ops = new VaultOpsService({
+        app: mockApp as unknown as App,
+        getPermissionMode: () => "full",
+        getAllowUiControl: () => false,
+        getAllowUiInProtectedAreas: () => false,
+        getAllowHiddenReads: () => false,
+        onAuditChanged: () => undefined,
+      });
+
+      const res = (await ops.dispatch(
+        "vault.trash_note",
+        { path: "throw-fallback.md" },
+        "test-r3b2"
+      )) as { trashed: boolean; method: string };
+      assert.equal(res.trashed, true);
+      assert.equal(res.method, "local");
+      const lastAudit = ops.getAuditLog()[0];
+      assert.match(lastAudit.summary, /Vault\.trash/i, "local fallback audit summary must name Vault.trash");
+
+      (mockApp.vault as unknown as { trash: () => Promise<void> }).trash = async () => {
+        throw new Error("LOCAL_TRASH_DENIED");
+      };
+      await assert.rejects(
+        () => ops.dispatch("vault.trash_note", { path: "throw-both.md" }, "test-r3b2"),
+        (err: unknown) =>
+          err instanceof BridgeRpcError &&
+          err.code === "trash_failed" &&
+          /XDG_TRASH_BROKEN/.test(err.message)
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-B3: UiControlService rejects both queued and newly invoked actions after dispose()", async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    let secondRan = false;
+
+    const btn = makeFakeElement({ tag: "button", label: "Go", rect: { x: 10, y: 10, width: 60, height: 24 } });
+    const win = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      devicePixelRatio: 1,
+      setTimeout,
+      clearTimeout,
+      document: {
+        body: { innerText: "" },
+        querySelectorAll: () => [btn],
+        elementFromPoint: () => btn,
+      },
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    } as unknown as Window;
+
+    let clickCalls = 0;
+    const svc = new UiControlService({
+      win,
+      getWebContents: () => ({
+        capturePage: async () => ({ toPNG: () => Buffer.alloc(0), getSize: () => ({ width: 1, height: 1 }) }),
+        sendInputEvent: (ev: Record<string, unknown>) => {
+          if (ev.type === "mouseDown") {
+            clickCalls += 1;
+            if (clickCalls >= 2) secondRan = true;
+          }
+        },
+        insertText: async () => undefined,
+      }),
+      sleep: async () => {
+        if (clickCalls === 1) await firstGate;
+      },
+    });
+
+    const p1 = svc.click({ target: { selector: "#go" } }, "a1");
+    const p2 = svc.click({ target: { selector: "#go" } }, "a2");
+    svc.dispose();
+    releaseFirst();
+
+    await p1.catch(() => undefined);
+    await assert.rejects(() => p2, (err: { code?: string }) => err?.code === "ui_unavailable");
+    assert.equal(secondRan, false, "queued action must not execute after dispose()");
+
+    await assert.rejects(
+      () => svc.click({ target: { selector: "#go" } }, "a3"),
+      (err: { code?: string }) => err?.code === "ui_unavailable"
+    );
+  });
+
+  it("R3-B4, R3-B5, R3-B6: prune probes connection.json socketPath, timeout clamps to [1000, 600000] ms, Python pipe uses timed thread", async () => {
+    const tmpBase = makeTempDir("fix-r3b4-");
+    let liveSrv: net.Server | null = null;
+    try {
+      // R3-B4: live socket referenced via connection.json socketPath (not b.sock) keeps kit alive
+      const customSockPath = path.join(tmpBase, "alt-live.sock");
+      liveSrv = net.createServer();
+      await new Promise<void>((resolve) => liveSrv!.listen(customSockPath, resolve));
+
+      const kitDir = path.join(tmpBase, "1234567890ab");
+      fs.mkdirSync(kitDir);
+      fs.writeFileSync(
+        path.join(kitDir, "connection.json"),
+        JSON.stringify({ socketPath: customSockPath, vaultPath: path.join(tmpBase, "gone-vault") })
+      );
+
+      const pruned = await runtimeKit.pruneStaleRuntimeKits({
+        baseDir: tmpBase,
+        keepDigest: "ffffffffffff",
+      });
+      assert.deepEqual(pruned.removed, [], "kit with live connection.json socketPath must not be pruned");
+      assert.equal(fs.existsSync(kitDir), true);
+
+      // R3-B5 & R3-B6: timeout clamping to >= 1000ms (and <= 600000ms) + Python threading timeout for Windows pipes
+      const kit = runtimeKit.computeRuntimePaths(path.join(tmpBase, "v"), tmpBase);
+      runtimeKit.provisionRuntimeKit({
+        kit,
+        token: "c".repeat(64),
+        vaultName: "ClampVault",
+        vaultPath: tmpBase,
+        pluginVersion: "0.3.2",
+      });
+      const pySrc = fs.readFileSync(path.join(kit.binDir, "obs-herdr-core.py"), "utf8");
+      assert.ok(pySrc.includes("threading.Thread") && pySrc.includes(".join("), "Python Windows pipe read must enforce timeout via thread join");
+
+      const hangSocks = new Set<net.Socket>();
+      const hangSrv = net.createServer((sock) => {
+        hangSocks.add(sock);
+        sock.on("close", () => hangSocks.delete(sock));
+      });
+      await new Promise<void>((resolve) => hangSrv.listen(kit.socketPath, resolve));
+      try {
+        const coreMjs = path.join(kit.binDir, "obs-herdr-core.mjs");
+        const corePy = path.join(kit.binDir, "obs-herdr-core.py");
+        const env = { ...process.env, OBSIDIAN_HERDR_CONNECTION_FILE: kit.connectionFilePath, OBS_HERDR_TIMEOUT_MS: "50" };
+        for (const [bin, args] of [
+          [process.execPath, [coreMjs]],
+          ["python3", [corePy]],
+        ] as Array<[string, string[]]>) {
+          await assert.rejects(
+            () => execFileAsync(bin, [...args, "rpc", "test.hang", "{}"], { env, timeout: 4000 }),
+            (err: { stderr?: string }) => /1000 ms/.test(String(err.stderr ?? ""))
+          );
+        }
+      } finally {
+        for (const s of hangSocks) s.destroy();
+        hangSrv.closeAllConnections?.();
+        await new Promise<void>((resolve) => hangSrv.close(() => resolve()));
+      }
+    } finally {
+      if (liveSrv) {
+        liveSrv.closeAllConnections?.();
+        await new Promise<void>((resolve) => liveSrv!.close(() => resolve()));
+      }
+      fs.rmSync(tmpBase, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-B7: ui.select refuses an option inside a disabled <optgroup>", async () => {
+    const optgroup = makeFakeElement({ tag: "optgroup" });
+    optgroup.disabled = true;
+    const disabledGroupOpt = {
+      tagName: "OPTION",
+      value: "blocked-opt",
+      label: "Blocked Opt",
+      textContent: "Blocked Opt",
+      disabled: false,
+      selected: false,
+      parentElement: optgroup,
+      closest: (sel: string) => (sel.includes("optgroup") && sel.includes("disabled") ? optgroup : null),
+    };
+    const selectEl = makeFakeElement({
+      tag: "select",
+      rect: { x: 10, y: 10, width: 120, height: 28 },
+    });
+    selectEl.value = "ok";
+    selectEl.options = [
+      { tagName: "OPTION", value: "ok", label: "OK", textContent: "OK", disabled: false, selected: true },
+      disabledGroupOpt,
+    ];
+    selectEl.dispatchEvent = () => true;
+
+    const win = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      devicePixelRatio: 1,
+      setTimeout,
+      clearTimeout,
+      document: {
+        body: { innerText: "" },
+        querySelectorAll: () => [selectEl],
+        elementFromPoint: () => selectEl,
+      },
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    } as unknown as Window;
+
+    const svc = new UiControlService({
+      win,
+      getWebContents: () => ({
+        capturePage: async () => ({ toPNG: () => Buffer.alloc(0), getSize: () => ({ width: 1, height: 1 }) }),
+        sendInputEvent: () => undefined,
+        insertText: async () => undefined,
+      }),
+      sleep: async () => undefined,
+    });
+
+    await assert.rejects(
+      () => svc.select({ target: { selector: "#s" }, value: "blocked-opt" }, "test-r3b7"),
+      (err: { code?: string }) => err?.code === "ui_option_disabled"
+    );
   });
 });

@@ -1570,7 +1570,10 @@ export class VaultOpsService {
             caller,
             targetPath: relPath,
             allowed: true,
-            summary: `Moved '${relPath}' to ${trashMethod === "local" ? "local .trash" : "trash"} via FileManager.trashFile.`,
+            summary:
+              trashMethod === "local"
+                ? `Moved '${relPath}' to local .trash via Vault.trash(file, false).`
+                : `Moved '${relPath}' to trash via FileManager.trashFile.`,
             snapshot: {
               kind: "modified",
               path: relPath,
@@ -1864,23 +1867,42 @@ export class VaultOpsService {
     }
   }
 
+  private renameConfigDepth = 0;
+  private renameConfigSaved: { hadKey: boolean; value: unknown } | null = null;
+
   private async trashFileVerified(file: TFile, relPath: string): Promise<"system" | "local"> {
-    await this.app.fileManager.trashFile(file);
-    if (this.app.vault.getAbstractFileByPath(relPath) === null) {
-      return "system";
+    let systemErr: unknown = null;
+    try {
+      await this.app.fileManager.trashFile(file);
+      if (this.app.vault.getAbstractFileByPath(relPath) === null) {
+        return "system";
+      }
+    } catch (err) {
+      systemErr = err;
     }
+    let localErr: unknown = null;
     const vaultWithTrash = this.app.vault as unknown as {
       trash?: (target: TFile, system: boolean) => Promise<void>;
     };
     if (typeof vaultWithTrash.trash === "function") {
-      await vaultWithTrash.trash(file, false);
-      if (this.app.vault.getAbstractFileByPath(relPath) === null) {
-        return "local";
+      try {
+        await vaultWithTrash.trash(file, false);
+        if (this.app.vault.getAbstractFileByPath(relPath) === null) {
+          return "local";
+        }
+      } catch (err) {
+        localErr = err;
       }
     }
+    const errDetails = [systemErr, localErr]
+      .filter((e) => e !== null)
+      .map((e) => (e instanceof Error ? e.message : typeof e === "string" ? e : JSON.stringify(e)))
+      .join("; ");
     throw new BridgeRpcError(
       "trash_failed",
-      `Failed to move '${relPath}' to trash: file is still present in the vault.`
+      errDetails
+        ? `Failed to move '${relPath}' to trash: ${errDetails}`
+        : `Failed to move '${relPath}' to trash: file is still present in the vault.`
     );
   }
 
@@ -1905,19 +1927,28 @@ export class VaultOpsService {
       vaultWithConfig.config && typeof vaultWithConfig.config === "object"
         ? vaultWithConfig.config
         : null;
-    const hadKey = cfg ? Object.prototype.hasOwnProperty.call(cfg, "alwaysUpdateLinks") : false;
-    const prevVal = cfg ? cfg.alwaysUpdateLinks : undefined;
     if (cfg) {
+      if (this.renameConfigDepth === 0) {
+        this.renameConfigSaved = {
+          hadKey: Object.prototype.hasOwnProperty.call(cfg, "alwaysUpdateLinks"),
+          value: cfg.alwaysUpdateLinks,
+        };
+      }
+      this.renameConfigDepth += 1;
       cfg.alwaysUpdateLinks = updateLinks;
     }
     try {
       await this.app.fileManager.renameFile(file, toPath);
     } finally {
       if (cfg) {
-        if (hadKey) {
-          cfg.alwaysUpdateLinks = prevVal;
-        } else {
-          delete cfg.alwaysUpdateLinks;
+        this.renameConfigDepth = Math.max(0, this.renameConfigDepth - 1);
+        if (this.renameConfigDepth === 0 && this.renameConfigSaved) {
+          if (this.renameConfigSaved.hadKey) {
+            cfg.alwaysUpdateLinks = this.renameConfigSaved.value;
+          } else {
+            delete cfg.alwaysUpdateLinks;
+          }
+          this.renameConfigSaved = null;
         }
       }
     }

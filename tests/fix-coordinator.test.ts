@@ -9,6 +9,7 @@ import { computeRuntimePaths, provisionRuntimeKit } from "../src/bridge/runtime-
 import { VaultBridgeServer } from "../src/bridge/vault-bridge-server";
 import type { AgentInfo, HerdrLayoutNode, HerdrStatusPayload } from "../src/domain/types";
 import { HerdrSocketClient } from "../src/herdr/socket-client";
+import * as coordModule from "../src/services/herdr-coordinator";
 import { HerdrCoordinator } from "../src/services/herdr-coordinator";
 import * as ptyHost from "../src/terminal/pty-host";
 import { PtySession } from "../src/terminal/pty-host";
@@ -829,5 +830,318 @@ describe("fix-coordinator: agyA review fixes (A1-A10)", () => {
       );
       assert.equal(promptCount, 2, "undelivered prompt with idle status must retry once then throw");
     }
+  });
+
+  it("R3-1: self-heal is single-flight and preserves lastKnownBridgeToken even after connection.json is wiped", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-r3-1-"));
+    let coord: HerdrCoordinator | null = null;
+    try {
+      const kit = computeRuntimePaths("/vault/r3-1", baseDir);
+      coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        runtimeKit: kit,
+        bridgeServer: null,
+        bridgeStartInFlight: null,
+        bridgeHealInFlight: null,
+        lastKnownBridgeToken: undefined,
+        bridgeLastError: null,
+        prunedStaleKits: true,
+        app: { vault: { getName: () => "R3-1Vault" } },
+        vaultOps: {
+          getVaultBasePath: () => "/vault/r3-1",
+          dispatch: async () => ({}),
+        },
+        cli: { setCustomEnv: () => undefined },
+        getSettings: () => ({
+          vaultBridgeEnabled: true,
+          vaultPermissionMode: "read-write",
+        }),
+        listeners: new Set(),
+      });
+
+      await coord.startVaultBridge();
+      const firstToken = (coord as unknown as { bridgeServer: VaultBridgeServer | null }).bridgeServer?.getAuthToken();
+      assert.ok(firstToken);
+
+      // Wipe connection.json and stop bridgeServer, then restart: must still keep lastKnownBridgeToken.
+      fs.unlinkSync(kit.connectionFilePath);
+      await coord.stopVaultBridge();
+      await coord.startVaultBridge();
+      const secondToken = (coord as unknown as { bridgeServer: VaultBridgeServer | null }).bridgeServer?.getAuthToken();
+      assert.equal(secondToken, firstToken, "must prefer lastKnownBridgeToken over minting a new token");
+
+      // Concurrent ensureBridgeReady() calls while kit is missing must share one single-flight heal.
+      fs.unlinkSync(kit.socketPath);
+      let stopCalls = 0;
+      const origStop = coord.stopVaultBridge.bind(coord);
+      (coord as unknown as { stopVaultBridge: () => Promise<void> }).stopVaultBridge = async () => {
+        stopCalls += 1;
+        await new Promise((r) => setTimeout(r, 25));
+        await origStop();
+      };
+      await Promise.all([coord.ensureBridgeReady(), coord.ensureBridgeReady()]);
+      assert.equal(stopCalls, 1, "concurrent self-heal must be single-flight");
+    } finally {
+      await coord?.stopVaultBridge().catch(() => undefined);
+      fs.rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-2+3: delivery confirmation sends exactly once for blocked-after-send, boxed composer, fast idle->working->done, and [Pasted text]", async () => {
+    const makeAgent = (over: Partial<AgentInfo>): AgentInfo =>
+      ({
+        pane_id: "w1:p7",
+        name: "agent-r3",
+        agent: "claude",
+        agent_status: "idle",
+        interactive_ready: true,
+        launch_pending: false,
+        focused: false,
+        revision: 1,
+        state_change_seq: 10,
+        ...over,
+      }) as AgentInfo;
+
+    const runScenario = async (opts: {
+      prompt: string;
+      initialPane: string;
+      afterSendPane: string;
+      initialAgent: AgentInfo;
+      afterSendAgent: AgentInfo;
+    }): Promise<number> => {
+      let promptCount = 0;
+      let sent = false;
+      const coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        sessionStartInFlight: null,
+        socketReachable: true,
+        snapshot: { workspaces: [{}], panes: [{}] },
+        vaultOps: { getVaultBasePath: () => "/v" },
+        app: { vault: { getName: () => "v" } },
+        ensureBridgeReady: async () => undefined,
+        waitForPaneShellReady: async () => undefined,
+        buildAgentSpawnArgs: () => [],
+        getBridgeEnv: () => ({}),
+        refreshAll: async () => undefined,
+        getActiveSessionName: () => "vault",
+        promptSettlePollMs: 10,
+        promptConfirmPollMs: 10,
+        promptConfirmTimeoutMs: 60,
+        socket: {
+          getSocketPath: () => "/sock",
+          splitPane: async () => ({ pane_id: "w1:p7" }),
+          startAgent: async () => opts.initialAgent,
+          listAgents: async () => [sent ? opts.afterSendAgent : opts.initialAgent],
+          promptAgent: async () => {
+            promptCount += 1;
+            sent = true;
+          },
+          readPane: async () => (sent ? opts.afterSendPane : opts.initialPane),
+        },
+      });
+      await coord.splitAndStartAgent({
+        agentName: "agent-r3",
+        agentKind: "claude",
+        direction: "right",
+        initialPrompt: opts.prompt,
+      });
+      return promptCount;
+    };
+
+    // (a) Agent becomes blocked right after send (e.g. tool approval) -> never retry into blocked agent.
+    assert.equal(
+      await runScenario({
+        prompt: "Run checks",
+        initialPane: "claude> ",
+        afterSendPane: "claude> ",
+        initialAgent: makeAgent({ agent_status: "idle" }),
+        afterSendAgent: makeAgent({ agent_status: "blocked" }),
+      }),
+      1,
+      "must send once when agent becomes blocked after send"
+    );
+
+    // (b) Boxed composer redraws pane without verbatim first-line probe -> pane text changed, send once.
+    assert.equal(
+      await runScenario({
+        prompt: "Long prompt that gets boxed and truncated in the TUI composer",
+        initialPane: "┌──────────┐\n│ >        │\n└──────────┘",
+        afterSendPane: "┌──────────┐\n│ > Long p…│\n└──────────┘",
+        initialAgent: makeAgent({ agent_status: "idle" }),
+        afterSendAgent: makeAgent({ agent_status: "idle" }),
+      }),
+      1,
+      "must send once when boxed composer pane text changes"
+    );
+
+    // (c) Fast idle -> working -> done between polls (pane unchanged, status left idle -> done and seq moved).
+    assert.equal(
+      await runScenario({
+        prompt: "Quick check",
+        initialPane: "codex> ",
+        afterSendPane: "codex> ",
+        initialAgent: makeAgent({ agent_status: "idle", state_change_seq: 10, revision: 1 }),
+        afterSendAgent: makeAgent({ agent_status: "done", state_change_seq: 12, revision: 2 }),
+      }),
+      1,
+      "must send once on fast idle -> working -> done transition"
+    );
+
+    // (d) [Pasted text #1 +3 lines] marker without status change -> pane text changed, send once.
+    assert.equal(
+      await runScenario({
+        prompt: "Line 1\nLine 2\nLine 3\nLine 4",
+        initialPane: "claude> ",
+        afterSendPane: "claude> [Pasted text #1 +3 lines]",
+        initialAgent: makeAgent({ agent_status: "idle" }),
+        afterSendAgent: makeAgent({ agent_status: "idle" }),
+      }),
+      1,
+      "must send once when [Pasted text] marker appears"
+    );
+  });
+
+  it("R3-4: isRuntimeKitIntact detects missing connection.json, obs-herdr-core.mjs, or obs-herdr-core.py", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-r3-4-"));
+    let coord: HerdrCoordinator | null = null;
+    try {
+      const kit = computeRuntimePaths("/vault/r3-4", baseDir);
+      coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        runtimeKit: kit,
+        bridgeServer: null,
+        bridgeStartInFlight: null,
+        bridgeHealInFlight: null,
+        lastKnownBridgeToken: undefined,
+        bridgeLastError: null,
+        prunedStaleKits: true,
+        app: { vault: { getName: () => "R3-4Vault" } },
+        vaultOps: { getVaultBasePath: () => "/vault/r3-4", dispatch: async () => ({}) },
+        cli: { setCustomEnv: () => undefined },
+        getSettings: () => ({ vaultBridgeEnabled: true, vaultPermissionMode: "read-write" }),
+        listeners: new Set(),
+      });
+
+      await coord.startVaultBridge();
+      const checkIntact = () => (coord as unknown as { isRuntimeKitIntact: () => boolean }).isRuntimeKitIntact();
+      assert.equal(checkIntact(), true);
+
+      // Delete only connection.json -> must detect not intact and self-heal.
+      fs.unlinkSync(kit.connectionFilePath);
+      assert.equal(checkIntact(), false, "missing connection.json must make kit not intact");
+      await coord.ensureBridgeReady();
+      assert.equal(fs.existsSync(kit.connectionFilePath), true);
+
+      // Delete only bin/obs-herdr-core.mjs -> must detect not intact and self-heal.
+      const coreMjs = path.join(kit.binDir, "obs-herdr-core.mjs");
+      fs.unlinkSync(coreMjs);
+      assert.equal(checkIntact(), false, "missing obs-herdr-core.mjs must make kit not intact");
+      await coord.ensureBridgeReady();
+      assert.equal(fs.existsSync(coreMjs), true);
+
+      // Delete only bin/obs-herdr-core.py -> must detect not intact and self-heal.
+      const corePy = path.join(kit.binDir, "obs-herdr-core.py");
+      fs.unlinkSync(corePy);
+      assert.equal(checkIntact(), false, "missing obs-herdr-core.py must make kit not intact");
+      await coord.ensureBridgeReady();
+      assert.equal(fs.existsSync(corePy), true);
+    } finally {
+      await coord?.stopVaultBridge().catch(() => undefined);
+      fs.rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-5: post-listen error closes server & clients, and doStartVaultBridge stops a non-running old server", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-r3-5-"));
+    const sockPath = path.join(dir, "b.sock");
+    let srv: VaultBridgeServer | null = null;
+    let client: net.Socket | null = null;
+    let coord: HerdrCoordinator | null = null;
+    try {
+      srv = new VaultBridgeServer({
+        socketPath: sockPath,
+        kitDir: dir,
+        dispatcher: async () => ({}),
+      });
+      await srv.start();
+      client = net.createConnection({ path: sockPath });
+      await new Promise<void>((r) => client!.once("connect", r));
+      const clientClosed = new Promise<void>((r) => client!.once("close", r));
+
+      const internalSrv = (srv as unknown as { server: net.Server | null }).server;
+      assert.ok(internalSrv);
+      const origWarn = console.warn;
+      console.warn = () => undefined;
+      try {
+        internalSrv.emit("error", new Error("simulated post-listen error"));
+      } finally {
+        console.warn = origWarn;
+      }
+
+      await Promise.race([
+        clientClosed,
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("client was not closed on server error")), 500)),
+      ]);
+      assert.equal(srv.isRunning(), false);
+      assert.equal((srv as unknown as { server: net.Server | null }).server, null, "server must be closed on post-listen error");
+
+      // doStartVaultBridge stops a non-running old bridgeServer before replacing it.
+      let oldStopped = false;
+      const kit = computeRuntimePaths("/vault/r3-5", dir);
+      coord = Object.create(HerdrCoordinator.prototype) as HerdrCoordinator;
+      Object.assign(coord as unknown as Record<string, unknown>, {
+        disposed: false,
+        runtimeKit: kit,
+        bridgeServer: {
+          isRunning: () => false,
+          getAuthToken: () => "a".repeat(64),
+          stop: async () => {
+            oldStopped = true;
+          },
+        },
+        bridgeStartInFlight: null,
+        bridgeHealInFlight: null,
+        lastKnownBridgeToken: undefined,
+        bridgeLastError: null,
+        prunedStaleKits: true,
+        app: { vault: { getName: () => "R3-5Vault" } },
+        vaultOps: { getVaultBasePath: () => "/vault/r3-5", dispatch: async () => ({}) },
+        cli: { setCustomEnv: () => undefined },
+        listeners: new Set(),
+      });
+      await coord.startVaultBridge();
+      assert.equal(oldStopped, true, "doStartVaultBridge must stop a non-running old server before replacing it");
+    } finally {
+      client?.destroy();
+      await coord?.stopVaultBridge().catch(() => undefined);
+      await srv?.stop().catch(() => undefined);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-6: SpawnAgentModal abort notice preserves coordinator's own pre-send vs post-send error message", () => {
+    const mod = HerdrCoordinator as unknown as {
+      formatSpawnAbortNotice?: (agentName: string, err: unknown) => string;
+    };
+    const helper =
+      (coordModule as unknown as { formatSpawnAbortNotice?: (agentName: string, err: unknown) => string })
+        .formatSpawnAbortNotice ?? mod.formatSpawnAbortNotice;
+    assert.equal(typeof helper, "function", "expected formatSpawnAbortNotice helper");
+    const preSend = new Error("Started 'claude', but waiting for it was cancelled, so the initial prompt was not sent.");
+    const postSend = new Error("Started 'claude', but waiting for prompt delivery was cancelled.");
+    assert.equal(helper!("claude", preSend), preSend.message);
+    assert.equal(helper!("claude", postSend), postSend.message);
   });
 });

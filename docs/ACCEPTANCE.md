@@ -222,3 +222,66 @@ Acceptance and runtime status for `0.3.0`:
 | `NOTICE` | `697` | `2da6936fb0e557bb5a919962e85b902a0707e7f8a98081d1f277e4e753323919` |
 | `THIRD_PARTY_NOTICES.md` | `1752` | `b9a795457258171354ba15ac8e9a6a78458b9d2ebb755c5612828d1a2286d65c` |
 | `README.md` | `8977` | `44a2c3fee9d708e3e2236d22bdc6ac7873ddf7fe658e4e22cb0caba84049ebe9` |
+
+### 7. Release `0.3.2`: reliability fixes from a full review, live tests, and a cross-review (2026-11-20)
+
+Work: one read-only review by two agents (code and live), three fix rounds with strict file ownership, a cross-review of each agent's code by the other, and orchestrator verification. Commits on top of `0.3.1` (`8895352`): `7a00784`, `5191d70`, and the round 3 commit. Change list: `CHANGELOG.md`, section `0.3.2`. Review and fix reports: `.agent/review-2026-11-20/`, `.agent/fix-2026-11-20/`, `.agent/round3-2026-11-20/` (local only).
+
+Automated verification on the current build: `140/140` tests across `17` suites, TypeScript check exit `0`, esbuild bundle exit `0` (`main.js` `1017863` bytes), strict ESLint exit `0` (`0` warnings), zero em or en dashes in the diff. The installed `.obsidian/plugins/herdr-obs/main.js` is byte-identical to the build.
+
+Live Obsidian `1.15.1` on Linux (Flatpak, Wayland), Herdr `0.8.2` protocol `20`, verified by the orchestrator on `2026-11-20` after installing and reloading:
+- Trash: system trash fails in the Flatpak; `note trash` returns `method: local` and the note moves to the vault `.trash`.
+- Rename with `alwaysUpdateLinks` unset: links updated, no "Update links" prompt, `app.json` unchanged; two concurrent renames updated both links and left `app.json` unchanged.
+- `obs-herdr` against a socket that never answers exits `1` after `OBS_HERDR_TIMEOUT_MS`; a reload mid-command reports "Bridge connection closed before a complete response was received".
+- Cache self-heal: the kit folder moved away while running was rebuilt in about 8 s with the same token.
+- Stale kit cleanup on load: `255` to `118` folders in `~/.cache/obs-herdr`.
+- MCP `serverInfo.version` `0.3.2`, `26` tools; `ui inspect` lists protected controls last with `protected: true`.
+- Spawn window, driven through UI control with `ui select`: Codex and Claude Code initial prompts delivered exactly once (one `agent.prompt` call each in the Herdr server log), including a three-line prompt typed with `press_key Enter`.
+- Panes `w2:p1` to `w2:p3` survived every reload.
+
+Not verified live: the Herdr protocol mismatch warning (Herdr matches), the Windows paths (no Windows machine), and Spawn cancel during a blocked start (Codex and Claude Code already trust the vault, so no start question appears). These are covered by automated tests only.
+
+```text
+> herdr-obs@0.3.2 check -> exit 0
+> herdr-obs@0.3.2 lint (eslint src --max-warnings=0) -> exit 0, 0 warnings
+> herdr-obs@0.3.2 build (tsc --noEmit && node esbuild.config.mjs) -> exit 0, main.js 1017863 bytes
+> herdr-obs@0.3.2 test (node scripts/run-tests.mjs) -> exit 0
+✔ UI control: keys, Electron input, permission gating, CLI, and MCP images (1236.541417ms)
+✔ Windows: the environment copy keeps one PATH on Windows (#78, #76 second half) (1.614392ms)
+✔ Windows: Herdr's socket path on Windows is a named pipe (#73) (0.84261ms)
+✔ Windows: the Windows terminal driver is chosen only where it can run (#76) (0.659222ms)
+✔ Windows: no initial prompt into an agent waiting at a question (#74) (2504.190884ms)
+✔ Windows: Herdr commands and the session server open no console window (152.324796ms)
+✔ Windows terminal: only an absolute .exe is started, through a job, with a bounded size (security review) (24.599625ms)
+✔ Domain: OSC stream observer, path guard, shell quoting, and settings migration (1.441173ms)
+✔ Terminal: Live POSIX PtySession with resize over control FD (173.874986ms)
+✔ Vault Control Bridge: Authenticated socket, permission tiers, obs-herdr CLI, undo, and stdio MCP (3048.482199ms)
+✔ Live Herdr 0.8.2 Daemon Integration (isolated config & session) (1118.547254ms)
+✔ AgentCursorOverlay: Round 3 collaborator presence, honest state, and lifecycle (632.227777ms)
+✔ Raw key regressions: delayed agent input and modal replay (7.486423ms)
+✔ html-drag: HTML5 drag-and-drop and pointer-event drags (2.148625ms)
+✔ nested-editors helpers (4.138372ms)
+✔ fix-coordinator: agyA review fixes (A1-A10) (410.896521ms)
+✔ Fix round 2026-11-20 (fix-vault: B1-B8) (6528.763997ms)
+ℹ tests 140
+ℹ suites 17
+ℹ pass 140
+ℹ fail 0
+ℹ duration_ms 15905.416787
+```
+
+#### Exact dependency and artifact SHA-256 hashes (release `0.3.2`)
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `main.js` | `1017863` | `228327114dfe5ada8332851ccfd8c0fdad59631b136bf598621022166ad77885` |
+| `manifest.json` | `374` | `d8fee1b6c9b906da72060a0d6e8cdc600f9b87e5da8bff7f284b75732059e6f7` |
+| `styles.css` | `23943` | `8ff0988373c4a3d3aa797622d1a8b04464d55cdefd2402f0f812559d7ffc524e` |
+| `versions.json` | `171` | `c5ffd21975dbb3f5c305ebb7a129266b4b1e73fb05c8e79bea2bd5ef95740b16` |
+| `package.json` | `1152` | `cdef2ffe8ca7f01f94d45b8c36260ed9326adc2981dcf4a1949dbc275252ecac` |
+| `package-lock.json` | `191939` | `859618cf72fec431765f4ee1d5a82e7236f5baad76872b22459ae2e08501081a` |
+| `LICENSE` | `1070` | `fe617d451da04ca0ed4ccbcc054574429712fa3e99fcea05d205b2c6a6573f13` |
+| `src/control/LICENSE` | `11358` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
+| `NOTICE` | `697` | `2da6936fb0e557bb5a919962e85b902a0707e7f8a98081d1f277e4e753323919` |
+| `THIRD_PARTY_NOTICES.md` | `1752` | `b9a795457258171354ba15ac8e9a6a78458b9d2ebb755c5612828d1a2286d65c` |
+| `README.md` | `9902` | `7116d31bb76d269e787cf09d2ad06698572e9086776b4f7eebb50172385189d3` |
+| `CHANGELOG.md` | `6853` | `6628f8a1842ac47d5a4b37fc2ebc0bacb285df2f007d67824df2cea2156750b2` |

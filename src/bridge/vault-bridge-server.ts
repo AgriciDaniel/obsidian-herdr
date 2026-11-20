@@ -117,6 +117,7 @@ export class VaultBridgeServer {
         srv.on("error", (err: Error) => {
           this.running = false;
           console.warn("[herdr-obs] Vault bridge server error:", err);
+          void this.stop().catch(() => undefined);
         });
 
         if (process.platform !== "win32") {

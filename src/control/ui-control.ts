@@ -737,109 +737,112 @@ export class UiControlService {
     params: Record<string, unknown>,
     caller: string
   ): Promise<Record<string, unknown>> {
-    return this.timedAsync(async () => {
-      const hasValue = typeof params.value === "string";
-      const hasLabel = typeof params.label === "string";
-      if (!hasValue && !hasLabel) {
-        throw new UiControlError(
-          "invalid_params",
-          "ui.select requires 'value' or 'label'."
-        );
-      }
-      const targetParam =
-        params.target ??
-        (typeof params.selector === "string" && params.selector.trim()
-          ? { selector: params.selector.trim() }
-          : undefined);
-      const resolved = await this.resolveTargetAsync(targetParam);
-      const rawEl = resolved.element ?? resolved.containerEl ?? null;
-      if (!rawEl || rawEl.tagName.toLowerCase() !== "select") {
-        throw new UiControlError(
-          "invalid_params",
-          `ui.select target must be a <select> element (got ${rawEl ? `<${rawEl.tagName.toLowerCase()}>` : "none"}).`
-        );
-      }
-      this.assertElementNotProtected(rawEl, "select");
-      this.assertPointReceiverSafe(resolved.point, "select", this.expectedTargetContainer(resolved));
-
-      const selectEl = rawEl as HTMLSelectElement;
-      if (selectEl.disabled) {
-        throw new UiControlError("ui_target_disabled", "Target <select> element is disabled.");
-      }
-      const options: HTMLOptionElement[] = selectEl.options
-        ? Array.from(selectEl.options)
-        : Array.from(selectEl.querySelectorAll?.("option") ?? []);
-
-      const optionLabel = (opt: HTMLOptionElement): string =>
-        (opt.textContent ?? opt.label ?? "").trim();
-
-      let matched: HTMLOptionElement | undefined;
-      if (hasValue) {
-        const wanted = String(params.value);
-        matched = options.find((opt) => opt.value === wanted);
-      } else {
-        const wanted = String(params.label).trim();
-        matched =
-          options.find((opt) => optionLabel(opt) === wanted) ??
-          options.find((opt) => optionLabel(opt).toLowerCase() === wanted.toLowerCase());
-      }
-      if (!matched) {
-        const avail = options
-          .slice(0, 12)
-          .map((opt) => `${JSON.stringify(opt.value)} (${JSON.stringify(optionLabel(opt))})`)
-          .join(", ");
-        throw new UiControlError(
-          "ui_option_not_found",
-          `No matching <option> found for ${hasValue ? `value=${JSON.stringify(params.value)}` : `label=${JSON.stringify(params.label)}`}. Available: ${avail || "none"}.`
-        );
-      }
-      if (matched.disabled) {
-        throw new UiControlError(
-          "ui_option_disabled",
-          `Option ${JSON.stringify(matched.value)} is disabled.`
-        );
-      }
-
-      const docCtx = this.docContextForResolvedTarget(resolved);
-      this.showCursor(
-        caller,
-        "click",
-        resolved.point.x,
-        resolved.point.y,
-        "select",
-        params,
-        docCtx
+    const hasValue = typeof params.value === "string";
+    const hasLabel = typeof params.label === "string";
+    if (!hasValue && !hasLabel) {
+      throw new UiControlError(
+        "invalid_params",
+        "ui.select requires 'value' or 'label'."
       );
+    }
+    const targetParam =
+      params.target ??
+      (typeof params.selector === "string" && params.selector.trim()
+        ? { selector: params.selector.trim() }
+        : undefined);
+    const resolved = await this.resolveTargetAsync(targetParam);
+    const rawEl = resolved.element ?? resolved.containerEl ?? null;
+    if (!rawEl || rawEl.tagName.toLowerCase() !== "select") {
+      throw new UiControlError(
+        "invalid_params",
+        `ui.select target must be a <select> element (got ${rawEl ? `<${rawEl.tagName.toLowerCase()}>` : "none"}).`
+      );
+    }
+    this.assertElementNotProtected(rawEl, "select");
+    this.assertPointReceiverSafe(resolved.point, "select", this.expectedTargetContainer(resolved));
 
-      const previousValue = selectEl.value;
-      selectEl.value = matched.value;
-      matched.selected = true;
+    const selectEl = rawEl as HTMLSelectElement;
+    if (selectEl.disabled) {
+      throw new UiControlError("ui_target_disabled", "Target <select> element is disabled.");
+    }
+    const options: HTMLOptionElement[] = selectEl.options
+      ? Array.from(selectEl.options)
+      : Array.from(selectEl.querySelectorAll?.("option") ?? []);
 
-      const makeEvent = (type: string): Event => {
-        const EventCtor = (this.win as unknown as { Event?: typeof Event }).Event ?? Event;
-        return new EventCtor(type, { bubbles: true });
-      };
-      selectEl.dispatchEvent(makeEvent("input"));
-      selectEl.dispatchEvent(makeEvent("change"));
+    const optionLabel = (opt: HTMLOptionElement): string =>
+      (opt.textContent ?? opt.label ?? "").trim();
 
-      if (selectEl.value !== matched.value) {
-        throw new UiControlError(
-          "ui_effect_failed",
-          `Expected <select> value '${matched.value}', but element kept '${selectEl.value}'.`
-        );
-      }
-      await this.waitForCursorSettled(caller);
+    let matched: HTMLOptionElement | undefined;
+    if (hasValue) {
+      const wanted = String(params.value);
+      matched = options.find((opt) => opt.value === wanted);
+    } else {
+      const wanted = String(params.label).trim();
+      matched =
+        options.find((opt) => optionLabel(opt) === wanted) ??
+        options.find((opt) => optionLabel(opt).toLowerCase() === wanted.toLowerCase());
+    }
+    if (!matched) {
+      const avail = options
+        .slice(0, 12)
+        .map((opt) => `${JSON.stringify(opt.value)} (${JSON.stringify(optionLabel(opt))})`)
+        .join(", ");
+      throw new UiControlError(
+        "ui_option_not_found",
+        `No matching <option> found for ${hasValue ? `value=${JSON.stringify(params.value)}` : `label=${JSON.stringify(params.label)}`}. Available: ${avail || "none"}.`
+      );
+    }
+    const parentEl = (matched as unknown as { parentElement?: Element | null }).parentElement ?? null;
+    const parentOptgroupDisabled =
+      Boolean(this.findClosestElement(matched as unknown as Element, "optgroup[disabled]")) ||
+      (parentEl?.tagName?.toLowerCase() === "optgroup" &&
+        Boolean((parentEl as unknown as { disabled?: boolean }).disabled));
+    if (matched.disabled || parentOptgroupDisabled) {
+      throw new UiControlError(
+        "ui_option_disabled",
+        `Option ${JSON.stringify(matched.value)} is disabled.`
+      );
+    }
 
-      return {
-        selected: true,
-        value: selectEl.value,
-        label: optionLabel(matched),
-        previousValue,
-        changed: selectEl.value !== previousValue,
-        point: resolved.point,
-        selector: this.selectorPath(selectEl),
-      };
-    });
+    const docCtx = this.docContextForResolvedTarget(resolved);
+    this.showCursor(
+      caller,
+      "click",
+      resolved.point.x,
+      resolved.point.y,
+      "select",
+      params,
+      docCtx
+    );
+
+    const previousValue = selectEl.value;
+    selectEl.value = matched.value;
+    matched.selected = true;
+
+    const makeEvent = (type: string): Event => {
+      const EventCtor = (this.win as unknown as { Event?: typeof Event }).Event ?? Event;
+      return new EventCtor(type, { bubbles: true });
+    };
+    selectEl.dispatchEvent(makeEvent("input"));
+    selectEl.dispatchEvent(makeEvent("change"));
+
+    if (selectEl.value !== matched.value) {
+      throw new UiControlError(
+        "ui_effect_failed",
+        `Expected <select> value '${matched.value}', but element kept '${selectEl.value}'.`
+      );
+    }
+    await this.waitForCursorSettled(caller);
+
+    return {
+      selected: true,
+      value: selectEl.value,
+      label: optionLabel(matched),
+      previousValue,
+      changed: selectEl.value !== previousValue,
+      point: resolved.point,
+      selector: this.selectorPath(selectEl),
+    };
   }
 
   private async dispatchResolvedClick(
@@ -1225,14 +1228,27 @@ export class UiControlService {
     }
   }
 
-  private dispatchAgentKeyInput(wc: WebContentsLike, event: Record<string, unknown>): void {
+  private dispatchAgentKeyInput(
+    wc: WebContentsLike,
+    event: Record<string, unknown>
+  ): ExpectedAgentEvent[] {
     const type = typeof event.type === "string" ? event.type : "";
     const keyCode = typeof event.keyCode === "string" ? event.keyCode : "";
     const modState = this.extractEventModifierState(event.modifiers);
+    const pushed: ExpectedAgentEvent[] = [];
     if (type === "keyDown" && keyCode) {
-      this.pushExpectedAgentEvent("keydown", keyCode, modState);
+      pushed.push(this.pushExpectedAgentEvent("keydown", keyCode, modState));
+      const lowerKey = keyCode.toLowerCase();
+      if (lowerKey === "backspace") {
+        pushed.push(this.pushExpectedAgentEvent("beforeinput", "__backspace__", modState));
+      } else if (lowerKey === "delete" || lowerKey === "del") {
+        pushed.push(this.pushExpectedAgentEvent("beforeinput", "__delete__", modState));
+      }
     } else if (type === "char" && keyCode) {
-      this.pushExpectedAgentEvent("keypress", keyCode, modState);
+      pushed.push(this.pushExpectedAgentEvent("keypress", keyCode, modState));
+      if (keyCode === "\r" || keyCode === "\n") {
+        pushed.push(this.pushExpectedAgentEvent("beforeinput", "__enter__", modState));
+      }
     }
     this.dispatchingAgentInput = true;
     try {
@@ -1240,6 +1256,7 @@ export class UiControlService {
     } finally {
       this.dispatchingAgentInput = false;
     }
+    return pushed;
   }
 
   /**
@@ -1952,33 +1969,49 @@ export class UiControlService {
           const beforeCtx = this.buildDocContext();
           this.showCursor(caller, "move", pt.x, pt.y, combo || "key", params, beforeCtx);
           let executedCommandId: string | null = null;
-          if (acceleratorCommandId && this.executeObsidianCommandById(acceleratorCommandId)) {
-            executedCommandId = acceleratorCommandId;
-          } else {
-            try {
-              this.dispatchAgentKeyInput(wc, {
-                type: "keyDown",
-                keyCode: press.keyCode,
-                modifiers: press.modifiers,
-              });
-              if (press.text !== null) {
-                this.dispatchAgentKeyInput(wc, {
-                  type: "char",
-                  keyCode: press.text,
-                  modifiers: press.modifiers,
-                });
+          const keyLedgerEntries: ExpectedAgentEvent[] = [];
+          try {
+            if (acceleratorCommandId && this.executeObsidianCommandById(acceleratorCommandId)) {
+              executedCommandId = acceleratorCommandId;
+            } else {
+              try {
+                keyLedgerEntries.push(
+                  ...this.dispatchAgentKeyInput(wc, {
+                    type: "keyDown",
+                    keyCode: press.keyCode,
+                    modifiers: press.modifiers,
+                  })
+                );
+                if (press.text !== null) {
+                  keyLedgerEntries.push(
+                    ...this.dispatchAgentKeyInput(wc, {
+                      type: "char",
+                      keyCode: press.text,
+                      modifiers: press.modifiers,
+                    })
+                  );
+                }
+              } finally {
+                keyLedgerEntries.push(
+                  ...this.dispatchAgentKeyInput(wc, {
+                    type: "keyUp",
+                    keyCode: press.keyCode,
+                    modifiers: press.modifiers,
+                  })
+                );
               }
-            } finally {
-              this.dispatchAgentKeyInput(wc, {
-                type: "keyUp",
-                keyCode: press.keyCode,
-                modifiers: press.modifiers,
-              });
             }
-          }
-          const settleMs = this.actionDelayMs(80, 10);
-          if (settleMs > 0) {
-            await this.sleep(settleMs);
+            const settleMs = this.actionDelayMs(80, 10);
+            if (settleMs > 0) {
+              await this.sleep(settleMs);
+            }
+          } finally {
+            for (const entry of keyLedgerEntries) {
+              const idx = this.expectedAgentLedger.indexOf(entry);
+              if (idx >= 0) {
+                this.expectedAgentLedger.splice(idx, 1);
+              }
+            }
           }
           const doc = this.win.document;
           const afterActive = this.deepActiveElement();
@@ -3369,6 +3402,8 @@ export class UiControlService {
       const aliases: Record<string, string> = {
         return: "enter",
         enter: "enter",
+        "\r": "enter",
+        "\n": "enter",
         space: " ",
         " ": " ",
         esc: "escape",
@@ -3393,6 +3428,7 @@ export class UiControlService {
         insert: "insert",
         ins: "insert",
         tab: "tab",
+        "\t": "tab",
       };
       const base = aliases[lower] ?? lower;
       return shiftKey && Object.prototype.hasOwnProperty.call(shiftedPunct, base)
@@ -3406,22 +3442,15 @@ export class UiControlService {
     type?: string;
     key?: string;
     data?: string | null;
+    inputType?: string;
     shiftKey?: boolean;
     ctrlKey?: boolean;
     altKey?: boolean;
     metaKey?: boolean;
   }): boolean {
     this.pruneExpiredAgentLedger();
-    const head = this.expectedAgentLedger[0];
-    if (!head || ev.type !== head.eventType) {
+    if (this.expectedAgentLedger.length === 0) {
       return false;
-    }
-    if (head.eventType === "beforeinput") {
-      if ((ev.data ?? "") !== head.keyMatch) {
-        return false;
-      }
-      this.expectedAgentLedger.shift();
-      return true;
     }
     const hasModifierFlags =
       typeof ev.shiftKey === "boolean" ||
@@ -3429,21 +3458,50 @@ export class UiControlService {
       typeof ev.altKey === "boolean" ||
       typeof ev.metaKey === "boolean";
     const skipStrictModsForSyncMock = this.dispatchingAgentInput && !hasModifierFlags;
-    if (
-      !skipStrictModsForSyncMock &&
-      (Boolean(ev.shiftKey) !== head.shiftKey ||
-        Boolean(ev.ctrlKey) !== head.ctrlKey ||
-        Boolean(ev.altKey) !== head.altKey ||
-        Boolean(ev.metaKey) !== head.metaKey)
-    ) {
-      return false;
+
+    for (let i = 0; i < this.expectedAgentLedger.length; i += 1) {
+      const entry = this.expectedAgentLedger[i];
+      if (ev.type !== entry.eventType) {
+        continue;
+      }
+      if (entry.eventType === "beforeinput") {
+        let matched = false;
+        if (entry.keyMatch === "__enter__") {
+          matched =
+            ev.inputType === "insertLineBreak" ||
+            ev.inputType === "insertParagraph" ||
+            ev.data === "\n" ||
+            ev.data === "\r";
+        } else if (entry.keyMatch === "__backspace__") {
+          matched = ev.inputType === "deleteContentBackward";
+        } else if (entry.keyMatch === "__delete__") {
+          matched = ev.inputType === "deleteContentForward";
+        } else {
+          matched = (ev.data ?? "") === entry.keyMatch;
+        }
+        if (!matched) {
+          continue;
+        }
+        this.expectedAgentLedger.splice(i, 1);
+        return true;
+      }
+      if (
+        !skipStrictModsForSyncMock &&
+        (Boolean(ev.shiftKey) !== entry.shiftKey ||
+          Boolean(ev.ctrlKey) !== entry.ctrlKey ||
+          Boolean(ev.altKey) !== entry.altKey ||
+          Boolean(ev.metaKey) !== entry.metaKey)
+      ) {
+        continue;
+      }
+      const keyVal = typeof ev.key === "string" ? ev.key : (ev.data ?? "");
+      if (!this.matchesAgentKeyName(keyVal, entry.keyMatch, entry.shiftKey)) {
+        continue;
+      }
+      this.expectedAgentLedger.splice(i, 1);
+      return true;
     }
-    const keyVal = typeof ev.key === "string" ? ev.key : (ev.data ?? "");
-    if (!this.matchesAgentKeyName(keyVal, head.keyMatch, head.shiftKey)) {
-      return false;
-    }
-    this.expectedAgentLedger.shift();
-    return true;
+    return false;
   }
 
   private attachUserInputCaptureListener(session: FocusShieldSession): () => void {
@@ -4857,7 +4915,20 @@ export class UiControlService {
   }
 
   private serialize<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(task, task);
+    if (this.disposed) {
+      return Promise.reject(
+        new UiControlError("ui_unavailable", "UI control service was disposed.")
+      );
+    }
+    const guarded = () => {
+      if (this.disposed) {
+        return Promise.reject(
+          new UiControlError("ui_unavailable", "UI control service was disposed.")
+        );
+      }
+      return task();
+    };
+    const run = this.queue.then(guarded, guarded);
     this.queue = run.catch(() => undefined);
     return run;
   }

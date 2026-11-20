@@ -301,38 +301,60 @@ export async function pruneStaleRuntimeKits(opts: {
       continue;
     }
 
-    const sockPath = path.join(entryPath, "b.sock");
-    let hasLiveSocket = false;
-    try {
-      const sockStat = fs.lstatSync(sockPath);
-      if (!sockStat.isSymbolicLink()) {
-        hasLiveSocket = await isSocketLive(sockPath);
-      }
-    } catch {
-      hasLiveSocket = false;
-    }
-    if (hasLiveSocket) {
-      continue;
-    }
-
     const connPath = path.join(entryPath, "connection.json");
     let stale = false;
     let hasConnFile = false;
     let hasConnSignature = false;
+    let connSocketPath: string | null = null;
     try {
       const connStat = fs.lstatSync(connPath);
       if (!connStat.isSymbolicLink() && connStat.isFile()) {
         hasConnFile = true;
         const parsed = JSON.parse(fs.readFileSync(connPath, "utf8")) as Record<string, unknown>;
-        if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "vaultPath")) {
-          hasConnSignature = true;
-          if (typeof parsed.vaultPath === "string" && parsed.vaultPath.trim().length > 0) {
-            stale = !fs.existsSync(parsed.vaultPath);
+        if (parsed && typeof parsed === "object") {
+          if (typeof parsed.socketPath === "string" && parsed.socketPath.trim().length > 0) {
+            connSocketPath = parsed.socketPath.trim();
+          }
+          if (Object.prototype.hasOwnProperty.call(parsed, "vaultPath")) {
+            hasConnSignature = true;
+            if (typeof parsed.vaultPath === "string" && parsed.vaultPath.trim().length > 0) {
+              stale = !fs.existsSync(parsed.vaultPath);
+            }
           }
         }
       }
     } catch {
       hasConnFile = false;
+    }
+
+    const sockPath = path.join(entryPath, "b.sock");
+    let hasLiveSocket = false;
+    if (process.platform === "win32" || (connSocketPath && /^\\\\[.?]\\pipe\\/i.test(connSocketPath))) {
+      if (connSocketPath) {
+        hasLiveSocket = await isSocketLive(connSocketPath);
+      }
+    } else {
+      try {
+        const sockStat = fs.lstatSync(sockPath);
+        if (!sockStat.isSymbolicLink()) {
+          hasLiveSocket = await isSocketLive(sockPath);
+        }
+      } catch {
+        hasLiveSocket = false;
+      }
+      if (!hasLiveSocket && connSocketPath && connSocketPath !== sockPath) {
+        try {
+          const altStat = fs.lstatSync(connSocketPath);
+          if (!altStat.isSymbolicLink() && altStat.isSocket()) {
+            hasLiveSocket = await isSocketLive(connSocketPath);
+          }
+        } catch {
+          // Ignore unreadable alternate socketPath
+        }
+      }
+    }
+    if (hasLiveSocket) {
+      continue;
     }
 
     const hasBinSig = hasKitBinSignature(entryPath);
@@ -1045,13 +1067,14 @@ function resolveConnection() {
 }
 
 function resolveTimeoutMs(method, params) {
+  const clamp = (ms) => Math.min(600000, Math.max(1000, Math.round(ms)));
   const envRaw = process.env.OBS_HERDR_TIMEOUT_MS;
   const envNum = envRaw !== undefined && envRaw !== "" ? Number(envRaw) : NaN;
-  const base = Number.isFinite(envNum) && envNum > 0 ? Math.round(envNum) : 60000;
+  const base = Number.isFinite(envNum) && envNum > 0 ? clamp(envNum) : 60000;
   if (method === "ui.wait_for") {
     const p = params && typeof params === "object" ? params : {};
     const waitMs = Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) >= 0 ? Number(p.timeoutMs) : 5000;
-    return Math.max(base, Math.round(waitMs) + 30000);
+    return clamp(Math.max(base, Math.round(waitMs) + 30000));
   }
   if (method === "ui.batch") {
     const p = params && typeof params === "object" ? params : {};
@@ -1065,10 +1088,10 @@ function resolveTimeoutMs(method, params) {
       }
     }
     if (totalWait > 0) {
-      return Math.max(base, Math.round(totalWait) + 30000);
+      return clamp(Math.max(base, Math.round(totalWait) + 30000));
     }
   }
-  return base;
+  return clamp(base);
 }
 
 function callBridge(method, params = {}) {
@@ -1956,7 +1979,7 @@ main().catch((err) => {
 
 function buildObsHerdrCorePy(defaultConnFile: string, pluginVersion: string): string {
   return `#!/usr/bin/env python3
-import datetime, json, math, os, posixpath, re, socket, subprocess, sys, time
+import datetime, json, math, os, posixpath, re, socket, subprocess, sys, threading, time
 
 DEFAULT_CONN_FILE = ${JSON.stringify(defaultConnFile)}
 PLUGIN_VERSION = ${JSON.stringify(pluginVersion)}
@@ -1986,13 +2009,15 @@ def resolve_conn():
     return data["socketPath"], data["token"]
 
 def resolve_timeout_ms(method, params):
+    def clamp(ms):
+        return min(600000, max(1000, int(round(ms))))
     env_raw = os.environ.get("OBS_HERDR_TIMEOUT_MS", "")
     base = 60000
     if env_raw != "":
         try:
             env_num = float(env_raw)
             if math.isfinite(env_num) and env_num > 0:
-                base = int(round(env_num))
+                base = clamp(env_num)
         except Exception:
             pass
     p = params if isinstance(params, dict) else {}
@@ -2003,7 +2028,7 @@ def resolve_timeout_ms(method, params):
                 w = 5000.0
         except Exception:
             w = 5000.0
-        return max(base, int(round(w)) + 30000)
+        return clamp(max(base, int(round(w)) + 30000))
     if method == "ui.batch":
         total_wait = 0.0
         if p.get("timeoutMs") is not None:
@@ -2025,8 +2050,8 @@ def resolve_timeout_ms(method, params):
                         sw = 5000.0
                     total_wait += sw
         if total_wait > 0:
-            return max(base, int(round(total_wait)) + 30000)
-    return base
+            return clamp(max(base, int(round(total_wait)) + 30000))
+    return clamp(base)
 
 def call_bridge(method, params=None):
     sock_path, token = resolve_conn()
@@ -2037,13 +2062,28 @@ def call_bridge(method, params=None):
     payload = (json.dumps(req) + "\\n").encode("utf-8")
     buf = b""
     if os.name == "nt" and sock_path.startswith("\\\\\\\\.\\\\pipe\\\\"):
-        with open(sock_path, "r+b", buffering=0) as pipe_fh:
-            pipe_fh.write(payload)
-            while b"\\n" not in buf:
-                chunk = pipe_fh.read(65536)
-                if not chunk:
-                    break
-                buf += chunk
+        box = {"buf": b"", "err": None}
+        def _pipe_io():
+            try:
+                with open(sock_path, "r+b", buffering=0) as pipe_fh:
+                    pipe_fh.write(payload)
+                    local_buf = b""
+                    while b"\\n" not in local_buf:
+                        chunk = pipe_fh.read(65536)
+                        if not chunk:
+                            break
+                        local_buf += chunk
+                    box["buf"] = local_buf
+            except Exception as exc:
+                box["err"] = exc
+        t = threading.Thread(target=_pipe_io, daemon=True)
+        t.start()
+        t.join(timeout_ms / 1000.0)
+        if t.is_alive():
+            raise RuntimeError(f"Bridge request timed out after {timeout_ms} ms ({method}).")
+        if box["err"] is not None:
+            raise box["err"]
+        buf = box["buf"]
     else:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout_ms / 1000.0)
