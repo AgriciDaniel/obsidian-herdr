@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.2 (2026-11-20)
+
+Reliability fixes from a full code and live review. The aim: agents keep working, and when something fails they are told so instead of being left hanging.
+
+- Deleting a note through the bridge now checks that the note is really gone. If system trash is not available (common in the Flatpak), it falls back to Obsidian's own `.trash` folder in the vault; if that fails too, it reports `trash_failed` instead of a false success. Undo of a created note uses the same check.
+- Renaming a linked note no longer stops at Obsidian's "Update links" question. Links are updated without a prompt and without changing your settings; pass `updateLinks: false` to rename without touching links.
+- The `obs-herdr` command and its MCP server time out (60 seconds by default, `OBS_HERDR_TIMEOUT_MS` to change it) and report an error when Obsidian closes the connection early, instead of hanging or exiting as if it had worked.
+- Reloading or turning the plugin off and on can no longer delete the new bridge socket, which used to cut agents off while Mission Control still showed the bridge as active.
+- If the runtime folder in `~/.cache/obs-herdr/` is deleted while Obsidian runs, the bridge rebuilds it with the same token. Old runtime folders of vaults that no longer exist are cleaned up once per start.
+- A bridge start failure no longer leaves Mission Control half loaded; it shows the error and carries on.
+- Mission Control's Doctor tab warns when Herdr reports a protocol other than the tested one (20), or when the Herdr client and server disagree, and suggests `herdr update --handoff`.
+- New panes from saved layouts get the vault command on PATH too. The Herdr agent and remote terminal profiles fall back to a shell when Herdr is missing, and the terminal says so when full-screen apps cannot work because Python 3 is missing.
+- While a new agent waits at a question, the Spawn window can be cancelled; the initial prompt is then not sent.
+- One failing view no longer stops the others from updating, and UI control stops cleanly when the plugin unloads.
+- Smaller: the note graph and backlinks skip `node_modules`, `.git` and the settings folder; `ui inspect` marks protected elements such as window controls and lists them last; the MCP server reports the real plugin version.
+
 ## 0.3.1 (2026-11-19)
 
 Windows fixes from member reports on the AIMH home repository (issues #73, #74, #76 and pull request #78), the same as in AIMH Team 0.3.29. Not run on a Windows computer by the maintainer: the member reports and tests that set up Windows' platform and environment are the evidence.

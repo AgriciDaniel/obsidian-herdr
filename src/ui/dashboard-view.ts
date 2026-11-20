@@ -642,9 +642,12 @@ export class HerdrDashboardView extends ItemView {
       chip.addEventListener("click", () => {
         this.selectedWorkspaceId = ws.workspace_id;
         if (state.serverRunning) {
-          void this.coordinator.socket.focusWorkspace(ws.workspace_id).then(() =>
-            this.coordinator.refreshAll(false)
-          );
+          void this.coordinator.socket
+            .focusWorkspace(ws.workspace_id)
+            .then(() => this.coordinator.refreshAll(false))
+            .catch((err: unknown) => {
+              new Notice(err instanceof Error ? err.message : String(err));
+            });
         } else {
           this.renderDashboard();
         }
@@ -865,7 +868,10 @@ export class HerdrDashboardView extends ItemView {
         cell.addEventListener("click", () => {
           void this.coordinator.socket
             .focusPane(lp.pane_id)
-            .then(() => this.coordinator.refreshAll(false));
+            .then(() => this.coordinator.refreshAll(false))
+            .catch((err: unknown) => {
+              new Notice(err instanceof Error ? err.message : String(err));
+            });
         });
       }
     }
@@ -1034,7 +1040,12 @@ export class HerdrDashboardView extends ItemView {
             cls: "herdr-btn-compact",
           });
           openBtn.addEventListener("click", () => {
-            void this.app.workspace.getLeaf(false).openFile(af);
+            void this.app.workspace
+              .getLeaf(false)
+              .openFile(af)
+              .catch((err: unknown) => {
+                new Notice(err instanceof Error ? err.message : String(err));
+              });
           });
         }
       }
@@ -1092,8 +1103,13 @@ export class HerdrDashboardView extends ItemView {
       void this.coordinator
         .buildActiveNoteContextPack({ includeBacklinks: true })
         .then((pack) => {
-          void navigator.clipboard.writeText(pack.payload);
+          void navigator.clipboard.writeText(pack.payload).catch((err: unknown) => {
+            console.warn("[herdr-obs] Clipboard write failed:", err);
+          });
           new Notice(`Copied context pack for '${pack.title}'.`);
+        })
+        .catch((err: unknown) => {
+          new Notice(err instanceof Error ? err.message : String(err));
         });
     });
   }
@@ -1101,6 +1117,13 @@ export class HerdrDashboardView extends ItemView {
   private renderDoctorTab(parent: HTMLElement, state: CoordinatorState): void {
     const diagCard = parent.createDiv({ cls: "herdr-section-card" });
     diagCard.createDiv({ cls: "herdr-card-title", text: "Runtime diagnostics" });
+
+    if (state.protocolWarning) {
+      const warnBanner = diagCard.createDiv({ cls: "herdr-preview-banner" });
+      const warnText = warnBanner.createDiv({ cls: "herdr-preview-text" });
+      warnText.createEl("strong", { text: "Herdr protocol warning: " });
+      warnText.createSpan({ text: state.protocolWarning });
+    }
 
     const kv = diagCard.createDiv({ cls: "herdr-kv-grid" });
     this.addKvRow(kv, "Herdr binary", state.binaryPath || "Not found on PATH");
@@ -1312,6 +1335,7 @@ export class HerdrDashboardView extends ItemView {
         workspaceId,
         tabLabel: activeFile.basename.slice(0, 32),
         focus: true,
+        env: this.coordinator.getBridgeEnv(),
       });
       await this.coordinator.refreshAll(false);
       new Notice(`Applied Herdr layout from '${activeFile.basename}'.`);

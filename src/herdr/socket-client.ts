@@ -59,6 +59,75 @@ const DEFAULT_SUBSCRIPTIONS = [
   { type: "layout.updated" },
 ];
 
+export const SUPPORTED_HERDR_PROTOCOLS: readonly number[] = [20];
+
+/**
+ * Checks Herdr client/server protocol compatibility and returns a user-facing warning
+ * without blocking plugin operation. Returns null when compatible or unknown.
+ */
+export function evaluateHerdrProtocol(info: {
+  clientVersion?: string | null;
+  clientProtocol?: number | null;
+  serverVersion?: string | null;
+  serverProtocol?: number | null;
+}): string | null {
+  const cp = typeof info.clientProtocol === "number" && Number.isFinite(info.clientProtocol)
+    ? info.clientProtocol
+    : null;
+  const sp = typeof info.serverProtocol === "number" && Number.isFinite(info.serverProtocol)
+    ? info.serverProtocol
+    : null;
+  const supportedLabel = SUPPORTED_HERDR_PROTOCOLS.join(", ");
+
+  if (cp !== null && sp !== null && cp !== sp) {
+    return (
+      `Herdr client (${info.clientVersion || "unknown"}, protocol ${cp}) and running server ` +
+      `(${info.serverVersion || "unknown"}, protocol ${sp}) disagree. ` +
+      `Run \`herdr update --handoff\` from a host shell to align them (plugin supports protocol ${supportedLabel}).`
+    );
+  }
+  if (sp !== null && !SUPPORTED_HERDR_PROTOCOLS.includes(sp)) {
+    return (
+      `Herdr server (${info.serverVersion || "unknown"}) uses protocol ${sp}, while this plugin ` +
+      `supports protocol ${supportedLabel}. Run \`herdr update --handoff\` from a host shell or update the plugin.`
+    );
+  }
+  if (cp !== null && !SUPPORTED_HERDR_PROTOCOLS.includes(cp)) {
+    return (
+      `Herdr client (${info.clientVersion || "unknown"}) uses protocol ${cp}, while this plugin ` +
+      `supports protocol ${supportedLabel}. Run \`herdr update --handoff\` from a host shell or update the plugin.`
+    );
+  }
+  return null;
+}
+
+/**
+ * Recursively injects default environment variables into every leaf pane node of a Herdr layout,
+ * preserving any explicit per-pane overrides already defined in the layout.
+ */
+export function injectEnvIntoLayoutNode(
+  node: HerdrLayoutNode,
+  env: Record<string, string>
+): HerdrLayoutNode {
+  if (!env || Object.keys(env).length === 0) {
+    return node;
+  }
+  if (node.type === "pane") {
+    return {
+      ...node,
+      env: {
+        ...env,
+        ...(node.env || {}),
+      },
+    };
+  }
+  return {
+    ...node,
+    first: injectEnvIntoLayoutNode(node.first, env),
+    second: injectEnvIntoLayoutNode(node.second, env),
+  };
+}
+
 const WINDOWS_PIPE_PREFIX = /^\\\\[.?]\\pipe\\/i;
 
 /**
@@ -387,9 +456,13 @@ export class HerdrSocketClient {
     tabId?: string;
     tabLabel?: string;
     focus?: boolean;
+    env?: Record<string, string>;
   }): Promise<HerdrLayoutDescription> {
+    const rootWithEnv = options.env
+      ? injectEnvIntoLayoutNode(options.root, options.env)
+      : options.root;
     const res = await this.request<{ layout: HerdrLayoutDescription }>("layout.apply", {
-      root: options.root,
+      root: rootWithEnv,
       workspace_id: options.workspaceId ?? null,
       tab_id: options.tabId ?? null,
       tab_label: options.tabLabel ?? null,

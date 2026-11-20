@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Writable } from "node:stream";
+import type { TerminalProfileKind } from "../domain/types";
 import { buildHostNormalizedEnv, resolvePreferredPosixShell } from "../herdr/cli-client";
 
 export interface PtySpawnOptions {
@@ -12,8 +13,25 @@ export interface PtySpawnOptions {
   cols: number;
   rows: number;
   env?: Record<string, string>;
+  /** Optional override for tests: pass null to force the plain-pipe fallback on POSIX. */
+  python3Path?: string | null;
   onData: (chunk: string) => void;
   onExit: (exitCode: number | null, signal: string | null) => void;
+}
+
+/** Returns true when a Herdr terminal profile cannot launch because the herdr binary is missing. */
+export function shouldFallbackMissingHerdr(
+  profileKind: TerminalProfileKind,
+  binaryPath: string | null
+): boolean {
+  if (binaryPath) {
+    return false;
+  }
+  return (
+    profileKind === "herdr-vault" ||
+    profileKind === "herdr-agent" ||
+    profileKind === "herdr-remote"
+  );
 }
 
 /**
@@ -536,7 +554,7 @@ export class PtySession {
       ...(options.env || {}),
     });
 
-    const py3 = findPython3();
+    const py3 = options.python3Path === undefined ? findPython3() : options.python3Path;
     const powershell = findWindowsPowerShell();
     if (py3 && process.platform !== "win32") {
       this.proc = spawn(
@@ -607,6 +625,11 @@ export class PtySession {
           return;
         }
         command = resolved.application;
+      }
+      if (process.platform !== "win32") {
+        options.onData(
+          "\r\n\x1b[33m[Warning: python3 not found; falling back to plain pipes without a PTY. Full-screen apps such as Herdr will not work.]\x1b[0m\r\n"
+        );
       }
       this.proc = spawn(command, options.args, {
         cwd: safeCwd,

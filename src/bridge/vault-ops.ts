@@ -380,7 +380,7 @@ export class VaultOpsService {
           // Hold the write guard from final validation until the destructive API settles.
           this.destructiveUndoPaths.add(snap.path);
           try {
-            await this.app.fileManager.trashFile(created);
+            await this.trashFileVerified(created, snap.path);
           } finally {
             this.destructiveUndoPaths.delete(snap.path);
           }
@@ -402,7 +402,7 @@ export class VaultOpsService {
             throw new Error(`Renamed note '${snap.path}' is no longer present.`);
           }
           await this.ensureParentFolders(snap.previousPath);
-          await this.app.fileManager.renameFile(current, snap.previousPath);
+          await this.renameFileSafely(current, snap.previousPath, true);
           entry.undone = true;
           this.notifyAudit();
           return `Renamed '${snap.path}' back to '${snap.previousPath}'.`;
@@ -1021,6 +1021,10 @@ export class VaultOpsService {
     if (explicitFolderPrefix && norm.startsWith(explicitFolderPrefix)) {
       return false;
     }
+    const cfgDir = this.app.vault.configDir ? normalizePath(this.app.vault.configDir) : "";
+    if (cfgDir && (norm === cfgDir || norm.startsWith(`${cfgDir}/`))) {
+      return true;
+    }
     if (/(?:^|\/)(?:\.git|node_modules)(?:\/|$)/.test(norm)) {
       return true;
     }
@@ -1273,10 +1277,12 @@ export class VaultOpsService {
         const relPath = this.safePath(params.path, false);
         const resolved = this.app.metadataCache.resolvedLinks[relPath] || {};
         const unresolved = this.app.metadataCache.unresolvedLinks[relPath] || {};
-        const outgoing = Object.entries(resolved).map(([target, count]) => ({
-          path: target,
-          count,
-        }));
+        const outgoing = Object.entries(resolved)
+          .filter(([target]) => !this.isExcludedFromScan(target))
+          .map(([target, count]) => ({
+            path: target,
+            count,
+          }));
         const unresolvedList = Object.entries(unresolved).map(([target, count]) => ({
           link: target,
           count,
@@ -1511,6 +1517,7 @@ export class VaultOpsService {
       case "vault.rename_note": {
         const fromPath = this.safePath(params.path, true);
         const toPath = this.safePath(params.newPath, true);
+        const updateLinks = params.updateLinks !== false;
         const [firstLock, secondLock] = [fromPath, toPath].sort();
         const doRename = async () => {
           const file = this.requireFile(fromPath);
@@ -1521,14 +1528,16 @@ export class VaultOpsService {
             );
           }
           await this.ensureParentFolders(toPath);
-          await this.app.fileManager.renameFile(file, toPath);
+          await this.renameFileSafely(file, toPath, updateLinks);
 
           this.recordAudit({
             method,
             caller,
             targetPath: toPath,
             allowed: true,
-            summary: `Renamed '${fromPath}' to '${toPath}' with automatic wiki link updates.`,
+            summary: updateLinks
+              ? `Renamed '${fromPath}' to '${toPath}' with automatic wiki link updates.`
+              : `Renamed '${fromPath}' to '${toPath}' without updating wiki links.`,
             snapshot: {
               kind: "renamed",
               path: toPath,
@@ -1550,14 +1559,14 @@ export class VaultOpsService {
         return this.withPathLock(relPath, async () => {
           const file = this.requireFile(relPath);
           const previousContent = await this.app.vault.read(file);
-          await this.app.fileManager.trashFile(file);
+          const trashMethod = await this.trashFileVerified(file, relPath);
 
           this.recordAudit({
             method,
             caller,
             targetPath: relPath,
             allowed: true,
-            summary: `Moved '${relPath}' to trash via FileManager.trashFile.`,
+            summary: `Moved '${relPath}' to ${trashMethod === "local" ? "local .trash" : "trash"} via FileManager.trashFile.`,
             snapshot: {
               kind: "modified",
               path: relPath,
@@ -1567,7 +1576,7 @@ export class VaultOpsService {
           });
           this.notifyActivity(caller, relPath, "trash");
 
-          return { trashed: true, path: relPath };
+          return { trashed: true, path: relPath, method: trashMethod };
         });
       }
 
@@ -1851,10 +1860,72 @@ export class VaultOpsService {
     }
   }
 
+  private async trashFileVerified(file: TFile, relPath: string): Promise<"system" | "local"> {
+    await this.app.fileManager.trashFile(file);
+    if (this.app.vault.getAbstractFileByPath(relPath) === null) {
+      return "system";
+    }
+    const vaultWithTrash = this.app.vault as unknown as {
+      trash?: (target: TFile, system: boolean) => Promise<void>;
+    };
+    if (typeof vaultWithTrash.trash === "function") {
+      await vaultWithTrash.trash(file, false);
+      if (this.app.vault.getAbstractFileByPath(relPath) === null) {
+        return "local";
+      }
+    }
+    throw new BridgeRpcError(
+      "trash_failed",
+      `Failed to move '${relPath}' to trash: file is still present in the vault.`
+    );
+  }
+
+  private async renameFileSafely(
+    file: TFile,
+    toPath: string,
+    updateLinks = true
+  ): Promise<void> {
+    if (!updateLinks) {
+      const vaultWithRename = this.app.vault as unknown as {
+        rename?: (target: TFile, newPath: string) => Promise<void>;
+      };
+      if (typeof vaultWithRename.rename === "function") {
+        await vaultWithRename.rename(file, toPath);
+        return;
+      }
+    }
+    const vaultWithConfig = this.app.vault as unknown as {
+      config?: Record<string, unknown>;
+    };
+    const cfg =
+      vaultWithConfig.config && typeof vaultWithConfig.config === "object"
+        ? vaultWithConfig.config
+        : null;
+    const hadKey = cfg ? Object.prototype.hasOwnProperty.call(cfg, "alwaysUpdateLinks") : false;
+    const prevVal = cfg ? cfg.alwaysUpdateLinks : undefined;
+    if (cfg) {
+      cfg.alwaysUpdateLinks = updateLinks;
+    }
+    try {
+      await this.app.fileManager.renameFile(file, toPath);
+    } finally {
+      if (cfg) {
+        if (hadKey) {
+          cfg.alwaysUpdateLinks = prevVal;
+        } else {
+          delete cfg.alwaysUpdateLinks;
+        }
+      }
+    }
+  }
+
   private collectBacklinksForPath(targetPath: string): Array<{ sourcePath: string; count: number }> {
     const resolvedMap = this.app.metadataCache.resolvedLinks;
     const out: Array<{ sourcePath: string; count: number }> = [];
     for (const [sourcePath, targets] of Object.entries(resolvedMap)) {
+      if (this.isExcludedFromScan(sourcePath)) {
+        continue;
+      }
       const count = targets[targetPath];
       if (typeof count === "number" && count > 0) {
         out.push({ sourcePath, count });

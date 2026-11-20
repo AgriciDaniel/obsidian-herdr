@@ -16,6 +16,7 @@ export class SpawnAgentModal extends Modal {
   private attachVaultMcp = true;
   private initialPrompt = "";
   private submitting = false;
+  private abortController: AbortController | null = null;
 
   constructor(app: App, coordinator: HerdrCoordinator, defaultKind: string, onSpawned?: () => void) {
     super(app);
@@ -145,9 +146,8 @@ export class SpawnAgentModal extends Modal {
     new Setting(contentEl)
       .addButton((btn) =>
         btn.setButtonText("Cancel").onClick(() => {
-          if (!this.submitting) {
-            this.close();
-          }
+          this.abortController?.abort();
+          this.close();
         })
       )
       .addButton((btn) => {
@@ -170,6 +170,8 @@ export class SpawnAgentModal extends Modal {
       return;
     }
     this.submitting = true;
+    const controller = new AbortController();
+    this.abortController = controller;
     if (spawnBtnEl) {
       spawnBtnEl.disabled = true;
       spawnBtnEl.setText(`Starting ${this.agentKind}...`);
@@ -181,21 +183,32 @@ export class SpawnAgentModal extends Modal {
         direction: this.direction,
         attachVaultMcp: this.attachVaultMcp,
         initialPrompt: this.initialPrompt,
+        signal: controller.signal,
       });
       new Notice(`Started Herdr agent '${this.agentName}' (${this.agentKind}).`);
       this.onSpawned?.();
       this.close();
     } catch (err) {
       this.submitting = false;
+      if (controller.signal.aborted) {
+        new Notice(`Cancelled waiting for '${this.agentName}'. Initial prompt was not sent.`);
+        return;
+      }
       if (spawnBtnEl) {
         spawnBtnEl.disabled = false;
         spawnBtnEl.setText("Spawn agent");
       }
       new Notice(`Could not start agent: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (this.abortController === controller) {
+        this.abortController = null;
+      }
     }
   }
 
   onClose(): void {
+    this.abortController?.abort();
+    this.abortController = null;
     this.contentEl.empty();
   }
 }

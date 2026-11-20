@@ -16,6 +16,8 @@ try {
         'import "./tests/raw-key-regressions.test.ts";',
         'import "./tests/html-drag.test.ts";',
         'import "./tests/nested-editors.test.ts";',
+        'import "./tests/fix-coordinator.test.ts";',
+        'import "./tests/fix-vault.test.ts";',
       ].join("\n"),
       resolveDir: process.cwd(),
       loader: "ts",

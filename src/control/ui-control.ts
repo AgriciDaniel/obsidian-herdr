@@ -147,6 +147,7 @@ export interface InspectedElement {
   text: string;
   value?: string;
   disabled: boolean;
+  protected?: boolean;
   rect: { x: number; y: number; width: number; height: number };
   notePath?: string;
   pane?: string;
@@ -432,6 +433,8 @@ export class UiControlService {
   private replayingUserInput = false;
   private dispatchingAgentInput = false;
   private inBatchExecution = false;
+  private disposed = false;
+  private readonly waitAbortCallbacks = new Set<() => void>();
 
   constructor(options: {
     win: Window;
@@ -627,6 +630,29 @@ export class UiControlService {
     };
   }
 
+  dispose(): void {
+    this.disposed = true;
+    if (this.activeShield) {
+      try {
+        this.activeShield.detach?.();
+      } catch {
+        // Ignore teardown errors during plugin unload
+      }
+      this.activeShield.detach = null;
+      this.activeShield = null;
+    }
+    this.expectedAgentLedger = [];
+    this.deferredUserInputs = [];
+    for (const abort of Array.from(this.waitAbortCallbacks)) {
+      try {
+        abort();
+      } catch {
+        // Ignore abort callback errors
+      }
+    }
+    this.waitAbortCallbacks.clear();
+  }
+
   waitFor(params: Record<string, unknown> = {}, caller = "agent"): Promise<unknown> {
     const text = typeof params.text === "string" ? params.text : "";
     if (!text) {
@@ -637,6 +663,9 @@ export class UiControlService {
     return this.timedAsync(async () => {
       const started = Date.now();
       for (;;) {
+        if (this.disposed) {
+          throw new UiControlError("ui_unavailable", "UI control service was disposed.");
+        }
         const doc = this.win.document;
         // Match against the full visible text first, then collect bounded element previews.
         const found = selector
@@ -669,8 +698,30 @@ export class UiControlService {
         if (Date.now() - started >= timeoutMs) {
           return { found: false, elapsedMs: Date.now() - started, matches: [] };
         }
-        await this.sleep(200);
+        await this.sleepOrAbort(200);
       }
+    });
+  }
+
+  private sleepOrAbort(ms: number): Promise<void> {
+    if (this.disposed) {
+      return Promise.reject(new UiControlError("ui_unavailable", "UI control service was disposed."));
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        this.waitAbortCallbacks.delete(onAbort);
+        reject(new UiControlError("ui_unavailable", "UI control service was disposed."));
+      };
+      this.waitAbortCallbacks.add(onAbort);
+      void this.sleep(ms).then(() => {
+        if (settled) return;
+        settled = true;
+        this.waitAbortCallbacks.delete(onAbort);
+        resolve();
+      });
     });
   }
 
@@ -4815,11 +4866,23 @@ export class UiControlService {
     if (innermostOnly) {
       all = all.filter((el) => !all.some((other) => other !== el && el.contains(other)));
     }
-    const elements = all.slice(0, limit).map((el): InspectedElement => {
+    const normalEls: Element[] = [];
+    const protectedEls: Element[] = [];
+    for (const el of all) {
+      if (this.detectProtectedArea(el)) {
+        protectedEls.push(el);
+      } else {
+        normalEls.push(el);
+      }
+    }
+    const ordered = [...normalEls, ...protectedEls];
+    const normalCount = normalEls.length;
+    const elements = ordered.slice(0, limit).map((el, idx): InspectedElement => {
       const r = el.getBoundingClientRect();
       const field = el as HTMLInputElement;
       const isField = el.matches('input:not([type="password"]),textarea,select');
       const ctx = this.resolveElementLeafContext(el);
+      const isProtected = idx >= normalCount;
       return {
         selector: this.selectorPath(el),
         tag: el.tagName.toLowerCase(),
@@ -4828,6 +4891,7 @@ export class UiControlService {
         text: textOf(el).trim().slice(0, 180),
         ...(isField ? { value: field.value } : {}),
         disabled: Boolean(field.disabled),
+        ...(isProtected ? { protected: true } : {}),
         rect: { x: r.x, y: r.y, width: r.width, height: r.height },
         ...(ctx?.notePath ? { notePath: ctx.notePath } : {}),
         ...(ctx?.pane ? { pane: ctx.pane } : {}),

@@ -44,6 +44,7 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
     this.coordinator = new HerdrCoordinator({
       app: this.app,
       getSettings: () => this.settings,
+      pluginVersion: this.manifest.version,
     });
 
     this.registerView(
@@ -169,10 +170,14 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
     this.addSettingTab(new HerdrSettingTab(this.app, this));
 
     this.app.workspace.onLayoutReady(() => {
-      void this.coordinator.initialize();
+      void this.coordinator.initialize().catch((err: unknown) => {
+        console.warn("[herdr-obs] Coordinator initialization failed:", err);
+      });
       this.registerInterval(
         window.setInterval(() => {
-          void this.coordinator.refreshAll(false);
+          void this.coordinator.refreshAll(false).catch((err: unknown) => {
+            console.warn("[herdr-obs] Periodic refresh failed:", err);
+          });
         }, 8000)
       );
     });
@@ -181,7 +186,9 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
   onunload(): void {
     this.unsubCoord?.();
     this.unsubCoord = null;
-    void this.coordinator?.dispose();
+    void this.coordinator?.dispose().catch((err: unknown) => {
+      console.warn("[herdr-obs] Coordinator dispose failed:", err);
+    });
   }
 
   async loadSettings(): Promise<void> {
@@ -364,9 +371,14 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
       id: "refresh-runtime-state",
       name: "Refresh runtime state",
       callback: () => {
-        void this.coordinator.refreshAll(true).then(() => {
-          new Notice("Refreshed Herdr runtime snapshot.");
-        });
+        void this.coordinator
+          .refreshAll(true)
+          .then(() => {
+            new Notice("Refreshed Herdr runtime snapshot.");
+          })
+          .catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
       },
     });
   }
@@ -385,6 +397,9 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
                   .openFile(abstractFile)
                   .then(() => {
                     new DispatchNoteModal(this.app, this.coordinator).open();
+                  })
+                  .catch((err: unknown) => {
+                    new Notice(err instanceof Error ? err.message : String(err));
                   });
               });
           });

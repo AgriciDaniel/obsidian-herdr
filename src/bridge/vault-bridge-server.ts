@@ -14,24 +14,33 @@ export type BridgeMethodDispatcher = (
 
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 
+function isPathInsideDir(targetPath: string, containerDir: string): boolean {
+  const rel = path.relative(path.resolve(containerDir), path.resolve(targetPath));
+  return Boolean(rel) && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 /**
  * Local-only Unix domain socket / Windows named pipe RPC server for the Obsidian Vault Control Bridge.
  * Authenticates every request with a constant-time 256-bit bearer token check.
  */
 export class VaultBridgeServer {
   private readonly socketPath: string;
+  private readonly kitDir: string | null;
   private readonly authToken: string;
   private readonly dispatcher: BridgeMethodDispatcher;
   private server: net.Server | null = null;
+  private socketIdentity: { dev: number; ino: number } | null = null;
   private readonly activeClients = new Set<net.Socket>();
   private running = false;
 
   constructor(options: {
     socketPath: string;
+    kitDir?: string;
     authToken?: string;
     dispatcher: BridgeMethodDispatcher;
   }) {
     this.socketPath = options.socketPath;
+    this.kitDir = options.kitDir ? path.resolve(options.kitDir) : null;
     this.authToken = options.authToken || crypto.randomBytes(32).toString("hex");
     this.dispatcher = options.dispatcher;
   }
@@ -63,15 +72,33 @@ export class VaultBridgeServer {
           // Ignore chmod on unsupported fs
         }
       }
+      let existingStat: fs.Stats | null = null;
       try {
-        if (fs.existsSync(this.socketPath)) {
-          const st = fs.lstatSync(this.socketPath);
-          if (st.isSocket()) {
-            fs.unlinkSync(this.socketPath);
-          }
+        existingStat = fs.lstatSync(this.socketPath);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code !== "ENOENT") {
+          throw err;
         }
-      } catch {
-        // Ignore stale socket cleanup error
+      }
+      if (existingStat) {
+        if (existingStat.isSocket()) {
+          try {
+            fs.unlinkSync(this.socketPath);
+          } catch {
+            // Ignore stale socket cleanup error
+          }
+        } else if (
+          !existingStat.isDirectory() &&
+          this.kitDir &&
+          isPathInsideDir(this.socketPath, this.kitDir)
+        ) {
+          fs.unlinkSync(this.socketPath);
+        } else {
+          throw new Error(
+            `Refusing to remove non-socket entry at bridge socket path '${this.socketPath}' outside the runtime kit directory.`
+          );
+        }
       }
     }
 
@@ -80,17 +107,32 @@ export class VaultBridgeServer {
         this.handleClient(client);
       });
 
-      srv.once("error", (err) => {
+      const onStartupError = (err: Error) => {
         reject(err);
-      });
+      };
+      srv.once("error", onStartupError);
 
       srv.listen(this.socketPath, () => {
+        srv.off("error", onStartupError);
+        srv.on("error", (err: Error) => {
+          this.running = false;
+          console.warn("[herdr-obs] Vault bridge server error:", err);
+        });
+
         if (process.platform !== "win32") {
           try {
             fs.chmodSync(this.socketPath, 0o600);
           } catch {
             // Ignore chmod on unsupported fs
           }
+          try {
+            const st = fs.lstatSync(this.socketPath);
+            this.socketIdentity = st.isSocket() ? { dev: st.dev, ino: st.ino } : null;
+          } catch {
+            this.socketIdentity = null;
+          }
+        } else {
+          this.socketIdentity = null;
         }
         this.server = srv;
         this.running = true;
@@ -101,6 +143,8 @@ export class VaultBridgeServer {
 
   async stop(): Promise<void> {
     this.running = false;
+    const ownedIdentity = this.socketIdentity;
+    this.socketIdentity = null;
     for (const sock of this.activeClients) {
       sock.destroy();
     }
@@ -114,13 +158,14 @@ export class VaultBridgeServer {
       });
     }
 
-    if (process.platform !== "win32") {
+    if (process.platform !== "win32" && ownedIdentity !== null) {
       try {
-        if (fs.existsSync(this.socketPath) && fs.lstatSync(this.socketPath).isSocket()) {
+        const st = fs.lstatSync(this.socketPath);
+        if (st.isSocket() && st.dev === ownedIdentity.dev && st.ino === ownedIdentity.ino) {
           fs.unlinkSync(this.socketPath);
         }
       } catch {
-        // Ignore cleanup failure
+        // Ignore cleanup failure or already removed socket
       }
     }
   }

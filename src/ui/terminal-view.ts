@@ -22,7 +22,7 @@ import {
 } from "../domain/types";
 import type { HerdrCoordinator } from "../services/herdr-coordinator";
 import { VaultTerminalLinkProvider } from "../terminal/link-provider";
-import { PtySession } from "../terminal/pty-host";
+import { PtySession, shouldFallbackMissingHerdr } from "../terminal/pty-host";
 import {
   buildObsidianXtermTheme,
   resolveTerminalFontFamily,
@@ -136,7 +136,9 @@ export class HerdrTerminalView extends ItemView {
     this.xtermMountEl = root.createDiv({ cls: "herdr-terminal-host" });
 
     this.mountXterm(this.xtermMountEl);
-    void this.startPtyForSelectedProfile();
+    void this.startPtyForSelectedProfile().catch((err: unknown) => {
+      console.warn("[herdr-obs] Terminal PTY startup failed:", err);
+    });
 
     this.unsubCoord = this.coordinator.onChange(() => {
       this.syncRuntimeSettings();
@@ -376,17 +378,24 @@ export class HerdrTerminalView extends ItemView {
       }
       if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "c") {
         if (ev.type === "keydown" && term.hasSelection()) {
-          void navigator.clipboard.writeText(term.getSelection());
+          void navigator.clipboard.writeText(term.getSelection()).catch((err: unknown) => {
+            console.warn("[herdr-obs] Terminal clipboard copy failed:", err);
+          });
         }
         return false;
       }
       if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "v") {
         if (ev.type === "keydown") {
-          void navigator.clipboard.readText().then((clip) => {
-            if (clip) {
-              this.pty?.write(clip);
-            }
-          });
+          void navigator.clipboard
+            .readText()
+            .then((clip) => {
+              if (clip) {
+                this.pty?.write(clip);
+              }
+            })
+            .catch((err: unknown) => {
+              console.warn("[herdr-obs] Terminal clipboard paste failed:", err);
+            });
         }
         return false;
       }
@@ -441,7 +450,7 @@ export class HerdrTerminalView extends ItemView {
     this.currentCwd = spawnSpec.cwd;
     this.updateHeaderCwd(spawnSpec.cwd);
 
-    if (profile.kind === "herdr-vault" && !this.coordinator.cli.getBinaryPath()) {
+    if (shouldFallbackMissingHerdr(profile.kind, this.coordinator.cli.getBinaryPath())) {
       this.terminal?.writeln(
         "\x1b[33m[Herdr binary not detected on PATH. Falling back to interactive shell with Vault Control Bridge enabled.]\x1b[0m"
       );
@@ -493,18 +502,24 @@ export class HerdrTerminalView extends ItemView {
         this.currentProgramMessage = undefined;
         this.updateStatusBadge("idle", undefined, "exited");
         this.showExitBanner(code, signal);
-        void this.coordinator.refreshAll(false);
+        void this.coordinator.refreshAll(false).catch((err: unknown) => {
+          console.warn("[herdr-obs] Post-exit refresh failed:", err);
+        });
       },
     });
 
     this.refreshStatusBadge();
     this.scheduleFit();
-    void this.coordinator.refreshAll(false);
+    void this.coordinator.refreshAll(false).catch((err: unknown) => {
+      console.warn("[herdr-obs] Post-launch refresh failed:", err);
+    });
   }
 
   restartPtySession(): void {
     this.terminal?.reset();
-    void this.startPtyForSelectedProfile();
+    void this.startPtyForSelectedProfile().catch((err: unknown) => {
+      console.warn("[herdr-obs] Terminal PTY restart failed:", err);
+    });
     this.terminal?.focus();
   }
 

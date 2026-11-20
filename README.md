@@ -8,7 +8,7 @@
   <a href="#license"><img alt="MIT and Apache 2.0 licenses" src="https://img.shields.io/badge/license-MIT%20%2B%20Apache%202.0-green"></a>
 </p>
 
-Run Claude Code, Codex, Hermes, Antigravity, OpenCode, Gemini and more than a dozen other coding agents inside Obsidian. They keep running when you close a tab or restart. They can read and edit your notes, and if you allow it, see and use Obsidian itself. Every edit is logged, and you can undo it.
+Run Claude Code, Codex, Hermes, Antigravity, OpenCode, Gemini and more than a dozen other coding agents inside Obsidian. They keep running when you close a tab or reload Obsidian. They can read and edit your notes, and if you allow it, see and use Obsidian itself. Every edit is logged, and you can undo it.
 
 ![Four agents running side by side in Obsidian, with Mission Control on the right](assets/screenshots/agents-grid.png)
 
@@ -88,6 +88,12 @@ The plugin keeps a private runtime folder at `~/.cache/obs-herdr/` (your temp fo
 ## Status
 
 Tested on Linux with Herdr 0.8.2 and four agents running at once. UI control was tested live in Obsidian 1.15.0 on Linux (Flatpak, Wayland). macOS and Windows are not tested yet. Reports are welcome in [Issues](https://github.com/AgriciDaniel/obsidian-herdr/issues); see [CONTRIBUTING](CONTRIBUTING.md) for what to include.
+
+Good to know:
+
+- With the Flatpak build of Obsidian, the Herdr server runs inside Obsidian's sandbox. Reloading Obsidian keeps your agents, but quitting it stops them all. Herdr saves the layout, so panes come back on the next start; the agents inside them start fresh.
+- Update Herdr with `herdr update --handoff` from a terminal outside Obsidian, so running agents are handed over instead of stopped. The plugin is tested with Herdr protocol 20 and warns in Mission Control's Doctor tab if Herdr reports another protocol.
+- If system trash is not available (common in the Flatpak), deleting a note through the bridge falls back to Obsidian's own `.trash` folder in the vault, and says so.
 
 <details>
 <summary><b>For developers</b></summary>

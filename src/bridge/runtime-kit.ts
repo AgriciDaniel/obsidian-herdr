@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildHostNormalizedEnv } from "../herdr/cli-client";
@@ -92,8 +93,10 @@ export function provisionRuntimeKit(options: {
   token: string;
   vaultName: string;
   vaultPath: string | null;
+  pluginVersion?: string;
 }): void {
   const { kit, token, vaultName, vaultPath } = options;
+  const pluginVersion = options.pluginVersion?.trim() || "0.3.1";
 
   fs.mkdirSync(kit.runtimeDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(kit.binDir, { recursive: true, mode: 0o700 });
@@ -119,13 +122,13 @@ export function provisionRuntimeKit(options: {
   });
 
   const coreMjsPath = path.join(kit.binDir, "obs-herdr-core.mjs");
-  fs.writeFileSync(coreMjsPath, buildObsHerdrCoreMjs(kit.connectionFilePath), {
+  fs.writeFileSync(coreMjsPath, buildObsHerdrCoreMjs(kit.connectionFilePath, pluginVersion), {
     encoding: "utf8",
     mode: 0o700,
   });
 
   const corePyPath = path.join(kit.binDir, "obs-herdr-core.py");
-  fs.writeFileSync(corePyPath, buildObsHerdrCorePy(kit.connectionFilePath), {
+  fs.writeFileSync(corePyPath, buildObsHerdrCorePy(kit.connectionFilePath, pluginVersion), {
     encoding: "utf8",
     mode: 0o700,
   });
@@ -157,7 +160,7 @@ export function provisionRuntimeKit(options: {
 
   fs.writeFileSync(
     kit.herdrPluginManifestPath,
-    buildHerdrPluginManifestToml(kit.cliScriptPath),
+    buildHerdrPluginManifestToml(kit.cliScriptPath, pluginVersion),
     {
       encoding: "utf8",
       mode: 0o600,
@@ -217,12 +220,152 @@ export function buildBridgeEnvForPanes(options: {
   return envOut;
 }
 
-function buildHerdrPluginManifestToml(cliScriptPath: string): string {
+const STALE_EMPTY_KIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const KIT_DIR_NAME_RE = /^(?:oh-)?[0-9a-f]{12}$/;
+
+function isRealFile(filePath: string): boolean {
+  try {
+    const st = fs.lstatSync(filePath);
+    return !st.isSymbolicLink() && st.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function hasKitBinSignature(entryPath: string): boolean {
+  const binPath = path.join(entryPath, "bin");
+  try {
+    const binStat = fs.lstatSync(binPath);
+    if (binStat.isSymbolicLink() || !binStat.isDirectory()) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return (
+    isRealFile(path.join(binPath, "obs-herdr-core.mjs")) ||
+    isRealFile(path.join(binPath, "obs-herdr-core.py"))
+  );
+}
+
+function isSocketLive(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (live: boolean) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(live);
+    };
+    const sock = net.createConnection({ path: socketPath });
+    sock.setTimeout(250, () => done(false));
+    sock.once("connect", () => done(true));
+    sock.once("error", () => done(false));
+  });
+}
+
+export async function pruneStaleRuntimeKits(opts: {
+  baseDir?: string;
+  keepDigest: string;
+}): Promise<{ removed: string[] }> {
+  const homeCacheBase = path.resolve(path.join(os.homedir(), ".cache", "obs-herdr"));
+  const defaultBase =
+    process.platform !== "win32" ? homeCacheBase : os.tmpdir();
+  const baseDir = path.resolve(opts.baseDir || defaultBase);
+  const isHomeCacheBase = baseDir === homeCacheBase;
+  const removed: string[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(baseDir, { withFileTypes: true });
+  } catch {
+    return { removed };
+  }
+  const keepNames = new Set([opts.keepDigest, `oh-${opts.keepDigest}`]);
+  const now = Date.now();
+
+  for (const entry of entries) {
+    if (!KIT_DIR_NAME_RE.test(entry.name) || keepNames.has(entry.name)) {
+      continue;
+    }
+    const entryPath = path.join(baseDir, entry.name);
+    if (path.dirname(entryPath) !== baseDir) {
+      continue;
+    }
+    let dirStat: fs.Stats;
+    try {
+      dirStat = fs.lstatSync(entryPath);
+    } catch {
+      continue;
+    }
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      continue;
+    }
+
+    const sockPath = path.join(entryPath, "b.sock");
+    let hasLiveSocket = false;
+    try {
+      const sockStat = fs.lstatSync(sockPath);
+      if (!sockStat.isSymbolicLink()) {
+        hasLiveSocket = await isSocketLive(sockPath);
+      }
+    } catch {
+      hasLiveSocket = false;
+    }
+    if (hasLiveSocket) {
+      continue;
+    }
+
+    const connPath = path.join(entryPath, "connection.json");
+    let stale = false;
+    let hasConnFile = false;
+    let hasConnSignature = false;
+    try {
+      const connStat = fs.lstatSync(connPath);
+      if (!connStat.isSymbolicLink() && connStat.isFile()) {
+        hasConnFile = true;
+        const parsed = JSON.parse(fs.readFileSync(connPath, "utf8")) as Record<string, unknown>;
+        if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "vaultPath")) {
+          hasConnSignature = true;
+          if (typeof parsed.vaultPath === "string" && parsed.vaultPath.trim().length > 0) {
+            stale = !fs.existsSync(parsed.vaultPath);
+          }
+        }
+      }
+    } catch {
+      hasConnFile = false;
+    }
+
+    const hasBinSig = hasKitBinSignature(entryPath);
+    const isOld = now - dirStat.mtimeMs > STALE_EMPTY_KIT_MAX_AGE_MS;
+
+    if (!hasConnFile && isOld) {
+      if (hasBinSig) {
+        stale = true;
+      } else if (isHomeCacheBase && /^[0-9a-f]{12}$/.test(entry.name)) {
+        stale = true;
+      }
+    }
+
+    if (stale && (hasConnSignature || hasBinSig || (isHomeCacheBase && /^[0-9a-f]{12}$/.test(entry.name)))) {
+      try {
+        fs.rmSync(entryPath, { recursive: true, force: true });
+        removed.push(entry.name);
+      } catch {
+        // Ignore removal errors on busy/protected entries
+      }
+    }
+  }
+
+  return { removed };
+}
+
+function buildHerdrPluginManifestToml(cliScriptPath: string, pluginVersion: string): string {
   const cliEsc = JSON.stringify(cliScriptPath);
+  const verEsc = JSON.stringify(pluginVersion);
   return [
     'id = "obsidian.vault"',
     'name = "Obsidian Vault Bridge"',
-    'version = "0.1.0"',
+    `version = ${verEsc}`,
     'min_herdr_version = "0.8.0"',
     'description = "Control the live Obsidian vault, notes, backlinks, and editor from Herdr"',
     'platforms = ["linux", "macos", "windows"]',
@@ -839,7 +982,7 @@ const SHARED_UI_ALLOWED_FLAGS: Record<string, string[]> = {
   batch: ["steps-json", "stdin"],
 };
 
-function buildObsHerdrCoreMjs(defaultConnFile: string): string {
+function buildObsHerdrCoreMjs(defaultConnFile: string, pluginVersion: string): string {
   return `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -848,6 +991,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 
 const DEFAULT_CONN_FILE = ${JSON.stringify(defaultConnFile)};
+const PLUGIN_VERSION = ${JSON.stringify(pluginVersion)};
 
 const SKILL_TEXT = ${JSON.stringify(SHARED_SKILL_TEXT)};
 
@@ -877,13 +1021,56 @@ function resolveConnection() {
   return { socketPath: raw.socketPath, token: raw.token };
 }
 
+function resolveTimeoutMs(method, params) {
+  const envRaw = process.env.OBS_HERDR_TIMEOUT_MS;
+  const envNum = envRaw !== undefined && envRaw !== "" ? Number(envRaw) : NaN;
+  const base = Number.isFinite(envNum) && envNum > 0 ? Math.round(envNum) : 60000;
+  if (method === "ui.wait_for") {
+    const p = params && typeof params === "object" ? params : {};
+    const waitMs = Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) >= 0 ? Number(p.timeoutMs) : 5000;
+    return Math.max(base, Math.round(waitMs) + 30000);
+  }
+  if (method === "ui.batch") {
+    const p = params && typeof params === "object" ? params : {};
+    let totalWait = Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) >= 0 ? Number(p.timeoutMs) : 0;
+    if (Array.isArray(p.steps)) {
+      for (const s of p.steps) {
+        if (s && s.action === "wait_for") {
+          const sw = Number.isFinite(Number(s.timeoutMs)) && Number(s.timeoutMs) >= 0 ? Number(s.timeoutMs) : 5000;
+          totalWait += sw;
+        }
+      }
+    }
+    if (totalWait > 0) {
+      return Math.max(base, Math.round(totalWait) + 30000);
+    }
+  }
+  return base;
+}
+
 function callBridge(method, params = {}) {
   const { socketPath, token } = resolveConnection();
   const id = "cli_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
   const caller = process.env.HERDR_PANE_ID ? "herdr:" + process.env.HERDR_PANE_ID : "obs-herdr-cli";
+  const timeoutMs = resolveTimeoutMs(method, params);
   return new Promise((resolve, reject) => {
     let buf = "";
+    let settled = false;
     const sock = net.createConnection({ path: socketPath });
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.destroy();
+      if (err) {
+        reject(err);
+      } else {
+        resolve(val);
+      }
+    };
+    const timer = setTimeout(() => {
+      finish(new Error("Bridge request timed out after " + timeoutMs + " ms (" + method + ")."));
+    }, timeoutMs);
     sock.on("connect", () => {
       sock.write(JSON.stringify({ id, token, method, params, caller }) + "\\n", "utf8");
     });
@@ -892,16 +1079,27 @@ function callBridge(method, params = {}) {
       const nl = buf.indexOf("\\n");
       if (nl !== -1) {
         const line = buf.slice(0, nl).trim();
-        sock.destroy();
-        const res = JSON.parse(line);
-        if (!res.ok) {
-          reject(new Error((res.error?.code || "error") + ": " + (res.error?.message || "Bridge error")));
+        let res;
+        try {
+          res = JSON.parse(line);
+        } catch (parseErr) {
+          finish(new Error("Invalid JSON response from Obsidian bridge: " + (parseErr instanceof Error ? parseErr.message : String(parseErr))));
+          return;
+        }
+        if (!res || !res.ok) {
+          finish(new Error((res?.error?.code || "error") + ": " + (res?.error?.message || "Bridge error")));
         } else {
-          resolve(res.result);
+          finish(null, res.result);
         }
       }
     });
-    sock.on("error", (err) => reject(err));
+    sock.on("end", () => {
+      finish(new Error("Bridge connection closed before a complete response was received (" + method + ")."));
+    });
+    sock.on("close", () => {
+      finish(new Error("Bridge connection closed before a complete response was received (" + method + ")."));
+    });
+    sock.on("error", (err) => finish(err));
   });
 }
 
@@ -1139,7 +1337,7 @@ async function runMcpServer() {
     if (msg.id === undefined) continue;
     try {
       if (msg.method === "initialize") {
-        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "obsidian-herdr-bridge", version: "0.1.0" } } }) + "\\n");
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "obsidian-herdr-bridge", version: PLUGIN_VERSION } } }) + "\\n");
       } else if (msg.method === "tools/list") {
         process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: MCP_TOOLS.map(({ rpc, ...rest }) => rest) } }) + "\\n");
       } else if (msg.method === "tools/call") {
@@ -1727,11 +1925,12 @@ main().catch((err) => {
 `;
 }
 
-function buildObsHerdrCorePy(defaultConnFile: string): string {
+function buildObsHerdrCorePy(defaultConnFile: string, pluginVersion: string): string {
   return `#!/usr/bin/env python3
 import datetime, json, math, os, posixpath, re, socket, subprocess, sys, time
 
 DEFAULT_CONN_FILE = ${JSON.stringify(defaultConnFile)}
+PLUGIN_VERSION = ${JSON.stringify(pluginVersion)}
 
 SKILL_TEXT = ${JSON.stringify(SHARED_SKILL_TEXT)}
 
@@ -1757,16 +1956,60 @@ def resolve_conn():
         data = json.load(fh)
     return data["socketPath"], data["token"]
 
+def resolve_timeout_ms(method, params):
+    env_raw = os.environ.get("OBS_HERDR_TIMEOUT_MS", "")
+    base = 60000
+    if env_raw != "":
+        try:
+            env_num = float(env_raw)
+            if math.isfinite(env_num) and env_num > 0:
+                base = int(round(env_num))
+        except Exception:
+            pass
+    p = params if isinstance(params, dict) else {}
+    if method == "ui.wait_for":
+        try:
+            w = float(p.get("timeoutMs")) if p.get("timeoutMs") is not None else 5000.0
+            if not math.isfinite(w) or w < 0:
+                w = 5000.0
+        except Exception:
+            w = 5000.0
+        return max(base, int(round(w)) + 30000)
+    if method == "ui.batch":
+        total_wait = 0.0
+        if p.get("timeoutMs") is not None:
+            try:
+                tw = float(p.get("timeoutMs"))
+                if math.isfinite(tw) and tw >= 0:
+                    total_wait += tw
+            except Exception:
+                pass
+        steps = p.get("steps")
+        if isinstance(steps, list):
+            for s in steps:
+                if isinstance(s, dict) and s.get("action") == "wait_for":
+                    try:
+                        sw = float(s.get("timeoutMs")) if s.get("timeoutMs") is not None else 5000.0
+                        if not math.isfinite(sw) or sw < 0:
+                            sw = 5000.0
+                    except Exception:
+                        sw = 5000.0
+                    total_wait += sw
+        if total_wait > 0:
+            return max(base, int(round(total_wait)) + 30000)
+    return base
+
 def call_bridge(method, params=None):
     sock_path, token = resolve_conn()
     caller = f"herdr:{os.environ['HERDR_PANE_ID']}" if os.environ.get("HERDR_PANE_ID") else "obs-herdr-py"
     clean_params = {k: v for k, v in (params or {}).items() if v is not None}
+    timeout_ms = resolve_timeout_ms(method, clean_params)
     req = {"id": f"py_{int(time.time()*1000)}", "token": token, "method": method, "params": clean_params, "caller": caller}
     payload = (json.dumps(req) + "\\n").encode("utf-8")
+    buf = b""
     if os.name == "nt" and sock_path.startswith("\\\\\\\\.\\\\pipe\\\\"):
         with open(sock_path, "r+b", buffering=0) as pipe_fh:
             pipe_fh.write(payload)
-            buf = b""
             while b"\\n" not in buf:
                 chunk = pipe_fh.read(65536)
                 if not chunk:
@@ -1774,17 +2017,25 @@ def call_bridge(method, params=None):
                 buf += chunk
     else:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.connect(sock_path)
-            s.sendall(payload)
-            buf = b""
-            while b"\\n" not in buf:
-                chunk = s.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-    res = json.loads(buf.split(b"\\n", 1)[0].decode("utf-8"))
-    if not res.get("ok"):
-        err = res.get("error") or {}
+            s.settimeout(timeout_ms / 1000.0)
+            try:
+                s.connect(sock_path)
+                s.sendall(payload)
+                while b"\\n" not in buf:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            except (socket.timeout, TimeoutError):
+                raise RuntimeError(f"Bridge request timed out after {timeout_ms} ms ({method}).")
+    if b"\\n" not in buf:
+        raise RuntimeError(f"Bridge connection closed before a complete response was received ({method}).")
+    try:
+        res = json.loads(buf.split(b"\\n", 1)[0].decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Invalid JSON response from Obsidian bridge: {exc}")
+    if not isinstance(res, dict) or not res.get("ok"):
+        err = res.get("error") if isinstance(res, dict) and isinstance(res.get("error"), dict) else {}
         raise RuntimeError(f"{err.get('code', 'error')}: {err.get('message', 'Bridge error')}")
     return res.get("result")
 
@@ -2012,7 +2263,7 @@ def run_mcp():
         m = msg.get("method")
         try:
             if m == "initialize":
-                out = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "obsidian-herdr-bridge", "version": "0.1.0"}}
+                out = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "obsidian-herdr-bridge", "version": PLUGIN_VERSION}}
             elif m == "tools/list":
                 out = {"tools": public_tools}
             elif m == "tools/call":

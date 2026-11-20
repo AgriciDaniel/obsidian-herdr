@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type App, MarkdownView, Notice, TFile } from "obsidian";
@@ -5,6 +6,7 @@ import {
   buildBridgeEnvForPanes,
   computeRuntimePaths,
   provisionRuntimeKit,
+  pruneStaleRuntimeKits,
   readExistingBridgeToken,
   type ProvisionedRuntimeKit,
 } from "../bridge/runtime-kit";
@@ -37,7 +39,7 @@ import type {
   WorktreeRecord,
 } from "../domain/types";
 import { HerdrCliClient } from "../herdr/cli-client";
-import { HerdrSocketClient } from "../herdr/socket-client";
+import { evaluateHerdrProtocol, HerdrSocketClient } from "../herdr/socket-client";
 import { deliverToTerminal, resolveDefaultShell } from "../terminal/pty-host";
 
 export interface CoordinatorState {
@@ -57,6 +59,7 @@ export interface CoordinatorState {
   bridgeSocketPath: string;
   cliScriptPath: string;
   herdrPluginManifestPath: string;
+  protocolWarning: string | null;
   lastError: string | null;
   lastUpdated: number;
 }
@@ -77,8 +80,13 @@ export class HerdrCoordinator {
   private integrations: HerdrIntegrationRow[] = [];
   private installedPlugins: InstalledHerdrPlugin[] = [];
   private worktrees: WorktreeRecord[] = [];
+  private protocolWarning: string | null = null;
+  private warnedProtocolKey: string | null = null;
+  private bridgeLastError: string | null = null;
   private lastError: string | null = null;
   private lastUpdated = 0;
+  private prunedStaleKits = false;
+  private pruneStaleKitsFn: typeof pruneStaleRuntimeKits = pruneStaleRuntimeKits;
   private refreshInFlight: Promise<void> | null = null;
   private sessionStartInFlight: Promise<void> | null = null;
   private bridgeStartInFlight: Promise<void> | null = null;
@@ -87,18 +95,38 @@ export class HerdrCoordinator {
   private readonly previousAgentStates = new Map<string, AgentStatus>();
   private unsubSocketEvent: (() => void) | null = null;
   private unsubSocketConn: (() => void) | null = null;
+  private readonly pluginVersion: string | undefined;
   private readonly cursorOverlay: AgentCursorOverlay;
+  private readonly uiControl: UiControlService;
   private readonly notePaneIds = new WeakMap<MarkdownView, string>();
   private notePaneSeq = 0;
   private disposed = false;
 
-  constructor(options: { app: App; getSettings: () => HerdrPluginSettings }) {
+  constructor(options: {
+    app: App;
+    getSettings: () => HerdrPluginSettings;
+    pluginVersion?: string;
+  }) {
     this.app = options.app;
     this.getSettings = options.getSettings;
+    this.pluginVersion = options.pluginVersion;
 
     this.cursorOverlay = new AgentCursorOverlay({
       win: window,
       enabled: this.getSettings().showAgentCursors,
+    });
+
+    this.uiControl = new UiControlService({
+      win: window,
+      getWebContents: getObsidianWebContents,
+      getUiTypingSpeed: () => this.getSettings().uiTypingSpeed,
+      getAllowUiInProtectedAreas: () => this.getSettings().allowUiInProtectedAreas,
+      cursorOverlay: this.cursorOverlay,
+      resolveAgentLabel: (caller) => this.resolveCallerLabel(caller),
+      resolveElementContext: (el) => this.resolveEditorContext(el),
+      resolveNoteLeaf: (notePath) => this.resolveOpenNoteLeaf(notePath),
+      beforeMutation: (context) => this.captureUiMutation(context),
+      deliverToTerminal: (element, data) => this.deliverCapturedTerminalInput(element, data),
     });
 
     this.vaultOps = new VaultOpsService({
@@ -108,18 +136,7 @@ export class HerdrCoordinator {
           ? this.getSettings().vaultPermissionMode
           : "off",
       getAllowHiddenReads: () => this.getSettings().allowHiddenConfigReads,
-      uiControl: new UiControlService({
-        win: window,
-        getWebContents: getObsidianWebContents,
-        getUiTypingSpeed: () => this.getSettings().uiTypingSpeed,
-        getAllowUiInProtectedAreas: () => this.getSettings().allowUiInProtectedAreas,
-        cursorOverlay: this.cursorOverlay,
-        resolveAgentLabel: (caller) => this.resolveCallerLabel(caller),
-        resolveElementContext: (el) => this.resolveEditorContext(el),
-        resolveNoteLeaf: (notePath) => this.resolveOpenNoteLeaf(notePath),
-        beforeMutation: (context) => this.captureUiMutation(context),
-        deliverToTerminal: (element, data) => this.deliverCapturedTerminalInput(element, data),
-      }),
+      uiControl: this.uiControl,
       getAllowUiControl: () => this.getSettings().allowUiControl,
       getAllowUiInProtectedAreas: () => this.getSettings().allowUiInProtectedAreas,
       onAgentActivity: (caller, targetPath, action, change) =>
@@ -198,7 +215,15 @@ export class HerdrCoordinator {
     this.cli.setConfiguredBinary(settings.herdrBinaryPath);
 
     if (settings.vaultBridgeEnabled && settings.vaultPermissionMode !== "off") {
-      await this.startVaultBridge();
+      try {
+        await this.startVaultBridge();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.bridgeLastError = `Vault Control Bridge failed to start: ${msg}`;
+        this.lastError = this.bridgeLastError;
+        new Notice(`Herdr Vault Control Bridge failed to start: ${msg}`, 8000);
+        this.emitChange();
+      }
     }
 
     await this.refreshAll(true);
@@ -220,17 +245,40 @@ export class HerdrCoordinator {
     await this.refreshAll(false);
   }
 
-  async startVaultBridge(): Promise<void> {
+  async startVaultBridge(preferredToken?: string): Promise<void> {
     if (this.bridgeServer?.isRunning()) {
       return;
     }
     if (this.bridgeStartInFlight) {
       return this.bridgeStartInFlight;
     }
-    this.bridgeStartInFlight = this.doStartVaultBridge().finally(() => {
+    this.bridgeStartInFlight = this.doStartVaultBridge(preferredToken).finally(() => {
       this.bridgeStartInFlight = null;
     });
     return this.bridgeStartInFlight;
+  }
+
+  private isRuntimeKitIntact(): boolean {
+    if (!fs.existsSync(this.runtimeKit.cliScriptPath)) {
+      return false;
+    }
+    if (process.platform === "win32") {
+      return fs.existsSync(this.runtimeKit.connectionFilePath);
+    }
+    return fs.existsSync(this.runtimeKit.socketPath);
+  }
+
+  private async healBridgeIfNeeded(): Promise<void> {
+    const settings = this.getSettings();
+    if (!settings.vaultBridgeEnabled || settings.vaultPermissionMode === "off") {
+      return;
+    }
+    if (!this.bridgeServer?.isRunning() || this.isRuntimeKitIntact()) {
+      return;
+    }
+    const preservedToken = this.bridgeServer.getAuthToken();
+    await this.stopVaultBridge();
+    await this.startVaultBridge(preservedToken);
   }
 
   /**
@@ -244,34 +292,55 @@ export class HerdrCoordinator {
       return;
     }
     try {
+      await this.healBridgeIfNeeded();
       await this.startVaultBridge();
     } catch {
       // The session still starts; panes simply lack the bridge.
     }
   }
 
-  private async doStartVaultBridge(): Promise<void> {
+  private async doStartVaultBridge(preferredToken?: string): Promise<void> {
     if (this.bridgeServer?.isRunning()) {
       return;
     }
-    const existingToken = readExistingBridgeToken(this.runtimeKit.connectionFilePath);
+    const existingToken =
+      preferredToken || readExistingBridgeToken(this.runtimeKit.connectionFilePath);
     const srv = new VaultBridgeServer({
       socketPath: this.runtimeKit.socketPath,
+      kitDir: this.runtimeKit.runtimeDir,
       authToken: existingToken,
       dispatcher: (method, params, caller) => this.vaultOps.dispatch(method, params, caller),
     });
     await srv.start();
     this.bridgeServer = srv;
+    this.bridgeLastError = null;
 
     provisionRuntimeKit({
       kit: this.runtimeKit,
       token: srv.getAuthToken(),
       vaultName: this.app.vault.getName(),
       vaultPath: this.vaultOps.getVaultBasePath(),
+      pluginVersion: this.pluginVersion,
     });
 
     this.cli.setCustomEnv(this.getBridgeEnv());
     this.emitChange();
+
+    if (!this.prunedStaleKits) {
+      this.prunedStaleKits = true;
+      const keepDigest = path.basename(this.runtimeKit.runtimeDir);
+      const baseDir = path.dirname(this.runtimeKit.runtimeDir);
+      const prune = this.pruneStaleKitsFn || pruneStaleRuntimeKits;
+      void prune({ baseDir, keepDigest })
+        .then((res) => {
+          if (res.removed.length > 0) {
+            console.debug(`[herdr-obs] Pruned ${res.removed.length} stale runtime kit(s).`);
+          }
+        })
+        .catch((err: unknown) => {
+          console.warn("[herdr-obs] Stale runtime kit cleanup failed:", err);
+        });
+    }
   }
 
   async stopVaultBridge(): Promise<void> {
@@ -314,6 +383,7 @@ export class HerdrCoordinator {
       bridgeSocketPath: this.runtimeKit.socketPath,
       cliScriptPath: this.runtimeKit.cliScriptPath,
       herdrPluginManifestPath: this.runtimeKit.herdrPluginManifestPath,
+      protocolWarning: this.protocolWarning,
       lastError: this.lastError,
       lastUpdated: this.lastUpdated,
     };
@@ -348,6 +418,12 @@ export class HerdrCoordinator {
 
   private async doRefresh(includeDiagnostics: boolean): Promise<void> {
     try {
+      await this.healBridgeIfNeeded().catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.bridgeLastError = `Vault Control Bridge self-heal failed: ${msg}`;
+        console.warn("[herdr-obs] Bridge self-heal failed:", err);
+      });
+
       const settings = this.getSettings();
       const sessionName = this.getActiveSessionName();
       let status = await this.cli.getStatus(sessionName);
@@ -376,6 +452,7 @@ export class HerdrCoordinator {
 
       if (status?.server?.running || this.socket.isSocketPresent()) {
         const snap = await this.socket.getSnapshot();
+        this.updateProtocolWarning(status, snap);
         this.detectAgentStateTransitions(snap.agents);
         const openPanes = new Set(snap.panes.map((pane) => pane.pane_id));
         this.cursorOverlay.reconcileLiveCallers(
@@ -385,7 +462,7 @@ export class HerdrCoordinator {
         );
         this.snapshot = snap;
         this.socketReachable = true;
-        this.lastError = null;
+        this.lastError = this.bridgeLastError;
 
         if (settings.autoConnectSocket && !this.socket.isSubscribed()) {
           this.socket.startSubscription();
@@ -418,6 +495,7 @@ export class HerdrCoordinator {
             .catch(() => undefined);
         }
       } else {
+        this.updateProtocolWarning(status, null);
         this.snapshot = null;
         this.socketReachable = false;
         this.socket.stopSubscription();
@@ -432,6 +510,27 @@ export class HerdrCoordinator {
     } finally {
       this.lastUpdated = Date.now();
       this.emitChange();
+    }
+  }
+
+  private updateProtocolWarning(
+    status: HerdrStatusPayload | null,
+    snap: SessionSnapshot | null
+  ): void {
+    const warning = evaluateHerdrProtocol({
+      clientVersion: status?.client?.version ?? null,
+      clientProtocol: status?.client?.protocol ?? null,
+      serverVersion: status?.server?.version ?? snap?.version ?? null,
+      serverProtocol: status?.server?.protocol ?? snap?.protocol ?? null,
+    });
+    this.protocolWarning = warning;
+    if (!warning) {
+      return;
+    }
+    const key = `${this.getActiveSessionName()}\u0000${warning}`;
+    if (this.warnedProtocolKey !== key) {
+      this.warnedProtocolKey = key;
+      new Notice(warning, 10000);
     }
   }
 
@@ -571,6 +670,7 @@ export class HerdrCoordinator {
     initialPrompt?: string;
     attachVaultMcp?: boolean;
     extraArgs?: string[];
+    signal?: AbortSignal;
   }): Promise<AgentInfo> {
     await this.ensureBridgeReady();
     if (this.sessionStartInFlight) {
@@ -638,7 +738,13 @@ export class HerdrCoordinator {
     if (options.initialPrompt && options.initialPrompt.trim()) {
       // An agent waiting at a question (Claude Code's first-run folder trust check, where Enter
       // picks "No, exit") must not get the prompt: its Enter would answer the question.
-      const ready = await this.waitWhileBlocked(agent, bound);
+      const ready = await this.waitWhileBlocked(agent, bound, options.signal);
+      if (options.signal?.aborted) {
+        await this.refreshAll(false);
+        throw new Error(
+          `Started '${options.agentName}', but waiting for it was cancelled, so the initial prompt was not sent.`
+        );
+      }
       if (this.disposed || this.sessionBinding() !== bound) {
         throw new Error(
           `Started '${options.agentName}', but the Herdr session changed meanwhile, so the initial prompt was not sent. Switch back to that session and send the prompt.`
@@ -660,14 +766,38 @@ export class HerdrCoordinator {
   /**
    * Waits, at most two minutes, while a just started agent is blocked at a question, and tells
    * the member once to answer it. True once it is ready (or was never blocked); false when it
-   * stayed blocked, left, the plugin closed, or the session changed.
+   * stayed blocked, left, was cancelled, the plugin closed, or the session changed.
    */
   /** The session and socket an action is bound to; a change means another session. */
   private sessionBinding(): string {
     return `${this.getActiveSessionName()}\u0000${this.socket.getSocketPath()}`;
   }
 
-  private async waitWhileBlocked(agent: AgentInfo, bound: string = this.sessionBinding()): Promise<boolean> {
+  private waitPollDelay(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        window.clearTimeout(timer);
+        resolve();
+      };
+      const timer = window.setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private async waitWhileBlocked(
+    agent: AgentInfo,
+    bound: string = this.sessionBinding(),
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    if (signal?.aborted) {
+      return false;
+    }
     if (agent.agent_status !== "blocked") {
       return true;
     }
@@ -676,9 +806,9 @@ export class HerdrCoordinator {
       15000
     );
     const deadline = Date.now() + 120000;
-    while (Date.now() < deadline && !this.disposed) {
-      await new Promise((r) => window.setTimeout(r, 500));
-      if (this.sessionBinding() !== bound) {
+    while (Date.now() < deadline && !this.disposed && !signal?.aborted) {
+      await this.waitPollDelay(500, signal);
+      if (signal?.aborted || this.disposed || this.sessionBinding() !== bound) {
         return false;
       }
       let now: AgentInfo | undefined;
@@ -686,6 +816,9 @@ export class HerdrCoordinator {
         now = (await this.socket.listAgents()).find((a) => a.pane_id === agent.pane_id && a.name === agent.name);
       } catch {
         continue;
+      }
+      if (signal?.aborted || this.disposed) {
+        return false;
       }
       if (!now) {
         return false;
@@ -858,6 +991,7 @@ export class HerdrCoordinator {
     this.unsubSocketConn?.();
     this.socket.dispose();
     this.cursorOverlay.dispose();
+    this.uiControl?.dispose();
     await this.stopVaultBridge();
     this.listeners.clear();
   }
@@ -1133,7 +1267,11 @@ export class HerdrCoordinator {
 
   private emitChange(): void {
     for (const listener of this.listeners) {
-      listener();
+      try {
+        listener();
+      } catch (err) {
+        console.warn("[herdr-obs] Coordinator listener error:", err);
+      }
     }
   }
 }

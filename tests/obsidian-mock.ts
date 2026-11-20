@@ -163,9 +163,13 @@ export function createMockObsidianApp(vaultRoot: string, vaultName = "TestVault"
     return resolved;
   };
 
+  const vaultConfig: Record<string, unknown> = {};
+
   const app = {
     vault: {
       configDir: ".obsidian",
+      config: vaultConfig,
+      getConfig: (key: string) => vaultConfig[key],
       adapter: new FileSystemAdapter(vaultRoot),
       getName: () => vaultName,
       getFiles: () => Array.from(files.values()),
@@ -204,6 +208,25 @@ export function createMockObsidianApp(vaultRoot: string, vaultName = "TestVault"
         const st = fs.statSync(abs);
         file.stat = { ctime: st.ctimeMs, mtime: st.mtimeMs, size: st.size };
         return Promise.resolve(next);
+      },
+      rename: (file: TFile, newPath: string) => {
+        const oldNorm = file.path;
+        const newNorm = normalizePath(newPath);
+        const newAbs = path.join(vaultRoot, newNorm);
+        fs.mkdirSync(path.dirname(newAbs), { recursive: true });
+        fs.renameSync(path.join(vaultRoot, oldNorm), newAbs);
+        syncFromDisk();
+        return Promise.resolve();
+      },
+      trash: (file: TFile, _system: boolean) => {
+        const trashDir = path.join(vaultRoot, ".trash");
+        fs.mkdirSync(trashDir, { recursive: true });
+        fs.renameSync(
+          path.join(vaultRoot, file.path),
+          path.join(trashDir, path.posix.basename(file.path))
+        );
+        syncFromDisk();
+        return Promise.resolve();
       },
     },
     metadataCache: {
