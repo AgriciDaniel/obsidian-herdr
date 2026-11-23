@@ -34,6 +34,30 @@ function isSocketLive(socketPath: string, timeoutMs = 250): Promise<boolean> {
   });
 }
 
+/**
+ * Identity of a socket file. The inode number alone is not enough: ext4 and tmpfs reuse a
+ * freed inode number at once, so a newer server's socket can look like ours. The creation
+ * (or change) time in nanoseconds tells them apart.
+ */
+interface SocketIdentity {
+  dev: bigint;
+  ino: bigint;
+  birthtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+function readSocketIdentity(socketPath: string): SocketIdentity | null {
+  const st = fs.lstatSync(socketPath, { bigint: true });
+  if (!st.isSocket()) {
+    return null;
+  }
+  return { dev: st.dev, ino: st.ino, birthtimeNs: st.birthtimeNs, ctimeNs: st.ctimeNs };
+}
+
+function sameSocketIdentity(a: SocketIdentity, b: SocketIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.birthtimeNs === b.birthtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
 function isPathInsideDir(targetPath: string, containerDir: string): boolean {
   const rel = path.relative(path.resolve(containerDir), path.resolve(targetPath));
   return Boolean(rel) && !rel.startsWith("..") && !path.isAbsolute(rel);
@@ -50,7 +74,7 @@ export class VaultBridgeServer {
   private readonly dispatcher: BridgeMethodDispatcher;
   private readonly clientIdleTimeoutMs: number;
   private server: net.Server | null = null;
-  private socketIdentity: { dev: number; ino: number } | null = null;
+  private socketIdentity: SocketIdentity | null = null;
   private readonly activeClients = new Set<net.Socket>();
   private running = false;
 
@@ -157,8 +181,7 @@ export class VaultBridgeServer {
             // Ignore chmod on unsupported fs
           }
           try {
-            const st = fs.lstatSync(this.socketPath);
-            this.socketIdentity = st.isSocket() ? { dev: st.dev, ino: st.ino } : null;
+            this.socketIdentity = readSocketIdentity(this.socketPath);
           } catch {
             this.socketIdentity = null;
           }
@@ -191,8 +214,10 @@ export class VaultBridgeServer {
 
     if (process.platform !== "win32" && ownedIdentity !== null) {
       try {
-        const st = fs.lstatSync(this.socketPath);
-        if (st.isSocket() && st.dev === ownedIdentity.dev && st.ino === ownedIdentity.ino) {
+        const current = readSocketIdentity(this.socketPath);
+        // Our server is closed now, so anything still answering on this path is a newer
+        // bridge (for example after a plugin reload): never delete its socket.
+        if (current && sameSocketIdentity(current, ownedIdentity) && !(await isSocketLive(this.socketPath))) {
           fs.unlinkSync(this.socketPath);
         }
       } catch {

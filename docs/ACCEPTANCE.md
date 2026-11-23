@@ -392,3 +392,5 @@ Live in Obsidian 1.15.1 with Herdr 0.9.5 (session restarted onto 0.9.5 by the ma
 | `styles.css` | `41,360` | `6c1d9ec38e627d06d2655813f05adcb5917d0cedc5bd1e86f4af28a90a7a6761` |
 
 Not verified: macOS and Windows desktop runs (left to the CI matrix), the Windows `.cmd` wrapper itself, and the 0.2.x to 0.3.2 Windows upgrade on a real Windows machine.
+
+First CI run of this commit (GitHub Actions): Windows passed; Ubuntu failed A1 (an old bridge's `stop()` deleted the newer bridge's socket, because ext4 reuses a freed inode number at once and the check compared only device and inode; it passed locally on btrfs); macOS failed one test whose fake window opened the command palette only on Ctrl+P. Fixed: socket identity now also compares creation and change time in nanoseconds, and `stop()` never deletes a socket that still answers a connection; the test accepts Cmd+P. Gates again: check, lint, build, 163/163.

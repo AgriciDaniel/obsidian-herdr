@@ -7943,7 +7943,13 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
           ) {
             openSettings();
           }
-          if (ev.type === "keyDown" && ev.keyCode === "P" && Array.isArray(ev.modifiers) && ev.modifiers.includes("control")) {
+          // Mod+P is Ctrl+P on Linux and Windows and Cmd+P on macOS, as in Obsidian.
+          if (
+            ev.type === "keyDown" &&
+            ev.keyCode === "P" &&
+            Array.isArray(ev.modifiers) &&
+            (ev.modifiers.includes("control") || ev.modifiers.includes("meta"))
+          ) {
             openPrompt();
           }
         },
