@@ -1,48 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Daniel Agrici. Visual multi-agent cursor overlay for Obsidian-herdr.
 
-export interface AgentCursorOptions {
-  win: Window;
-  enabled?: boolean;
-  idleAfterMs?: number;
-  hideAfterMs?: number;
-}
+import type {
+  AgentCursorOptions,
+  CursorCodeMirrorLike,
+  DocumentCursorContext,
+  NoteDocChange,
+} from "./types";
+import {
+  HUE_BUCKETS,
+  PILL_DEFAULT_X,
+  PILL_DEFAULT_Y,
+  caretPointFromCoords,
+  formatCssPx,
+  formatCursorDisplayLabel,
+  hasDocumentAnchorTarget,
+  hashCallerBucket,
+  isHerdrPaneId,
+  mapAnchoredPos,
+  normalizeHonestAction,
+  readDocSnapshot,
+  resolvePillOffsets,
+  type PillLayoutInput,
+  type PillRect,
+} from "./cursor-anchor";
 
-export interface CursorCodeMirrorLike {
-  dom?: Element | null;
-  scrollDOM?: Element | null;
-  contentDOM?: Element | null;
-  state?: {
-    doc?: {
-      toString(): string;
-      length?: number;
-    };
-    selection?: {
-      main?: {
-        head?: number;
-      };
-    };
-  };
-  coordsAtPos?(pos: number, side?: number): { left: number; right?: number; top: number; bottom?: number } | null;
-}
-
-export interface DocumentCursorContext {
-  notePath?: string;
-  pane?: string;
-  leafId?: string;
-  pos?: number;
-  cm?: CursorCodeMirrorLike | null;
-  containerEl?: Element | null;
-  view?: { file?: { path?: string } | null } | null;
-  getLeafNotePath?: () => string | null | undefined;
-  isVisible?: () => boolean;
-}
-
-export interface NoteDocChange {
-  from: number;
-  to: number;
-  insertLength: number;
-}
+export type {
+  AgentCursorOptions,
+  CursorCodeMirrorLike,
+  DocumentCursorContext,
+  NoteDocChange,
+} from "./types";
+export {
+  caretPointFromCoords,
+  formatCursorDisplayLabel,
+  mapAnchoredPos,
+} from "./cursor-anchor";
 
 interface DocumentAnchor {
   notePath?: string;
@@ -55,13 +48,18 @@ interface DocumentAnchor {
   isVisible?: () => boolean;
   pos: number | null;
   docSnapshot: string | null;
+  docRef: unknown;
+  docLength: number | null;
 }
 
 interface RecentTextAnchor {
-  cm: CursorCodeMirrorLike;
+  cmRef: WeakRef<CursorCodeMirrorLike>;
   notePath?: string;
   pos: number;
   docSnapshot: string | null;
+  docRef: unknown;
+  docLength: number | null;
+  recordedAt: number;
 }
 
 interface CursorGlide {
@@ -101,90 +99,6 @@ const DEFAULT_HIDE_MS = 60000;
 const BRIEF_ACTION_MS = 550;
 const TYPING_SAFETY_MS = 650;
 const EXIT_FADE_MS = 240;
-
-const SILENT_MOVE_ACTIONS = new Set([
-  "hover",
-  "move",
-  "focus",
-  "scroll",
-  "drag",
-  "drop",
-  "note_update",
-  "parked",
-  "idle",
-]);
-
-function normalizeHonestAction(
-  source: "move" | "click" | "typing",
-  action?: string
-): { text: string; isTyping: boolean } {
-  if (source === "typing") {
-    return { text: "typing", isTyping: true };
-  }
-  const trimmed = action?.trim() ?? "";
-  if (source === "click") {
-    if (!trimmed || trimmed === "click" || trimmed === "clicking" || trimmed === "insert_line" || trimmed === "drag") {
-      return { text: "clicking", isTyping: false };
-    }
-    return { text: trimmed, isTyping: false };
-  }
-  if (!trimmed) {
-    return { text: "", isTyping: false };
-  }
-  if (trimmed === "click" || trimmed === "clicking") {
-    return { text: "clicking", isTyping: false };
-  }
-  if (SILENT_MOVE_ACTIONS.has(trimmed) || trimmed === "typing") {
-    return { text: "", isTyping: false };
-  }
-  return { text: trimmed, isTyping: false };
-}
-
-function mapAnchoredPos(oldText: string | null, newText: string | null, pos: number, change?: NoteDocChange): number {
-  const newLen = newText?.length ?? null;
-  if (change) {
-    const delta = change.insertLength - (change.to - change.from);
-    let nextPos = pos;
-    if (pos >= change.to) {
-      nextPos = pos + delta;
-    } else if (pos > change.from) {
-      nextPos = change.from + Math.min(change.insertLength, pos - change.from);
-    }
-    if (newLen !== null) {
-      return Math.max(0, Math.min(newLen, nextPos));
-    }
-    return Math.max(0, nextPos);
-  }
-  if (oldText === null || newText === null || oldText === newText) {
-    return newLen !== null ? Math.max(0, Math.min(newLen, pos)) : Math.max(0, pos);
-  }
-
-  const oldLen = oldText.length;
-  const minLen = Math.min(oldLen, newLen ?? 0);
-  let prefix = 0;
-  while (prefix < minLen && oldText.charCodeAt(prefix) === newText.charCodeAt(prefix)) {
-    prefix += 1;
-  }
-
-  let suffix = 0;
-  const maxSuffix = minLen - prefix;
-  while (
-    suffix < maxSuffix &&
-    oldText.charCodeAt(oldLen - 1 - suffix) === newText.charCodeAt((newLen ?? 0) - 1 - suffix)
-  ) {
-    suffix += 1;
-  }
-
-  const oldTo = oldLen - suffix;
-  const newTo = (newLen ?? 0) - suffix;
-  let nextPos = pos;
-  if (pos >= oldTo) {
-    nextPos = pos + (newTo - oldTo);
-  } else if (pos > prefix) {
-    nextPos = prefix + Math.min(newTo - prefix, pos - prefix);
-  }
-  return Math.max(0, Math.min(newLen ?? nextPos, nextPos));
-}
 const MAX_GLIDE_MS = 180;
 const MIN_GLIDE_MS = 45;
 const DEFAULT_SETTLE_WAIT_MS = 250;
@@ -192,130 +106,6 @@ const MAX_SETTLE_WAIT_MS = 500;
 const SETTLE_EPSILON = 0.35;
 const CLICK_POS_TOLERANCE_X = 24;
 const CLICK_POS_TOLERANCE_Y = 24;
-const HUE_BUCKETS = 12;
-const PILL_DEFAULT_X = 10;
-const PILL_DEFAULT_Y = 5;
-const PILL_ROW_STEP = 20;
-
-function hasDocumentAnchorTarget(docContext: DocumentCursorContext): boolean {
-  return Boolean(
-    docContext.cm ||
-      (typeof docContext.notePath === "string" && docContext.notePath.trim() !== "") ||
-      (typeof docContext.pos === "number" && Number.isFinite(docContext.pos)) ||
-      (typeof docContext.view?.file?.path === "string" && docContext.view.file.path.trim() !== "") ||
-      docContext.getLeafNotePath
-  );
-}
-
-function formatCssPx(value: number): string {
-  const rounded = Math.round(value * 100) / 100;
-  return `${Object.is(rounded, -0) ? 0 : rounded}px`;
-}
-
-/** Returns the text caret anchor at the left edge and vertical midpoint of the line box. */
-export function caretPointFromCoords(
-  coords: { left: number; top: number; bottom?: number }
-): { x: number; y: number } {
-  const midY =
-    typeof coords.bottom === "number" && Number.isFinite(coords.bottom)
-      ? (coords.top + coords.bottom) / 2
-      : coords.top;
-  return {
-    x: coords.left,
-    y: midY,
-  };
-}
-const PILL_PAD = 4;
-
-interface PillRect {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-}
-
-function hashCallerBucket(caller: string): number {
-  let hash = 2166136261;
-  for (let i = 0; i < caller.length; i += 1) {
-    hash ^= caller.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return Math.abs(hash) % HUE_BUCKETS;
-}
-
-function rectsOverlap(a: PillRect, b: PillRect, pad = PILL_PAD): boolean {
-  return (
-    a.left < b.right + pad &&
-    a.right + pad > b.left &&
-    a.top < b.bottom + pad &&
-    a.bottom + pad > b.top
-  );
-}
-
-const HERDR_PANE_ID_RE = /^(?:w\d+:p[0-9a-zA-Z]+|p\d+|pane[-_][0-9a-zA-Z_-]+|markdown-pane-\d+)$/i;
-
-function isHerdrPaneId(value: string): boolean {
-  const trimmed = value.trim();
-  const bare = trimmed.startsWith("herdr:") ? trimmed.slice(6).trim() : trimmed;
-  return bare !== "" && HERDR_PANE_ID_RE.test(bare);
-}
-
-/**
- * Formats the visible cursor badge to show only the known agent name and
- * fall back to the pane id when no agent name is available.
- */
-export function formatCursorDisplayLabel(caller: string, label: string): string {
-  const trimmedCaller = caller.trim();
-  const bareCaller = trimmedCaller.startsWith("herdr:")
-    ? trimmedCaller.slice(6).trim()
-    : trimmedCaller;
-  const hashIdx = bareCaller.indexOf("#");
-  const callerPane = (hashIdx >= 0 ? bareCaller.slice(0, hashIdx) : bareCaller).trim();
-  const callerHint = (hashIdx >= 0 ? bareCaller.slice(hashIdx + 1) : "").trim();
-
-  const isPaneLikeId = (value: string): boolean => {
-    const clean = (value.startsWith("herdr:") ? value.slice(6) : value).trim();
-    if (!clean) {
-      return false;
-    }
-    if (callerPane && clean === callerPane) {
-      return true;
-    }
-    return isHerdrPaneId(clean);
-  };
-
-  const raw = label.trim();
-  if (!raw) {
-    return callerHint || callerPane || bareCaller || trimmedCaller;
-  }
-
-  const tailParenMatch = /^(.+?)\s+\(([^()]+)\)$/.exec(raw);
-  if (tailParenMatch && isPaneLikeId(tailParenMatch[2])) {
-    const head = tailParenMatch[1].trim();
-    if (head) {
-      return head;
-    }
-  }
-
-  if (raw === trimmedCaller || raw === bareCaller || raw === callerPane) {
-    return callerHint || callerPane || bareCaller || raw;
-  }
-
-  if (raw.startsWith("herdr:")) {
-    const withoutPrefix = raw.slice(6).trim();
-    const rawHash = withoutPrefix.indexOf("#");
-    if (rawHash >= 0) {
-      const hint = withoutPrefix.slice(rawHash + 1).trim();
-      if (hint) {
-        return hint;
-      }
-      return withoutPrefix.slice(0, rawHash).trim() || withoutPrefix;
-    }
-    return withoutPrefix || raw;
-  }
-
-  return raw;
-}
 
 /**
  * Renders one spring-animated, color-coded cursor per active agent inside the
@@ -360,6 +150,12 @@ export class AgentCursorOverlay {
   private readonly knownLiveCallers = new Set<string>();
   private readonly pendingSettleTimers = new Set<number>();
   private readonly recentTextAnchors = new Map<string, RecentTextAnchor>();
+  private reprojectRafId: number | null = null;
+  private pendingReprojectAll = false;
+  private readonly pendingReprojectTargets = new Set<Element>();
+  private readonly pendingMutationTargets = new Set<Element>();
+  private readonly entranceRafIds = new Set<number>();
+  private readonly pulseRafIds = new Map<CursorInstance, number>();
 
   getActiveCount(): number {
     return this.cursors.size;
@@ -430,7 +226,7 @@ export class AgentCursorOverlay {
     action?: string,
     docContext?: DocumentCursorContext | null
   ): void {
-    if (this.disposed || !this.enabled) {
+    if (this.disposed || !this.enabled || !Number.isFinite(x) || !Number.isFinite(y)) {
       return;
     }
     this.cancelExitingForCaller(caller);
@@ -438,6 +234,9 @@ export class AgentCursorOverlay {
     const effectiveCtx = renameOverride ? renameOverride.docContext : docContext;
     const targetX = renameOverride ? renameOverride.point.x : x;
     const targetY = renameOverride ? renameOverride.point.y : y;
+    if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
+      return;
+    }
     const cursor = this.ensureCursor(caller, label);
     const honest = normalizeHonestAction("move", action);
     this.updateDocumentAnchor(cursor, effectiveCtx, {
@@ -458,7 +257,7 @@ export class AgentCursorOverlay {
     action = "clicking",
     docContext?: DocumentCursorContext | null
   ): void {
-    if (this.disposed || !this.enabled) {
+    if (this.disposed || !this.enabled || !Number.isFinite(x) || !Number.isFinite(y)) {
       return;
     }
     this.cancelExitingForCaller(caller);
@@ -476,7 +275,7 @@ export class AgentCursorOverlay {
     y: number,
     docContext?: DocumentCursorContext | null
   ): void {
-    if (this.disposed || !this.enabled) {
+    if (this.disposed || !this.enabled || !Number.isFinite(x) || !Number.isFinite(y)) {
       return;
     }
     this.cancelExitingForCaller(caller);
@@ -527,6 +326,7 @@ export class AgentCursorOverlay {
     if (this.disposed || !this.enabled) {
       return;
     }
+    let updatedAny = false;
     for (const cursor of Array.from(this.cursors.values())) {
       const anchor = cursor.docAnchor;
       if (!anchor) {
@@ -536,12 +336,17 @@ export class AgentCursorOverlay {
         continue;
       }
       if (!this.isAnchorSameNoteAndConnected(anchor)) {
-        this.hideDisplacedCursor(cursor);
+        this.hideDisplacedCursor(cursor, false);
+        updatedAny = true;
         continue;
       }
       this.syncAnchorFromDoc(anchor, change);
       this.recordRecentTextAnchor(cursor.caller, anchor);
-      this.reprojectCursor(cursor, true);
+      this.reprojectCursor(cursor, true, false);
+      updatedAny = true;
+    }
+    if (updatedAny) {
+      this.updateLabelOffsets();
     }
   }
 
@@ -657,6 +462,14 @@ export class AgentCursorOverlay {
       this.win.clearTimeout(timerId);
     }
     this.pendingSettleTimers.clear();
+    for (const rafHandle of Array.from(this.entranceRafIds)) {
+      this.win.cancelAnimationFrame?.(rafHandle);
+    }
+    this.entranceRafIds.clear();
+    for (const rafHandle of Array.from(this.pulseRafIds.values())) {
+      this.win.cancelAnimationFrame?.(rafHandle);
+    }
+    this.pulseRafIds.clear();
     for (const [el, entry] of Array.from(this.fadingEls.entries())) {
       if (entry.timer !== null) {
         this.win.clearTimeout(entry.timer);
@@ -680,6 +493,7 @@ export class AgentCursorOverlay {
     this.disposed = true;
     this.stopLoop();
     this.clearAll();
+    this.assignedHues.clear();
   }
 
   private pickHueForCaller(caller: string): number {
@@ -742,10 +556,22 @@ export class AgentCursorOverlay {
       ? layer.createDiv({ cls: "herdr-cursor is-entering" })
       : this.win.document.createDiv({ cls: "herdr-cursor is-entering" });
     el.style.setProperty("--herdr-cursor-hue", String(hue));
-    if (!this.prefersReducedMotion()) {
-      this.win.requestAnimationFrame(() => {
+    if (!this.prefersReducedMotion() && typeof this.win.requestAnimationFrame === "function") {
+      let fired = false;
+      let entranceRaf: number | null = null;
+      entranceRaf = this.win.requestAnimationFrame(() => {
+        fired = true;
+        if (entranceRaf !== null) {
+          this.entranceRafIds.delete(entranceRaf);
+        }
+        if (this.disposed || el.isConnected === false) {
+          return;
+        }
         el.classList.remove("is-entering");
       });
+      if (!fired && entranceRaf !== null) {
+        this.entranceRafIds.add(entranceRaf);
+      }
     } else {
       el.classList.remove("is-entering");
     }
@@ -822,99 +648,36 @@ export class AgentCursorOverlay {
 
   /** Offsets overlapping cursor labels so multiple agents at the same point remain readable. */
   private updateLabelOffsets(): void {
-    const placed: PillRect[] = [];
     const viewW = this.win.innerWidth || 1920;
     const viewH = this.win.innerHeight || 1080;
 
+    // Read phase: measure all visible cursor pills before writing any styles.
+    const visibleCursors: CursorInstance[] = [];
+    const layoutInputs: PillLayoutInput[] = [];
     for (const cursor of this.cursors.values()) {
       if (cursor.el.classList.contains("is-offscreen")) {
         continue;
       }
       const bounds = cursor.paneBounds ?? { left: 0, top: 0, right: viewW, bottom: viewH };
       const { width, height } = this.estimatePillSize(cursor);
-      const leftSideX = -width - 8;
-      const aboveY = -height - 6;
-      const candidates: Array<[number, number]> = [
-        [PILL_DEFAULT_X, PILL_DEFAULT_Y],
-        [PILL_DEFAULT_X, aboveY],
-        [leftSideX, PILL_DEFAULT_Y],
-        [leftSideX, aboveY],
-        [PILL_DEFAULT_X, PILL_DEFAULT_Y + PILL_ROW_STEP],
-        [PILL_DEFAULT_X, aboveY - PILL_ROW_STEP],
-        [PILL_DEFAULT_X, PILL_DEFAULT_Y + PILL_ROW_STEP * 2],
-        [leftSideX, PILL_DEFAULT_Y + PILL_ROW_STEP],
-        [PILL_DEFAULT_X, PILL_DEFAULT_Y + PILL_ROW_STEP * 3],
-      ];
-
-      let chosenX = PILL_DEFAULT_X;
-      let chosenY = PILL_DEFAULT_Y + placed.length * PILL_ROW_STEP;
-      let fallbackInBounds: [number, number] | null = null;
-
-      for (const [ox, oy] of candidates) {
-        const rect: PillRect = {
-          left: cursor.targetX + ox,
-          top: cursor.targetY + oy,
-          right: cursor.targetX + ox + width,
-          bottom: cursor.targetY + oy + height,
-        };
-        const inViewport =
-          rect.left >= bounds.left + 2 &&
-          rect.top >= bounds.top + 2 &&
-          rect.right <= bounds.right - 2 &&
-          rect.bottom <= bounds.bottom - 2;
-        if (inViewport && !fallbackInBounds) {
-          fallbackInBounds = [ox, oy];
-        }
-        if (inViewport && !placed.some((p) => rectsOverlap(rect, p))) {
-          chosenX = ox;
-          chosenY = oy;
-          break;
-        }
-      }
-
-      if (
-        chosenX === PILL_DEFAULT_X &&
-        chosenY === PILL_DEFAULT_Y + placed.length * PILL_ROW_STEP &&
-        fallbackInBounds
-      ) {
-        const defaultRect: PillRect = {
-          left: cursor.targetX + chosenX,
-          top: cursor.targetY + chosenY,
-          right: cursor.targetX + chosenX + width,
-          bottom: cursor.targetY + chosenY + height,
-        };
-        const overflowsPane =
-          defaultRect.left < bounds.left + 2 ||
-          defaultRect.top < bounds.top + 2 ||
-          defaultRect.right > bounds.right - 2 ||
-          defaultRect.bottom > bounds.bottom - 2;
-        if (overflowsPane || placed.some((p) => rectsOverlap(defaultRect, p))) {
-          chosenX = fallbackInBounds[0];
-          chosenY = fallbackInBounds[1];
-        }
-      }
-
-      if (cursor.paneBounds) {
-        const minRelX = bounds.left + 2 - cursor.targetX;
-        const maxRelX = bounds.right - 2 - width - cursor.targetX;
-        const minRelY = bounds.top + 2 - cursor.targetY;
-        const maxRelY = bounds.bottom - 2 - height - cursor.targetY;
-        if (maxRelX >= minRelX) {
-          chosenX = Math.max(minRelX, Math.min(maxRelX, chosenX));
-        }
-        if (maxRelY >= minRelY) {
-          chosenY = Math.max(minRelY, Math.min(maxRelY, chosenY));
-        }
-      }
-
-      cursor.pillEl.style.setProperty("--herdr-pill-x", `${Math.round(chosenX)}px`);
-      cursor.pillEl.style.setProperty("--herdr-pill-y", `${Math.round(chosenY)}px`);
-      placed.push({
-        left: cursor.targetX + chosenX,
-        top: cursor.targetY + chosenY,
-        right: cursor.targetX + chosenX + width,
-        bottom: cursor.targetY + chosenY + height,
+      visibleCursors.push(cursor);
+      layoutInputs.push({
+        targetX: cursor.targetX,
+        targetY: cursor.targetY,
+        bounds,
+        clampToBounds: cursor.paneBounds !== null,
+        width,
+        height,
       });
+    }
+
+    // Compute phase: resolve non-overlapping offsets purely in memory.
+    const offsets = resolvePillOffsets(layoutInputs);
+
+    // Write phase: apply CSS variables in a single batch without interleaved layout reads.
+    for (let i = 0; i < visibleCursors.length; i += 1) {
+      visibleCursors[i].pillEl.style.setProperty("--herdr-pill-x", `${offsets[i].x}px`);
+      visibleCursors[i].pillEl.style.setProperty("--herdr-pill-y", `${offsets[i].y}px`);
     }
   }
 
@@ -1025,14 +788,61 @@ export class AgentCursorOverlay {
       this.win.clearTimeout(cursor.pulseTimer);
       cursor.pulseTimer = null;
     }
+    const pendingPulseRaf = this.pulseRafIds.get(cursor);
+    if (pendingPulseRaf !== undefined) {
+      this.win.cancelAnimationFrame?.(pendingPulseRaf);
+      this.pulseRafIds.delete(cursor);
+    }
+    const schedulePulseClear = (): void => {
+      cursor.pulseTimer = this.win.setTimeout(() => {
+        cursor.pulseTimer = null;
+        cursor.el.classList.remove("is-clicking");
+      }, 420);
+    };
+    const wasClicking = cursor.el.classList.contains("is-clicking");
+    if (!wasClicking) {
+      cursor.el.classList.add("is-clicking");
+      schedulePulseClear();
+      return;
+    }
+    const ringWithAnim = cursor.ringEl as HTMLElement & {
+      getAnimations?: () => Array<{ currentTime?: number | null; play?: () => void }>;
+    };
+    if (typeof ringWithAnim.getAnimations === "function") {
+      try {
+        const anims = ringWithAnim.getAnimations();
+        if (anims.length > 0) {
+          for (const anim of anims) {
+            anim.currentTime = 0;
+            anim.play?.();
+          }
+          schedulePulseClear();
+          return;
+        }
+      } catch {
+        // Fall through to rAF class toggle.
+      }
+    }
     cursor.el.classList.remove("is-clicking");
-    // Force style recalc only when restarting an active pulse class.
-    void cursor.ringEl.offsetWidth;
-    cursor.el.classList.add("is-clicking");
-    cursor.pulseTimer = this.win.setTimeout(() => {
-      cursor.pulseTimer = null;
-      cursor.el.classList.remove("is-clicking");
-    }, 420);
+    if (typeof this.win.requestAnimationFrame === "function") {
+      let fired = false;
+      let rafHandle: number | null = null;
+      rafHandle = this.win.requestAnimationFrame(() => {
+        fired = true;
+        this.pulseRafIds.delete(cursor);
+        if (this.disposed || this.cursors.get(cursor.caller) !== cursor) {
+          return;
+        }
+        cursor.el.classList.add("is-clicking");
+      });
+      if (!fired && rafHandle !== null) {
+        this.pulseRafIds.set(cursor, rafHandle);
+      }
+    } else {
+      void cursor.ringEl.offsetWidth;
+      cursor.el.classList.add("is-clicking");
+    }
+    schedulePulseClear();
   }
 
   private clearActionLabel(cursor: CursorInstance): void {
@@ -1085,6 +895,11 @@ export class AgentCursorOverlay {
       this.win.clearTimeout(cursor.pulseTimer);
       cursor.pulseTimer = null;
     }
+    const pendingPulseRaf = this.pulseRafIds.get(cursor);
+    if (pendingPulseRaf !== undefined) {
+      this.win.cancelAnimationFrame?.(pendingPulseRaf);
+      this.pulseRafIds.delete(cursor);
+    }
   }
 
   private cancelExitingForCaller(caller: string): void {
@@ -1100,6 +915,21 @@ export class AgentCursorOverlay {
     }
   }
 
+  private pruneRecentTextAnchors(now = Date.now()): void {
+    const RECENT_ANCHOR_TTL_MS = 5000;
+    for (const [key, entry] of Array.from(this.recentTextAnchors.entries())) {
+      const cm = entry.cmRef.deref();
+      if (
+        !cm ||
+        now - entry.recordedAt > RECENT_ANCHOR_TTL_MS ||
+        cm.scrollDOM?.isConnected === false ||
+        cm.dom?.isConnected === false
+      ) {
+        this.recentTextAnchors.delete(key);
+      }
+    }
+  }
+
   private recordRecentTextAnchor(caller: string, anchor: DocumentAnchor | null): void {
     if (
       !anchor?.cm ||
@@ -1109,11 +939,16 @@ export class AgentCursorOverlay {
     ) {
       return;
     }
+    const now = Date.now();
+    this.pruneRecentTextAnchors(now);
     this.recentTextAnchors.set(caller, {
-      cm: anchor.cm,
+      cmRef: new WeakRef(anchor.cm),
       notePath: anchor.notePath,
       pos: anchor.pos,
       docSnapshot: anchor.docSnapshot,
+      docRef: anchor.docRef,
+      docLength: anchor.docLength,
+      recordedAt: now,
     });
   }
 
@@ -1134,7 +969,10 @@ export class AgentCursorOverlay {
     if (cm.scrollDOM?.isConnected === false || cm.dom?.isConnected === false) {
       return null;
     }
+    this.pruneRecentTextAnchors();
     const existingAnchor = this.cursors.get(caller)?.docAnchor ?? null;
+    const recentEntry = this.recentTextAnchors.get(caller) ?? null;
+    const recentCm = recentEntry?.cmRef.deref() ?? null;
     const recent =
       existingAnchor?.cm === cm && typeof existingAnchor.pos === "number"
         ? {
@@ -1142,12 +980,24 @@ export class AgentCursorOverlay {
             notePath: existingAnchor.notePath,
             pos: existingAnchor.pos,
             docSnapshot: existingAnchor.docSnapshot,
+            docRef: existingAnchor.docRef,
+            docLength: existingAnchor.docLength,
           }
-        : this.recentTextAnchors.get(caller) ?? null;
+        : recentEntry && recentCm === cm
+          ? {
+              cm: recentCm,
+              notePath: recentEntry.notePath,
+              pos: recentEntry.pos,
+              docSnapshot: recentEntry.docSnapshot,
+              docRef: recentEntry.docRef,
+              docLength: recentEntry.docLength,
+            }
+          : null;
     if (!recent || recent.cm !== cm || !Number.isFinite(recent.pos)) {
       return null;
     }
-    const currentDoc = cm.state?.doc ? cm.state.doc.toString() : null;
+    const currentSnap = readDocSnapshot(cm, recent);
+    const currentDoc = currentSnap.docSnapshot;
     if (currentDoc === null || recent.docSnapshot === null) {
       return null;
     }
@@ -1211,7 +1061,14 @@ export class AgentCursorOverlay {
 
     const cm = docContext.cm !== undefined ? docContext.cm : sameTargetDoc ? prev?.cm ?? null : null;
     const view = docContext.view !== undefined ? docContext.view : sameTargetDoc ? prev?.view ?? null : null;
-    const docSnapshot = cm?.state?.doc ? cm.state.doc.toString() : sameTargetDoc ? prev?.docSnapshot ?? null : null;
+    const snap = cm?.state?.doc
+      ? readDocSnapshot(cm, sameTargetDoc ? prev : null)
+      : {
+          docRef: sameTargetDoc ? prev?.docRef ?? null : null,
+          docSnapshot: sameTargetDoc ? prev?.docSnapshot ?? null : null,
+          docLength: sameTargetDoc ? prev?.docLength ?? null : null,
+        };
+    const docSnapshot = snap.docSnapshot;
     let notePath =
       docContext.notePath !== undefined ? docContext.notePath : sameCm ? prev?.notePath : undefined;
     if (
@@ -1275,6 +1132,8 @@ export class AgentCursorOverlay {
       isVisible,
       pos,
       docSnapshot,
+      docRef: snap.docRef,
+      docLength: snap.docLength,
     };
     this.recordRecentTextAnchor(cursor.caller, cursor.docAnchor);
 
@@ -1364,7 +1223,7 @@ export class AgentCursorOverlay {
     return bounds;
   }
 
-  private hideDisplacedCursor(cursor: CursorInstance): void {
+  private hideDisplacedCursor(cursor: CursorInstance, updateLabels = true): void {
     cursor.paneBounds = null;
     cursor.el.classList.add("is-offscreen");
     const anchor = cursor.docAnchor;
@@ -1377,32 +1236,46 @@ export class AgentCursorOverlay {
       this.clearAgent(cursor.caller);
       return;
     }
-    this.updateLabelOffsets();
+    if (updateLabels) {
+      this.updateLabelOffsets();
+    }
   }
 
   private syncAnchorFromDoc(anchor: DocumentAnchor, change?: NoteDocChange): void {
-    const nextText = anchor.cm?.state?.doc ? anchor.cm.state.doc.toString() : null;
+    const doc = anchor.cm?.state?.doc;
+    const snap = doc
+      ? readDocSnapshot(anchor.cm, anchor)
+      : { docRef: null, docSnapshot: null, docLength: null };
+    const nextText = snap.docSnapshot;
     if (anchor.pos !== null) {
-      const textChanged = nextText === null || anchor.docSnapshot !== nextText;
+      const textChanged =
+        nextText !== null
+          ? anchor.docSnapshot !== nextText
+          : doc !== undefined
+            ? anchor.docRef !== snap.docRef || anchor.docLength !== snap.docLength
+            : true;
       anchor.pos = mapAnchoredPos(
         anchor.docSnapshot,
         nextText,
         anchor.pos,
-        change && textChanged ? change : undefined
+        change && textChanged ? change : undefined,
+        snap.docLength
       );
     }
-    if (nextText !== null) {
+    if (doc) {
+      anchor.docRef = snap.docRef;
+      anchor.docLength = snap.docLength;
       anchor.docSnapshot = nextText;
     }
   }
 
-  private reprojectCursor(cursor: CursorInstance, immediate = false): void {
+  private reprojectCursor(cursor: CursorInstance, immediate = false, updateLabels = true): void {
     const anchor = cursor.docAnchor;
     if (!anchor) {
       return;
     }
     if (!this.isAnchorSameNoteAndConnected(anchor)) {
-      this.hideDisplacedCursor(cursor);
+      this.hideDisplacedCursor(cursor, updateLabels);
       return;
     }
 
@@ -1410,7 +1283,9 @@ export class AgentCursorOverlay {
     if (!paneBounds && this.hasMeasurableHostBox(anchor)) {
       cursor.paneBounds = null;
       cursor.el.classList.add("is-offscreen");
-      this.updateLabelOffsets();
+      if (updateLabels) {
+        this.updateLabelOffsets();
+      }
       return;
     }
 
@@ -1431,7 +1306,9 @@ export class AgentCursorOverlay {
         cursor.paneBounds = paneBounds;
         cursor.el.classList.remove("is-offscreen");
       }
-      this.updateLabelOffsets();
+      if (updateLabels) {
+        this.updateLabelOffsets();
+      }
       return;
     }
     const maxPos = anchor.cm.state?.doc?.length ?? anchor.docSnapshot?.length;
@@ -1445,7 +1322,9 @@ export class AgentCursorOverlay {
     if (!coords || !Number.isFinite(coords.left) || !Number.isFinite(coords.top)) {
       cursor.paneBounds = null;
       cursor.el.classList.add("is-offscreen");
-      this.updateLabelOffsets();
+      if (updateLabels) {
+        this.updateLabelOffsets();
+      }
       return;
     }
 
@@ -1474,25 +1353,96 @@ export class AgentCursorOverlay {
       !cursor.initialized ||
       cursor.el.classList.contains("is-idle");
     this.setCursorMotionTarget(cursor, clampedX, clampedY, snap);
-    this.updateLabelOffsets();
+    if (updateLabels) {
+      this.updateLabelOffsets();
+    }
   }
 
-  private reprojectAll(targetEl?: Element, immediate = false): void {
+  private scheduleReproject(opts?: {
+    targetEl?: Element;
+    mutationTarget?: Element;
+    all?: boolean;
+  }): void {
+    if (this.disposed) {
+      return;
+    }
+    if (opts?.all || (!opts?.targetEl && !opts?.mutationTarget)) {
+      this.pendingReprojectAll = true;
+    } else {
+      if (opts.targetEl) {
+        this.pendingReprojectTargets.add(opts.targetEl);
+      }
+      if (opts.mutationTarget) {
+        this.pendingMutationTargets.add(opts.mutationTarget);
+      }
+    }
+    if (typeof this.win.requestAnimationFrame !== "function") {
+      this.flushScheduledReproject();
+      return;
+    }
+    if (this.reprojectRafId !== null) {
+      return;
+    }
+    let fired = false;
+    let rafId: number | null = null;
+    rafId = this.win.requestAnimationFrame(() => {
+      fired = true;
+      this.reprojectRafId = null;
+      this.flushScheduledReproject();
+    });
+    if (!fired && rafId !== null) {
+      this.reprojectRafId = rafId;
+    }
+  }
+
+  private flushScheduledReproject(): void {
+    const doAll = this.pendingReprojectAll;
+    const targets = Array.from(this.pendingReprojectTargets);
+    const mutTargets = Array.from(this.pendingMutationTargets);
+    this.pendingReprojectAll = false;
+    this.pendingReprojectTargets.clear();
+    this.pendingMutationTargets.clear();
+    if (this.disposed || this.cursors.size === 0) {
+      return;
+    }
+
+    const targetSet = targets.length > 0 ? new Set(targets) : null;
+    const mutTargetSet = mutTargets.length > 0 ? new Set(mutTargets) : null;
+    let updatedAny = false;
+
     for (const cursor of Array.from(this.cursors.values())) {
       const anchor = cursor.docAnchor;
       if (!anchor) {
         continue;
       }
-      if (
-        targetEl &&
-        anchor.cm?.scrollDOM !== targetEl &&
-        anchor.cm?.contentDOM !== targetEl &&
-        anchor.cm?.dom !== targetEl &&
-        anchor.containerEl !== targetEl
-      ) {
+      const curMutTarget = anchor.cm?.contentDOM ?? anchor.cm?.dom ?? anchor.cm?.scrollDOM ?? null;
+      const matchesMut = Boolean(curMutTarget && mutTargetSet?.has(curMutTarget));
+      const matchesTarget =
+        doAll ||
+        Boolean(
+          targetSet &&
+            ((anchor.cm?.scrollDOM && targetSet.has(anchor.cm.scrollDOM)) ||
+              (anchor.cm?.contentDOM && targetSet.has(anchor.cm.contentDOM)) ||
+              (anchor.cm?.dom && targetSet.has(anchor.cm.dom)) ||
+              (anchor.containerEl && targetSet.has(anchor.containerEl)))
+        );
+      if (!matchesMut && !matchesTarget) {
         continue;
       }
-      this.reprojectCursor(cursor, immediate);
+      if (matchesMut) {
+        if (!this.isAnchorSameNoteAndConnected(anchor)) {
+          this.hideDisplacedCursor(cursor, false);
+          updatedAny = true;
+          continue;
+        }
+        this.syncAnchorFromDoc(anchor);
+      }
+      this.reprojectCursor(cursor, true, false);
+      updatedAny = true;
+    }
+
+    if (updatedAny) {
+      this.updateLabelOffsets();
     }
   }
 
@@ -1501,7 +1451,7 @@ export class AgentCursorOverlay {
       return;
     }
     const handler = (): void => {
-      this.reprojectAll(scrollDom, true);
+      this.scheduleReproject({ targetEl: scrollDom });
     };
     scrollDom.addEventListener("scroll", handler, { passive: true });
     this.trackedScrollDoms.set(scrollDom, handler);
@@ -1534,11 +1484,11 @@ export class AgentCursorOverlay {
           return;
         }
         for (const entry of entries) {
-          this.reprojectAll(entry.target, true);
+          this.scheduleReproject({ targetEl: entry.target });
         }
       });
     }
-    const candidates = [anchor.cm?.scrollDOM, anchor.cm?.contentDOM, anchor.cm?.dom, anchor.containerEl];
+    const candidates = [anchor.cm?.scrollDOM, anchor.containerEl];
     for (const el of candidates) {
       if (el && !this.observedResizeEls.has(el)) {
         this.resizeObserver.observe(el);
@@ -1560,22 +1510,7 @@ export class AgentCursorOverlay {
       if (this.disposed) {
         return;
       }
-      for (const cursor of Array.from(this.cursors.values())) {
-        const curAnchor = cursor.docAnchor;
-        if (!curAnchor?.cm) {
-          continue;
-        }
-        const curTarget = curAnchor.cm.contentDOM ?? curAnchor.cm.dom ?? curAnchor.cm.scrollDOM;
-        if (curTarget !== target) {
-          continue;
-        }
-        if (!this.isAnchorSameNoteAndConnected(curAnchor)) {
-          this.hideDisplacedCursor(cursor);
-          continue;
-        }
-        this.syncAnchorFromDoc(curAnchor);
-        this.reprojectCursor(cursor, true);
-      }
+      this.scheduleReproject({ mutationTarget: target });
     });
     observer.observe(target, { childList: true, characterData: true, subtree: true });
     this.mutationObservers.set(target, observer);
@@ -1586,7 +1521,7 @@ export class AgentCursorOverlay {
       return;
     }
     const handler = (): void => {
-      this.reprojectAll(undefined, true);
+      this.scheduleReproject({ all: true });
     };
     this.win.addEventListener("resize", handler, { passive: true });
     this.win.addEventListener("scroll", handler, { passive: true });
@@ -1605,12 +1540,6 @@ export class AgentCursorOverlay {
       if (a.cm?.scrollDOM) {
         activeScrollEls.add(a.cm.scrollDOM);
         activeResizeEls.add(a.cm.scrollDOM);
-      }
-      if (a.cm?.contentDOM) {
-        activeResizeEls.add(a.cm.contentDOM);
-      }
-      if (a.cm?.dom) {
-        activeResizeEls.add(a.cm.dom);
       }
       if (a.containerEl) {
         activeScrollEls.add(a.containerEl);
@@ -1647,6 +1576,13 @@ export class AgentCursorOverlay {
   }
 
   private detachAllListeners(): void {
+    if (this.reprojectRafId !== null) {
+      this.win.cancelAnimationFrame?.(this.reprojectRafId);
+      this.reprojectRafId = null;
+    }
+    this.pendingReprojectAll = false;
+    this.pendingReprojectTargets.clear();
+    this.pendingMutationTargets.clear();
     for (const [scrollDom, handler] of Array.from(this.trackedScrollDoms.entries())) {
       if (typeof scrollDom.removeEventListener === "function") {
         scrollDom.removeEventListener("scroll", handler);

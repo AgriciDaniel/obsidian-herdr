@@ -9,10 +9,30 @@ import { BridgeRpcError } from "./vault-ops";
 export type BridgeMethodDispatcher = (
   method: string,
   params: Record<string, unknown>,
-  caller: string
+  caller: string,
+  /** True once the client that sent this request has disconnected (gave up or timed out). */
+  isAbandoned?: () => boolean
 ) => Promise<unknown>;
 
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
+const MAX_CONCURRENT_CLIENTS = 64;
+const CLIENT_IDLE_TIMEOUT_MS = 60_000;
+
+function isSocketLive(socketPath: string, timeoutMs = 250): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (live: boolean) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(live);
+    };
+    const sock = net.createConnection({ path: socketPath });
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once("connect", () => done(true));
+    sock.once("error", () => done(false));
+  });
+}
 
 function isPathInsideDir(targetPath: string, containerDir: string): boolean {
   const rel = path.relative(path.resolve(containerDir), path.resolve(targetPath));
@@ -28,6 +48,7 @@ export class VaultBridgeServer {
   private readonly kitDir: string | null;
   private readonly authToken: string;
   private readonly dispatcher: BridgeMethodDispatcher;
+  private readonly clientIdleTimeoutMs: number;
   private server: net.Server | null = null;
   private socketIdentity: { dev: number; ino: number } | null = null;
   private readonly activeClients = new Set<net.Socket>();
@@ -38,11 +59,14 @@ export class VaultBridgeServer {
     kitDir?: string;
     authToken?: string;
     dispatcher: BridgeMethodDispatcher;
+    /** Closes sockets that send nothing for this long while no request is running. */
+    clientIdleTimeoutMs?: number;
   }) {
     this.socketPath = options.socketPath;
     this.kitDir = options.kitDir ? path.resolve(options.kitDir) : null;
     this.authToken = options.authToken || crypto.randomBytes(32).toString("hex");
     this.dispatcher = options.dispatcher;
+    this.clientIdleTimeoutMs = options.clientIdleTimeoutMs ?? CLIENT_IDLE_TIMEOUT_MS;
   }
 
   getSocketPath(): string {
@@ -83,6 +107,11 @@ export class VaultBridgeServer {
       }
       if (existingStat) {
         if (existingStat.isSocket()) {
+          if (await isSocketLive(this.socketPath)) {
+            throw new Error(
+              `Another live Vault Control Bridge is already listening on '${this.socketPath}'.`
+            );
+          }
           try {
             fs.unlinkSync(this.socketPath);
           } catch {
@@ -106,6 +135,7 @@ export class VaultBridgeServer {
       const srv = net.createServer((client) => {
         this.handleClient(client);
       });
+      srv.maxConnections = MAX_CONCURRENT_CLIENTS;
 
       const onStartupError = (err: Error) => {
         reject(err);
@@ -173,31 +203,101 @@ export class VaultBridgeServer {
 
   private handleClient(client: net.Socket): void {
     this.activeClients.add(client);
-    let buffer = "";
+    client.setTimeout(this.clientIdleTimeoutMs, () => {
+      client.destroy();
+    });
+    let pending: Buffer = Buffer.alloc(0);
+    const queuedLines: string[] = [];
+    let draining = false;
+    let consecutiveFailures = 0;
+    const MAX_QUEUED_LINES = 64;
+    const MAX_CONSECUTIVE_FAILURES = 5;
+
+    const drainQueue = async (): Promise<void> => {
+      if (draining) {
+        return;
+      }
+      draining = true;
+      // The idle timeout guards silent sockets only. While a request is being
+      // handled the client is waiting on us, so a long ui.batch or a request
+      // queued behind another agent's UI lock must not be cut off at 60 s.
+      client.setTimeout(0);
+      try {
+        while (queuedLines.length > 0 && !client.destroyed) {
+          const line = queuedLines.shift();
+          if (!line) {
+            continue;
+          }
+          const outcome = await this.processLine(client, line);
+          if (outcome === "bad_frame") {
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+              client.end();
+              break;
+            }
+          } else {
+            consecutiveFailures = 0;
+          }
+        }
+      } finally {
+        draining = false;
+        if (!client.destroyed) {
+          client.setTimeout(this.clientIdleTimeoutMs);
+        }
+        if (!client.destroyed && queuedLines.length === 0) {
+          client.resume();
+        }
+      }
+    };
 
     client.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString("utf8");
-      if (buffer.length > MAX_FRAME_BYTES) {
-        this.writeResponse(client, {
-          id: "overflow",
-          ok: false,
-          error: {
-            code: "payload_too_large",
-            message: "Vault Bridge request exceeded 2 MiB frame limit.",
-          },
-        });
-        client.destroy();
+      pending = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+      if (pending.length > MAX_FRAME_BYTES) {
+        const overflowPayload =
+          JSON.stringify({
+            id: "overflow",
+            ok: false,
+            error: {
+              code: "payload_too_large",
+              message: "Vault Bridge request exceeded 2 MiB frame limit.",
+            },
+          }) + "\n";
+        pending = Buffer.alloc(0);
+        if (!client.destroyed && client.writable) {
+          client.end(overflowPayload, "utf8");
+        } else {
+          client.destroy();
+        }
         return;
       }
 
-      let newlineIdx = buffer.indexOf("\n");
+      let newlineIdx = pending.indexOf(0x0a);
       while (newlineIdx !== -1) {
-        const line = buffer.slice(0, newlineIdx).trim();
-        buffer = buffer.slice(newlineIdx + 1);
+        const line = pending.subarray(0, newlineIdx).toString("utf8").trim();
+        pending = pending.subarray(newlineIdx + 1);
         if (line) {
-          void this.processLine(client, line);
+          if (queuedLines.length >= MAX_QUEUED_LINES) {
+            this.writeResponse(client, {
+              id: "overflow",
+              ok: false,
+              error: {
+                code: "too_many_requests",
+                message: "Vault Bridge client exceeded queued request limit.",
+              },
+            });
+            client.end();
+            return;
+          }
+          queuedLines.push(line);
         }
-        newlineIdx = buffer.indexOf("\n");
+        newlineIdx = pending.indexOf(0x0a);
+      }
+
+      if (queuedLines.length > 0) {
+        if (queuedLines.length >= 8) {
+          client.pause();
+        }
+        void drainQueue();
       }
     });
 
@@ -210,18 +310,28 @@ export class VaultBridgeServer {
     });
   }
 
-  private async processLine(client: net.Socket, line: string): Promise<void> {
-    let req: VaultBridgeRequest;
+  private async processLine(client: net.Socket, line: string): Promise<"ok" | "bad_frame"> {
+    let parsed: unknown;
     try {
-      req = JSON.parse(line) as VaultBridgeRequest;
+      parsed = JSON.parse(line);
     } catch {
       this.writeResponse(client, {
         id: "invalid",
         ok: false,
         error: { code: "invalid_json", message: "Request line must be valid JSON." },
       });
-      return;
+      return "bad_frame";
     }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      this.writeResponse(client, {
+        id: "invalid",
+        ok: false,
+        error: { code: "invalid_json", message: "Request payload must be a JSON object." },
+      });
+      return "bad_frame";
+    }
+    const req = parsed as Partial<VaultBridgeRequest>;
 
     const reqId = typeof req.id === "string" ? req.id : "req";
     if (!this.verifyToken(req.token)) {
@@ -230,7 +340,7 @@ export class VaultBridgeServer {
         ok: false,
         error: { code: "unauthorized", message: "Invalid Vault Control Bridge token." },
       });
-      return;
+      return "bad_frame";
     }
 
     if (typeof req.method !== "string" || !req.method.trim()) {
@@ -239,16 +349,26 @@ export class VaultBridgeServer {
         ok: false,
         error: { code: "invalid_request", message: "Missing RPC method name." },
       });
-      return;
+      return "ok";
+    }
+
+    if (req.params !== undefined && (req.params === null || typeof req.params !== "object" || Array.isArray(req.params))) {
+      this.writeResponse(client, {
+        id: reqId,
+        ok: false,
+        error: { code: "invalid_params", message: "Request params must be a JSON object." },
+      });
+      return "ok";
     }
 
     try {
       const result = await this.dispatcher(
         req.method.trim(),
-        req.params && typeof req.params === "object" ? req.params : {},
+        req.params ?? {},
         typeof req.caller === "string" && req.caller.trim()
           ? req.caller.trim().slice(0, 64)
-          : "herdr-agent"
+          : "herdr-agent",
+        () => client.destroyed
       );
       this.writeResponse(client, { id: reqId, ok: true, result });
     } catch (err) {
@@ -260,6 +380,7 @@ export class VaultBridgeServer {
         error: { code, message },
       });
     }
+    return "ok";
   }
 
   private verifyToken(candidate: unknown): boolean {

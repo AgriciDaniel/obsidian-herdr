@@ -4,6 +4,12 @@ import obsidianmd from "eslint-plugin-obsidianmd";
 export default tseslint.config(
   ...obsidianmd.configs.recommended,
   {
+    files: ["src/bridge/client/*.mjs"],
+    rules: {
+      "obsidianmd/prefer-window-timers": "off"
+    }
+  },
+  {
     files: ["src/**/*.ts"],
     rules: {
       "obsidianmd/ui/sentence-case": [

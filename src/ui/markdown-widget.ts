@@ -1,5 +1,6 @@
 import { MarkdownRenderChild, Notice } from "obsidian";
 import type { HerdrCoordinator } from "../services/herdr-coordinator";
+import { confirmAction } from "./modals";
 
 interface ParsedHerdrBlock {
   session?: string;
@@ -147,13 +148,24 @@ export class HerdrCodeblockWidget extends MarkdownRenderChild {
       const runBtn = actions.createEl("button", {
         text: `Prompt ${cfg.agent}`,
         cls: "herdr-btn-compact",
+        attr: { type: "button" },
       });
       runBtn.disabled = !state.serverRunning;
       runBtn.addEventListener("click", () => {
-        void this.coordinator.socket
-          .promptAgent(cfg.agent as string, cfg.prompt as string)
-          .then(() => {
-            new Notice(`Sent playbook prompt to '${cfg.agent}'.`);
+        const agentName = cfg.agent as string;
+        const promptText = cfg.prompt as string;
+        void confirmAction(this.coordinator.app, {
+          title: `Send prompt to '${agentName}'?`,
+          body: `Send the following prompt from this note to live agent '${agentName}':\n\n${promptText}`,
+          confirmText: "Send prompt",
+        })
+          .then((ok) => {
+            if (!ok) {
+              return;
+            }
+            return this.coordinator.socket.promptAgent(agentName, promptText).then(() => {
+              new Notice(`Sent playbook prompt to '${agentName}'.`);
+            });
           })
           .catch((err: unknown) => {
             new Notice(err instanceof Error ? err.message : String(err));
@@ -165,29 +177,45 @@ export class HerdrCodeblockWidget extends MarkdownRenderChild {
       const cmdBtn = actions.createEl("button", {
         text: "Run command",
         cls: "herdr-btn-compact",
+        attr: { type: "button" },
       });
       cmdBtn.addEventListener("click", () => {
         const commandText = cfg.command as string;
+        const targetSession = cfg.session?.trim() || state.activeSessionName;
+        const matchesActiveSession =
+          !cfg.session?.trim() || cfg.session.trim() === state.activeSessionName;
         const targetPaneId =
-          state.serverRunning && snap
+          matchesActiveSession && state.serverRunning && snap
             ? snap.focused_pane_id || snap.panes[0]?.pane_id
             : undefined;
-        if (targetPaneId) {
-          void this.coordinator.socket
-            .sendPaneText(targetPaneId, `${commandText}\n`)
-            .then(() => {
-              new Notice(`Sent command to Herdr pane '${targetPaneId}'.`);
-            })
-            .catch((err: unknown) => {
-              new Notice(err instanceof Error ? err.message : String(err));
-            });
-          return;
-        }
-        if (this.runInTerminal) {
-          void this.runInTerminal(commandText, cfg.session);
-        } else {
-          void this.openTerminal(cfg.session);
-        }
+        const targetDesc = targetPaneId
+          ? `pane '${targetPaneId}' in session '${targetSession}'`
+          : `a new terminal in session '${targetSession}'`;
+        void confirmAction(this.coordinator.app, {
+          title: "Run command from note?",
+          body: `Execute the following command in ${targetDesc}:\n\n${commandText}`,
+          confirmText: "Run command",
+          danger: true,
+        })
+          .then((ok) => {
+            if (!ok) {
+              return;
+            }
+            if (targetPaneId) {
+              return this.coordinator.socket
+                .sendPaneText(targetPaneId, `${commandText}\n`)
+                .then(() => {
+                  new Notice(`Sent command to Herdr pane '${targetPaneId}'.`);
+                });
+            }
+            if (this.runInTerminal) {
+              return this.runInTerminal(commandText, cfg.session);
+            }
+            return this.openTerminal(cfg.session);
+          })
+          .catch((err: unknown) => {
+            new Notice(err instanceof Error ? err.message : String(err));
+          });
       });
     }
   }

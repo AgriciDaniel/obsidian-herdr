@@ -180,7 +180,10 @@ export function getDeepActiveElement(doc: Document | null | undefined): Element 
     }
     const frameDoc = getIframeDocumentSafe(el);
     const frameNext = frameDoc?.activeElement ?? null;
-    if (frameNext && frameNext !== el && frameNext !== frameDoc?.body) {
+    const skipFrameBody =
+      frameNext === frameDoc?.body &&
+      !(frameDoc?.body as { isContentEditable?: boolean } | null | undefined)?.isContentEditable;
+    if (frameNext && frameNext !== el && !skipFrameBody) {
       el = frameNext;
       continue;
     }
@@ -333,18 +336,10 @@ export function extractBasesRowCandidates(el: Element | null | undefined): Bases
   return out;
 }
 
-/**
- * Resolves an unambiguous note file path from a Bases cell or row element using
- * caller-supplied path/linkpath resolvers, returning null when missing or ambiguous.
- */
-export function resolveBasesRowFilePath(
-  el: Element | null | undefined,
+function resolveBasesCandidates(
+  candidates: readonly BasesRowCandidate[],
   options?: BasesRowPathResolverOptions
-): string | null {
-  const candidates = extractBasesRowCandidates(el);
-  if (candidates.length === 0) {
-    return null;
-  }
+): Set<string> {
   const resolved = new Set<string>();
   for (const candidate of candidates) {
     let target: string | null | undefined = null;
@@ -359,6 +354,37 @@ export function resolveBasesRowFilePath(
       resolved.add(target);
     }
   }
+  return resolved;
+}
+
+/**
+ * Resolves an unambiguous note file path from a Bases cell or row element using
+ * caller-supplied path/linkpath resolvers, returning null when missing or ambiguous.
+ */
+export function resolveBasesRowFilePath(
+  el: Element | null | undefined,
+  options?: BasesRowPathResolverOptions
+): string | null {
+  const row = resolveBasesRowElement(el);
+  if (!row) {
+    return null;
+  }
+  const explicitNameCell = queryAllSafe(row, '.bases-td[data-property="file.name"]')[0] ?? null;
+  if (explicitNameCell) {
+    const primarySeen = new Set<string>();
+    const primaryOut: BasesRowCandidate[] = [];
+    const primaryNodes = [explicitNameCell, ...queryAllSafe(explicitNameCell, BASES_LINK_SELECTOR)];
+    collectRowCandidatesFromNodes(primaryNodes, primaryOut, primarySeen);
+    const primaryResolved = resolveBasesCandidates(primaryOut, options);
+    if (primaryResolved.size === 1) {
+      return [...primaryResolved][0];
+    }
+  }
+  const candidates = extractBasesRowCandidates(el);
+  if (candidates.length === 0) {
+    return null;
+  }
+  const resolved = resolveBasesCandidates(candidates, options);
   return resolved.size === 1 ? [...resolved][0] : null;
 }
 
@@ -432,7 +458,7 @@ export function cmOwnsElementStrict(
   el: Element | null | undefined
 ): boolean {
   if (!el) {
-    return true;
+    return false;
   }
   const root = view.contentDOM ?? view.dom ?? null;
   if (!root) {
@@ -633,14 +659,22 @@ function dispatchSimpleEvent(
   win: Window,
   ctorName: "Event" | "InputEvent" | "FocusEvent" | "KeyboardEvent",
   type: string,
-  init: Record<string, unknown>
+  init: Record<string, unknown>,
+  fallbackWin?: Window
 ): void {
   const target = el as unknown as { dispatchEvent?: (event: unknown) => boolean };
   if (typeof target.dispatchEvent !== "function") {
     return;
   }
   const winRecord = win as unknown as Record<string, unknown>;
-  const Ctor = winRecord[ctorName] as (new (t: string, i: Record<string, unknown>) => unknown) | undefined;
+  const fallbackRecord = fallbackWin as unknown as Record<string, unknown> | undefined;
+  const Ctor = (
+    typeof winRecord[ctorName] === "function"
+      ? winRecord[ctorName]
+      : fallbackRecord && typeof fallbackRecord[ctorName] === "function"
+        ? fallbackRecord[ctorName]
+        : undefined
+  ) as (new (t: string, i: Record<string, unknown>) => unknown) | undefined;
   const fallbackEvent = { type, ...init };
   const event = typeof Ctor === "function" ? new Ctor(type, init) : fallbackEvent;
   target.dispatchEvent(event);
@@ -668,6 +702,11 @@ export function commitNestedEditor(
     kind === "canvas-card" && matchesSafe(el, "iframe")
       ? (findCanvasCardEditorTarget(el) ?? el)
       : el;
+  const eventWin =
+    ((targetEl as { ownerDocument?: Document | null }).ownerDocument?.defaultView as
+      | Window
+      | null
+      | undefined) ?? win;
 
   let sawBlur = false;
   let sawFocusOut = false;
@@ -686,12 +725,12 @@ export function commitNestedEditor(
 
   let blurred = false;
   try {
-    dispatchSimpleEvent(targetEl, win, "InputEvent", "input", {
+    dispatchSimpleEvent(targetEl, eventWin, "InputEvent", "input", {
       bubbles: true,
       inputType: "insertText",
       data: options?.text ?? null,
-    });
-    dispatchSimpleEvent(targetEl, win, "Event", "change", { bubbles: true });
+    }, win);
+    dispatchSimpleEvent(targetEl, eventWin, "Event", "change", { bubbles: true }, win);
 
     if (options?.triggerEnter) {
       const enterInit = {
@@ -702,8 +741,8 @@ export function commitNestedEditor(
         bubbles: true,
         cancelable: true,
       };
-      dispatchSimpleEvent(targetEl, win, "KeyboardEvent", "keydown", enterInit);
-      dispatchSimpleEvent(targetEl, win, "KeyboardEvent", "keyup", enterInit);
+      dispatchSimpleEvent(targetEl, eventWin, "KeyboardEvent", "keydown", enterInit, win);
+      dispatchSimpleEvent(targetEl, eventWin, "KeyboardEvent", "keyup", enterInit, win);
     }
 
     const shouldBlur = options?.triggerBlur !== false;
@@ -717,10 +756,10 @@ export function commitNestedEditor(
         }
       }
       if (!sawFocusOut) {
-        dispatchSimpleEvent(targetEl, win, "FocusEvent", "focusout", { bubbles: true });
+        dispatchSimpleEvent(targetEl, eventWin, "FocusEvent", "focusout", { bubbles: true }, win);
       }
       if (!sawBlur) {
-        dispatchSimpleEvent(targetEl, win, "FocusEvent", "blur", { bubbles: false });
+        dispatchSimpleEvent(targetEl, eventWin, "FocusEvent", "blur", { bubbles: false }, win);
       }
       blurred = true;
     } else {

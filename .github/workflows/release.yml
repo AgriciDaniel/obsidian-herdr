@@ -18,8 +18,32 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify release tag and version parity
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const tag = process.env.GITHUB_REF_NAME || "";
+            if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(tag)) {
+              throw new Error("Release tag must be bare semver without v prefix, got: " + tag);
+            }
+            const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const versions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
+            if (manifest.version !== tag) throw new Error("manifest.json version mismatch: " + manifest.version + " !== " + tag);
+            if (pkg.version !== tag) throw new Error("package.json version mismatch: " + pkg.version + " !== " + tag);
+            if (versions[tag] !== manifest.minAppVersion) {
+              throw new Error("versions.json missing or mismatched minAppVersion for " + tag);
+            }
+            console.log("Release version parity verified:", tag, "minAppVersion:", manifest.minAppVersion);
+          '
       - run: npm ci --no-audit --no-fund
-      - run: npm run check && npm run lint && npm run build && npm test
+      - run: npm run check && npm run lint && npm run build
+      - run: python3 -m py_compile src/terminal/drivers/pty-bridge.py src/bridge/client/obs-herdr-core.py
+      - run: node --check src/bridge/client/obs-herdr-core.mjs
+      - run: npm test
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:

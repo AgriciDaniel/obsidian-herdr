@@ -363,13 +363,14 @@ describe("Windows terminal: only an absolute .exe is started, through a job, wit
   });
 
   it("the driver starts the checked .exe by name with no search, suspended inside a kill-on-close job", () => {
-    const src = fs.readFileSync("src/terminal/pty-host.ts", "utf8");
-    assert.match(src, /CreateProcessW\(application, new StringBuilder\(commandLine\)/);
-    assert.match(src, /0x00080000 \| 0x00000004/, "CREATE_SUSPENDED until the child is in the job");
-    assert.match(src, /LimitFlags = 0x00002000 \| 0x00001000;/, "kill on job close, children of the child break away");
-    assert.match(src, /AssignProcessToJobObject\(job, process\.hProcess\);\s*ResumeThread\(process\.hThread\);/);
-    assert.match(src, /\\\\d\{1,5\}\)\(\?!\\\\d\)/, "at most five digits reach int.Parse");
-    assert.match(src, /HERDR_OBS_CONPTY_APP: resolved\.application/);
-    assert.match(src, /Run\(\$\{this\.cols\},\$\{this\.rows\},\$a,\$c\)/);
+    const csSrc = fs.readFileSync("src/terminal/drivers/conpty-bridge.cs", "utf8");
+    const hostSrc = fs.readFileSync("src/terminal/pty-host.ts", "utf8");
+    assert.match(csSrc, /CreateProcessW\(application, new StringBuilder\(commandLine\)/);
+    assert.match(csSrc, /0x00080000 \| 0x00000004/, "CREATE_SUSPENDED until the child is in the job");
+    assert.match(csSrc, /LimitFlags = 0x00002000 \| 0x00001000;/, "kill on job close, children of the child break away");
+    assert.match(csSrc, /AssignProcessToJobObject\(job, process\.hProcess\);\s*ResumeThread\(process\.hThread\);/);
+    assert.match(csSrc, /\\\\d\{1,5\}\)\(\?!\\\\d\)/, "at most five digits reach int.Parse");
+    assert.match(hostSrc, /HERDR_OBS_CONPTY_APP: resolved\.application/);
+    assert.match(hostSrc, /Run\(\$\{this\.cols\},\$\{this\.rows\},\$a,\$c\)/);
   });
 });

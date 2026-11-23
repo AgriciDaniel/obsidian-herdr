@@ -286,3 +286,109 @@ Not verified live: the Herdr protocol mismatch warning (Herdr matches), the Wind
 | `THIRD_PARTY_NOTICES.md` | `1752` | `b9a795457258171354ba15ac8e9a6a78458b9d2ebb755c5612828d1a2286d65c` |
 | `README.md` | `9925` | `a6f0137282cc5b5eddb9534bf2a9210edc2d77ddf34b0a64ed641e6f4de81d14` |
 | `CHANGELOG.md` | `7707` | `64ff781a5097df3590451d0173a5a850a37e982654c7f143b4bd37f3625498a1` |
+
+
+### 5. Full 6-Phase Optimization, Security, Architecture & Interactive Halftone Mission Control Pass (2026-11-23)
+
+Executed all 6 planned phases on Linux (`7.2.7-200.fc44.x86_64`, Node.js `v24`, TypeScript `5.8.3`, ESLint `eslint-plugin-obsidianmd`, `herdr 0.8.2`) with zero remote pushes and zero live vault overwrites (awaiting owner approval before local plugin install or commit).
+
+#### Automated Gates & Verification Output
+
+```text
+$ npm run check && npm run lint && npm run build && python3 -m py_compile src/terminal/drivers/pty-bridge.py src/bridge/client/obs-herdr-core.py && node --check src/bridge/client/obs-herdr-core.mjs && timeout 180 npm test
+- tsc --noEmit: exit 0 (0 errors)
+- eslint src --max-warnings=0: exit 0 (0 errors, 0 warnings)
+- esbuild.config.mjs build gates: exit 0
+  - 0 raw HTML sinks in main.js
+  - main.js 1,043,496 bytes (< 2 MiB limit)
+  - 0 em/en dashes in main.js and styles.css
+  - Apache-2.0 SPDX header verified on all src/control/*.ts files
+  - 0 hardcoded #hex colors and 0 !important declarations in styles.css
+- python3 -m py_compile src/terminal/drivers/pty-bridge.py src/bridge/client/obs-herdr-core.py: exit 0
+- node --check src/bridge/client/obs-herdr-core.mjs: exit 0
+- timeout 180 npm test: 154/154 pass across 20 suites in 16,499 ms (0 failures, 0 skipped)
+```
+
+#### Verified Artifact Sizes & SHA-256 Digests
+
+| Artifact | Bytes | SHA-256 |
+|---|---|---|
+| `main.js` | `1,043,496` | `48b0dbf101a7f37f92a09be9580735cf18b1f85a3d213c049f5abd1593e3292b` |
+| `manifest.json` | `374` | `d8fee1b6c9b906da72060a0d6e8cdc600f9b87e5da8bff7f284b75732059e6f7` |
+| `styles.css` | `38,324` | `9dc04459f00a0b0e7aabf889e88c50333c3f003be3a14f95104fe5714ed43a26` |
+
+#### Scope & Verification Honesty
+
+- **Verified locally**: All 154 automated unit, security, parity, UI view, and live isolated `herdr 0.8.2` daemon tests passed on Linux.
+- **Not yet run**: Live Obsidian desktop reload with this build (held for owner approval before copying into `.obsidian/plugins/herdr-obs/`) and physical macOS/Windows desktop execution (covered by unit tests and the new 3-OS `.github/workflows/ci.yml` matrix).
+
+### 6. Live Multi-Agent Audit & Post-Install Hardening Pass (2026-11-23)
+
+After installing the Phase 1-6 build into `.obsidian/plugins/herdr-obs/` and reloading live Flatpak Obsidian, ran a live multi-agent orchestration inside Herdr (`vault-obsidian-herdr` split panes, split `Live Audit Board.md` note, concurrent `obs-herdr ui insert-line` edits with live floating agent cursor pills, `obs-herdr mcp` 27-tool protocol checks, and live security probes) alongside two fresh-context independent code/UI audit subagents.
+
+#### Key Defects Caught & Fixed
+
+- **Vault tab activity row overlap**: Overrode Obsidian's default `button` `white-space: nowrap` and centered `inline-flex` on `.herdr-mc-log-link` (`display: block; flex: 1 1 0%; white-space: normal; text-align: left`) and `.herdr-note-link-btn`.
+- **Protected-area coverage & inspect oracle**: Added Mission Control (`[data-type="herdr-view"]`, `.herdr-dashboard-pane`), Bases board (`.herdr-bases-board`), and codeblock widgets (`.herdr-embed-card`) to `UiSafetyGuard`; closed the text-extraction oracle in `ui.inspect` and `ui.wait_for` against protected and password elements; blocked `app:delete-file`, `app:toggle-dev-tools`, `window:toggle-dev-tools`, and `app:show-debug-info` in `policy.ts`.
+- **Bridge, path-guard, and CLI/MCP parity**: Bounded per-client NDJSON queue and added consecutive auth-failure disconnects in `VaultBridgeServer`; validated POSIX runtime dir ownership/non-symlink state and converted `pruneStaleRuntimeKits` to `fs.promises`; forwarded `--offset`, `--offset-line`, `--max-lines`, `--max-chars`, `--limit`, and `--label` across both `obs-herdr-core.mjs` and `obs-herdr-core.py`; guarded MCP stdio against non-object JSON lines; fixed `ui key` for `+`/`Mod++`; hardened `obsidian://herdr` URI validation + confirmation modals for codeblock prompts, layout apply, and Command Palette stop session; locked `editor.replace_selection`/`editor.insert_at_cursor` with `withPathLock` and source-mode checks; blocked Windows drive-relative paths (`C:note.md`) and symlink escapes during `vault.search`.
+- **Mission Control accessibility, focus, and CSS polish**: Eliminated nested interactive `<button>` inside spatial pane board (now `<div role="group">` with sibling `.herdr-mc-pane-select` and real `<button class="herdr-mc-dock-btn">` controls); generalized in-place live updates and `data-herdr-focus-id` focus restoration so roving keyboard tabs/radios and Peek scroll position survive refreshes; fixed `submitPrompt` stuck-disabled closure race, Attention Banner Peek tab switch, keyboard-anchored `Menu` placement, CSS cascade order on hover/selected spatial panes and agent status stripes, narrow-pane overflow, light/dark contrast, and `HerdrTerminalView` per-agent status scoping.
+
+#### Final Post-Audit Verification (`exit 0`)
+
+- `npm run check`: 0 errors
+- `npm run lint` (`eslint src --max-warnings=0`): 0 errors, 0 warnings
+- `npm run build`: PASS (`main.js` `1,056,037` bytes, 0 raw HTML sinks, 0 em/en dashes, Apache-2.0 SPDX verified on all `src/control/*.ts`, 0 `#hex` and 0 `!important` in `styles.css`)
+- Python & Node client syntax checks (`py_compile`, `node --check`): PASS
+- `timeout 180 npm test`: **155/155 pass across 20 suites in 16,512 ms**
+- Installed into `.obsidian/plugins/herdr-obs/` with matching SHA-256:
+  - `main.js`: `b6886423d89655dac9f2d918e536e59542c3c51a23a9315a89e5fcd4f3557d3c`
+  - `styles.css`: `6c1d9ec38e627d06d2655813f05adcb5917d0cedc5bd1e86f4af28a90a7a6761`
+  - `manifest.json`: `d8fee1b6c9b906da72060a0d6e8cdc600f9b87e5da8bff7f284b75732059e6f7`
+
+### 7. Release review and fixes (2026-11-23, before the public 0.3.2 release)
+
+An independent code review of the uncommitted pass and a check against the Obsidian plugin guidelines and developer policies, then fixes:
+
+- Plugin guidelines: UI control no longer reads the global `window.app` or `workspace.activeLeaf`. The coordinator passes the plugin's `this.app` (`getApp`), and the active leaf comes from `workspace.getMostRecentLeaf()` or the leaf's `mod-active` state.
+- Bridge: the 60 second idle timeout is paused while a request is in flight, so long `ui.batch` calls and requests queued behind the UI lock are not cut off.
+- `vault.read_note`: returns the whole note unless `offsetLine`, `maxLines` or `maxChars` is given (the pass had a silent 32,000 character default); `null` or empty limits count as absent; line windows keep CRLF and LF endings. The MCP tool description says so.
+- Default listing sizes restored to the 0.2.x values (`vault.list_files` 250, `commands.list` 200); paging stays available.
+- Terminal: text queued while a terminal starts is dropped when that start fails, instead of being replayed into a later session.
+- Smaller: settings changes rewrite the runtime kit only when UI control is switched; a missing Herdr binary is cached for 5 seconds instead of 60; `vault.search` checks symlinks once per folder plus one `lstat` per file; a failing bridge self-heal is logged once instead of every 8 seconds.
+- README: lists Python 3, Node.js and Windows PowerShell use, and the real runtime folder on each OS.
+- Secrets: gitleaks over the full history, the shippable tree and `main.js` found only test fixtures and minified names; no value from the maintainer's key file appears in `main` history, the shippable tree or `main.js`.
+
+Gates (Linux, exit 0): `npm run check`, `npm run lint` (0 warnings), `npm run build`, `py_compile`, `node --check`, `timeout 180 npm test` 155/155. A clean copy of `git ls-files -co --exclude-standard` with Herdr absent from PATH also passed 155/155.
+
+| Artifact | Bytes | SHA-256 |
+|---|---|---|
+| `main.js` | `1,057,187` | `a7bfd46128865351a66d7a03996eddeea797daeade8cf23259732c3c8fff1d4e` |
+| `manifest.json` | `374` | `d8fee1b6c9b906da72060a0d6e8cdc600f9b87e5da8bff7f284b75732059e6f7` |
+| `styles.css` | `41,360` | `6c1d9ec38e627d06d2655813f05adcb5917d0cedc5bd1e86f4af28a90a7a6761` |
+
+Superseded by section 8 (a second audit found more before release).
+
+### 8. Second pre-release audit and fixes (2026-11-23 and 24)
+
+Three independent reviews (security, correctness since 0.2.3, release package) of the full change set since 0.2.3, then fixes:
+
+- Security: agents cannot run commands of plugins that run code, shell commands or other programs (matched by plugin id: `templater-obsidian`, `obsidian-shellcommands`, `quickadd`, `execute-code`, `open-with-default-app`, `terminal`, `cmdr`, `customjs`, `runjs`, `js-engine`, `python-scripter`, `user-plugins`, `herdr-obs`). `ui.screenshot` paints over Herdr terminals, Mission Control and the Settings window (the areas `ui.inspect` redacts) and refuses the capture if it cannot.
+- Upgrade: on Windows the bridge reuses the 0.2.x token from `%TEMP%\<digest>\connection.json`, so MCP configs copied under 0.2.x keep working (pipe name unchanged). Not on Linux or macOS, where the old fallback was the shared `/tmp`.
+- UI queue: a queued UI action whose client disconnected before its turn is skipped (`ui_request_abandoned`); UI methods default to a 5 minute client timeout.
+- Bridge: retries after a failed start or repair and clears a stale repair error.
+- Defaults: backlinks, graph neighbours and tag lists return everything unless `limit` is given (as in 0.2.x); `obs-herdr command list` forwards `--limit` and `--offset` (Node and Python).
+- Herdr 0.9.5: protocol 22 accepted next to 20; the event stream reconnects on `events_lost`.
+- Release package: `.gitignore` keeps only project folders and files at the root (this repo is also a demo vault); `.gitattributes` keeps LF everywhere; unused `tsconfig.test.json` removed; tests made portable to macOS (short socket paths) and Windows (python, pipes, node for the `.cmd` wrapper, POSIX-only cases skipped visibly).
+- Docs: CHANGELOG without private project references, README permission names, protected areas, MCP button name, Herdr and Obsidian versions tested.
+
+Gates (Linux, exit 0): check, lint (0 warnings), build, `py_compile`, `node --check`, `timeout 180 npm test` 163/163 three runs in a row (about 17 s each, no hang); with a 58 character TMPDIR 163/163. A clean copy of `git ls-files -co --exclude-standard` (112 files) builds the same `main.js` and passes 163/163. gitleaks on that copy: no leaks; no value from the maintainer's key file in it or in `main.js`.
+
+Live in Obsidian 1.15.1 with Herdr 0.9.5 (session restarted onto 0.9.5 by the maintainer): Mission Control finds the session, subscribes to events, shows five agents with live status, no protocol warning; Peek reads a pane; `command list --limit 3 --offset 2` pages in both clients; `templater-obsidian:replace-in-file-templater` is refused with `command_blocked`; a real screenshot hid 6 protected areas with no visible flicker; `read_note` returns a 50 KB note whole, CRLF windows kept.
+
+| Artifact | Bytes | SHA-256 |
+|---|---|---|
+| `main.js` | `1,061,184` | `2b946a439374939f2507659bf22200fe2ac7ccb69d055ae7d53d398f67d4389b` |
+| `manifest.json` | `374` | `d8fee1b6c9b906da72060a0d6e8cdc600f9b87e5da8bff7f284b75732059e6f7` |
+| `styles.css` | `41,360` | `6c1d9ec38e627d06d2655813f05adcb5917d0cedc5bd1e86f4af28a90a7a6761` |
+
+Not verified: macOS and Windows desktop runs (left to the CI matrix), the Windows `.cmd` wrapper itself, and the 0.2.x to 0.3.2 Windows upgrade on a real Windows machine.

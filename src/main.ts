@@ -23,6 +23,7 @@ import {
   DispatchNoteModal,
   SelectProfileModal,
   SpawnAgentModal,
+  confirmAction,
 } from "./ui/modals";
 import { HerdrSettingTab, type HerdrSettingsHost } from "./ui/settings-tab";
 import {
@@ -100,11 +101,38 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
     });
 
     this.registerObsidianProtocolHandler("herdr", (params) => {
+      const safeId = (raw: unknown): string | undefined => {
+        if (typeof raw !== "string") return undefined;
+        const trimmed = raw.trim();
+        if (!trimmed) return undefined;
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}$/.test(trimmed)) {
+          return undefined;
+        }
+        return trimmed;
+      };
       const view = params.view || "";
       if (view === "terminal") {
-        void this.activateTerminalView({
-          sessionName: params.session || undefined,
-          agentTarget: params.agent || undefined,
+        const sessionName = safeId(params.session);
+        const agentTarget = safeId(params.agent);
+        if ((params.session && !sessionName) || (params.agent && !agentTarget)) {
+          new Notice("Ignored protocol link with invalid session or agent identifier.");
+          return;
+        }
+        const desc = agentTarget
+          ? `agent '${agentTarget}'${sessionName ? ` in session '${sessionName}'` : ""}`
+          : sessionName
+            ? `session '${sessionName}'`
+            : "default vault terminal";
+        void confirmAction(this.app, {
+          title: "Open Herdr terminal from link?",
+          body: `An external protocol link requested opening ${desc}.`,
+          confirmText: "Open terminal",
+        }).then((confirmed) => {
+          if (!confirmed) return;
+          void this.activateTerminalView({
+            sessionName,
+            agentTarget,
+          });
         });
         return;
       }
@@ -328,10 +356,19 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
       name: "Stop persistent session for this vault",
       callback: () => {
         const sessionName = this.coordinator.getActiveSessionName();
-        void this.coordinator
-          .stopVaultHerdrSession()
-          .then(() => {
-            new Notice(`Stopped Herdr session '${sessionName}'.`);
+        void confirmAction(this.app, {
+          title: `Stop session '${sessionName}'?`,
+          body: `All running agents and terminals in '${sessionName}' will stop immediately.`,
+          confirmText: "Stop session",
+          danger: true,
+        })
+          .then((confirmed) => {
+            if (!confirmed) {
+              return;
+            }
+            return this.coordinator.stopVaultHerdrSession().then(() => {
+              new Notice(`Stopped Herdr session '${sessionName}'.`);
+            });
           })
           .catch((err: unknown) => {
             new Notice(err instanceof Error ? err.message : String(err));
@@ -447,7 +484,9 @@ export default class HerdrPlugin extends Plugin implements HerdrSettingsHost {
               )
               .setIcon("cpu")
               .onClick(() => {
-                new DispatchNoteModal(this.app, this.coordinator).open();
+                new DispatchNoteModal(this.app, this.coordinator, {
+                  selectionOnly: editor.somethingSelected(),
+                }).open();
               });
           });
         }

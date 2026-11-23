@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 export class VaultPathGuardError extends Error {
@@ -35,10 +36,10 @@ export function guardVaultRelativePath(
   if (!trimmed) {
     throw new VaultPathGuardError("invalid_path", "Vault path must not be empty.");
   }
-  if (trimmed.startsWith("/") || /^[A-Za-z]:\//.test(trimmed)) {
+  if (trimmed.startsWith("/") || /^[A-Za-z]:/.test(trimmed)) {
     throw new VaultPathGuardError(
       "absolute_path_forbidden",
-      "Use a vault-relative path rather than an absolute filesystem path."
+      "Use a vault-relative path rather than an absolute or drive-prefixed filesystem path."
     );
   }
 
@@ -59,17 +60,21 @@ export function guardVaultRelativePath(
   const configDir = options.configDirName
     ? options.configDirName.replace(/^\/+|\/+$/g, "")
     : "";
-  const firstSeg = segments[0];
 
-  if (
-    (configDir && firstSeg === configDir) ||
-    firstSeg.startsWith(".")
-  ) {
-    if (options.isWrite || !options.allowHiddenRead || firstSeg === ".git") {
+  for (const seg of segments) {
+    if (seg === ".git") {
       throw new VaultPathGuardError(
         "protected_directory",
-        `Access to protected directory '${firstSeg}' is blocked by Vault Control Bridge policy.`
+        "Access to protected directory '.git' is blocked by Vault Control Bridge policy."
       );
+    }
+    if ((configDir && seg === configDir) || seg.startsWith(".")) {
+      if (options.isWrite || !options.allowHiddenRead) {
+        throw new VaultPathGuardError(
+          "protected_directory",
+          `Access to protected directory '${seg}' is blocked by Vault Control Bridge policy.`
+        );
+      }
     }
   }
 
@@ -81,6 +86,69 @@ export function guardVaultRelativePath(
   }
 
   return normalized;
+}
+
+/**
+ * Verifies that no existing path component inside vaultRoot is a symlink pointing
+ * outside vaultRoot (blocks symlink escapes on both reads and writes).
+ */
+export function assertNoSymlinkEscape(vaultRoot: string, vaultRelPath: string): void {
+  if (!vaultRoot || !vaultRelPath) {
+    return;
+  }
+  let realVaultRoot: string;
+  try {
+    realVaultRoot = fs.realpathSync(vaultRoot);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") {
+      // Allow unit tests using synthetic non-existent vault paths without failing reads.
+      return;
+    }
+    throw new VaultPathGuardError(
+      "symlink_escape_forbidden",
+      `Could not verify vault root boundary for '${vaultRelPath}'.`
+    );
+  }
+
+  const parts = vaultRelPath.replace(/\\/g, "/").split("/").filter(Boolean);
+  let cursor = realVaultRoot;
+  for (const part of parts) {
+    cursor = path.join(cursor, part);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(cursor);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        // Non-existent suffix (e.g. file/folder about to be created) cannot be a symlink.
+        break;
+      }
+      throw new VaultPathGuardError(
+        "symlink_escape_forbidden",
+        `Could not inspect path component inside vault path '${vaultRelPath}'.`
+      );
+    }
+    if (st.isSymbolicLink()) {
+      let targetReal: string;
+      try {
+        targetReal = fs.realpathSync(cursor);
+      } catch {
+        throw new VaultPathGuardError(
+          "symlink_escape_forbidden",
+          `Refused broken or unreadable symlink inside vault path '${vaultRelPath}'.`
+        );
+      }
+      const rel = path.relative(realVaultRoot, targetReal);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        throw new VaultPathGuardError(
+          "symlink_escape_forbidden",
+          `Refused symlink escaping vault boundary at '${vaultRelPath}'.`
+        );
+      }
+      cursor = targetReal;
+    }
+  }
 }
 
 /**
@@ -123,11 +191,14 @@ export function resolveTerminalPathInsideVault(
   }
 
   const posixRel = rel.split(path.sep).join("/");
-  const topSeg = posixRel.split("/")[0] || "";
-  if (
-    (configDirName && topSeg === configDirName.replace(/^\/+|\/+$/g, "")) ||
-    topSeg.startsWith(".")
-  ) {
+  const cfgDir = configDirName ? configDirName.replace(/^\/+|\/+$/g, "") : "";
+  const segs = posixRel.split("/").filter(Boolean);
+  if (segs.some((seg) => (cfgDir && seg === cfgDir) || seg.startsWith("."))) {
+    return null;
+  }
+  try {
+    assertNoSymlinkEscape(normalizedVault, posixRel);
+  } catch {
     return null;
   }
 

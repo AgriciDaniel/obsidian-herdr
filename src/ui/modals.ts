@@ -1,10 +1,80 @@
-import { type App, Modal, Notice, Setting } from "obsidian";
-import type {
-  SplitDirection,
-  TerminalProfile,
-  TerminalProfileKind,
+import { type App, FuzzySuggestModal, MarkdownView, Modal, Notice, Setting } from "obsidian";
+import {
+  SUPPORTED_AGENT_RUNTIMES,
+  type SplitDirection,
+  type TerminalProfile,
+  type TerminalProfileKind,
 } from "../domain/types";
 import type { HerdrCoordinator } from "../services/herdr-coordinator";
+
+function tokenizeShellArgs(raw: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let inToken = false;
+  let quote: "'" | '"' | null = null;
+
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+      } else if (ch === "\\" && i + 1 < raw.length && (raw[i + 1] === '"' || raw[i + 1] === "\\")) {
+        i += 1;
+        current += raw[i];
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inToken) {
+        args.push(current);
+        current = "";
+        inToken = false;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inToken = true;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < raw.length) {
+      i += 1;
+      current += raw[i];
+      inToken = true;
+      continue;
+    }
+    current += ch;
+    inToken = true;
+  }
+
+  if (inToken) {
+    args.push(current);
+  }
+  return args;
+}
+
+function formatShellArgs(args?: string[]): string {
+  if (!args || args.length === 0) {
+    return "";
+  }
+  return args
+    .map((arg) =>
+      arg === "" || /[\s"'\\]/.test(arg)
+        ? `"${arg.replace(/([\\"])/g, "\\$1")}"`
+        : arg
+    )
+    .join(" ");
+}
 
 export interface ConfirmActionOptions {
   title: string;
@@ -151,41 +221,39 @@ export class SpawnAgentModal extends Modal {
     new Setting(contentEl)
       .setName("Agent runtime")
       .setDesc("Supported CLI agent installed on this machine.")
-      .addDropdown((dd) =>
-        dd
-          .addOption("claude", "Claude Code")
-          .addOption("codex", "Codex")
-          .addOption("agy", "Antigravity")
-          .addOption("gemini", "Gemini")
-          .addOption("opencode", "OpenCode")
-          .addOption("cursor", "Cursor CLI")
-          .addOption("copilot", "GitHub Copilot CLI")
-          .addOption("grok", "Grok")
-          .addOption("hermes", "Hermes Agent")
-          .addOption("amp", "Amp")
-          .addOption("droid", "Factory Droid")
-          .addOption("kimi", "Kimi CLI")
-          .addOption("kiro", "Kiro CLI")
-          .addOption("qwen", "Qwen Code")
-          .addOption("devin", "Devin")
-          .addOption("cline", "Cline")
-          .addOption("kilo", "Kilo Code")
-          .addOption("mastracode", "Mastra Code")
-          .addOption("qodercli", "Qoder CLI")
-          .addOption("pi", "Pi")
-          .addOption("omp", "Oh My Pi")
-          .addOption("maki", "Maki")
-          .setValue(this.agentKind)
-          .onChange((val) => {
-            this.agentKind = val;
-            if (!this.nameEditedManually) {
-              this.agentName = this.suggestUniqueHandle(val);
-              if (nameInputEl) {
-                nameInputEl.value = this.agentName;
-              }
+      .addDropdown((dd) => {
+        const installedIds = new Set(
+          this.coordinator
+            .getState()
+            .integrations.filter((i) => i.installed)
+            .map((i) => i.target.toLowerCase())
+        );
+        const installedFirst = SUPPORTED_AGENT_RUNTIMES.filter((r) =>
+          installedIds.has(r.id.toLowerCase())
+        );
+        const others = SUPPORTED_AGENT_RUNTIMES.filter(
+          (r) => !installedIds.has(r.id.toLowerCase())
+        );
+        for (const runtime of installedFirst) {
+          dd.addOption(runtime.id, `${runtime.label} (installed)`);
+        }
+        for (const runtime of others) {
+          dd.addOption(runtime.id, runtime.label);
+        }
+        const validKind = SUPPORTED_AGENT_RUNTIMES.some((r) => r.id === this.agentKind)
+          ? this.agentKind
+          : SUPPORTED_AGENT_RUNTIMES[0].id;
+        this.agentKind = validKind;
+        dd.setValue(validKind).onChange((val) => {
+          this.agentKind = val;
+          if (!this.nameEditedManually) {
+            this.agentName = this.suggestUniqueHandle(val);
+            if (nameInputEl) {
+              nameInputEl.value = this.agentName;
             }
-          })
-      );
+          }
+        });
+      });
 
     new Setting(contentEl)
       .setName("Split direction")
@@ -226,6 +294,10 @@ export class SpawnAgentModal extends Modal {
       });
 
     let spawnBtnEl: HTMLButtonElement | null = null;
+    this.scope?.register(["Mod"], "Enter", () => {
+      void this.submit(spawnBtnEl);
+      return false;
+    });
     new Setting(contentEl)
       .addButton((btn) =>
         btn.setButtonText("Cancel").onClick(() => {
@@ -304,6 +376,7 @@ export class CreateWorktreeModal extends Modal {
   private readonly coordinator: HerdrCoordinator;
   private branchName = "";
   private focusAfter = true;
+  private submitting = false;
 
   constructor(app: App, coordinator: HerdrCoordinator) {
     super(app);
@@ -337,26 +410,36 @@ export class CreateWorktreeModal extends Modal {
         })
       );
 
+    let createBtnEl: HTMLButtonElement | null = null;
     new Setting(contentEl)
       .addButton((btn) =>
         btn.setButtonText("Cancel").onClick(() => {
           this.close();
         })
       )
-      .addButton((btn) =>
+      .addButton((btn) => {
+        createBtnEl = btn.buttonEl;
         btn
           .setButtonText("Create worktree")
           .setCta()
           .onClick(() => {
-            void this.submit();
-          })
-      );
+            void this.submit(createBtnEl);
+          });
+      });
   }
 
-  private async submit(): Promise<void> {
+  private async submit(createBtnEl: HTMLButtonElement | null): Promise<void> {
+    if (this.submitting) {
+      return;
+    }
     if (!this.branchName) {
       new Notice("Enter a Git branch name.");
       return;
+    }
+    this.submitting = true;
+    if (createBtnEl) {
+      createBtnEl.disabled = true;
+      createBtnEl.setText("Creating...");
     }
     try {
       const vaultRoot = this.coordinator.vaultOps.getVaultBasePath() || undefined;
@@ -369,6 +452,11 @@ export class CreateWorktreeModal extends Modal {
       new Notice(`Opened worktree workspace for '${this.branchName}'.`);
       this.close();
     } catch (err) {
+      this.submitting = false;
+      if (createBtnEl) {
+        createBtnEl.disabled = false;
+        createBtnEl.setText("Create worktree");
+      }
       new Notice(`Worktree creation failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -378,17 +466,34 @@ export class CreateWorktreeModal extends Modal {
   }
 }
 
+export interface DispatchNoteModalOptions {
+  defaultTarget?: string;
+  selectionOnly?: boolean;
+}
+
 export class DispatchNoteModal extends Modal {
   private readonly coordinator: HerdrCoordinator;
   private target = "";
   private instruction = "Review this note context and apply requested updates via obs-herdr.";
   private selectionOnly = false;
   private includeBacklinks = true;
+  private submitting = false;
 
-  constructor(app: App, coordinator: HerdrCoordinator, defaultTarget = "") {
+  constructor(
+    app: App,
+    coordinator: HerdrCoordinator,
+    options?: string | DispatchNoteModalOptions
+  ) {
     super(app);
     this.coordinator = coordinator;
-    this.target = defaultTarget;
+    if (typeof options === "string") {
+      this.target = options;
+    } else if (options) {
+      this.target = options.defaultTarget || "";
+      if (typeof options.selectionOnly === "boolean") {
+        this.selectionOnly = options.selectionOnly;
+      }
+    }
   }
 
   onOpen(): void {
@@ -398,31 +503,60 @@ export class DispatchNoteModal extends Modal {
 
     new Setting(contentEl).setName("Dispatch vault context to Herdr").setHeading();
 
+    const activeFile = this.app.workspace.getActiveFile();
+    const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const selectionText = mdView?.editor.getSelection() || "";
+    const noteLengthLabel = activeFile
+      ? mdView && mdView.file?.path === activeFile.path
+        ? `${mdView.editor.getValue().length} chars`
+        : `${activeFile.stat.size} bytes`
+      : "";
+    const contextSummary = activeFile
+      ? selectionText.length > 0
+        ? `Active note: ${activeFile.path} (${noteLengthLabel}) | Selection: ${selectionText.length} chars`
+        : `Active note: ${activeFile.path} (${noteLengthLabel}) | No active selection`
+      : selectionText.length > 0
+        ? `No active note | Selection: ${selectionText.length} chars`
+        : "No active note or editor selection detected.";
+    contentEl.createDiv({
+      cls: "herdr-mc-hint",
+      text: contextSummary,
+    });
+
     const snap = this.coordinator.getState().snapshot;
     const agents = snap?.agents ?? [];
     const panes = snap?.panes ?? [];
-
-    if (!this.target) {
-      this.target =
-        agents[0]?.name || agents[0]?.pane_id || panes[0]?.pane_id || "";
-    }
 
     new Setting(contentEl)
       .setName("Target agent or pane")
       .setDesc("Select a live Herdr agent handle or pane ID.")
       .addDropdown((dd) => {
+        const optionKeys: string[] = [];
         for (const ag of agents) {
           const id = ag.name || ag.pane_id;
+          const key = `agent:${id}`;
           const label = `${ag.display_agent || ag.name || ag.agent || ag.pane_id} (${ag.agent_status})`;
-          dd.addOption(`agent:${id}`, `Agent: ${label}`);
+          dd.addOption(key, `Agent: ${label}`);
+          optionKeys.push(key);
         }
         for (const p of panes) {
-          dd.addOption(`pane:${p.pane_id}`, `Pane: ${p.pane_id} (${p.label || p.cwd || "shell"})`);
+          const key = `pane:${p.pane_id}`;
+          dd.addOption(key, `Pane: ${p.pane_id} (${p.label || p.cwd || "shell"})`);
+          optionKeys.push(key);
         }
-        if (agents.length === 0 && panes.length === 0) {
+        if (optionKeys.length === 0) {
           dd.addOption("", "No active Herdr targets found");
+          dd.setValue("");
+          this.target = "";
         } else {
-          const initialKey = agents.length > 0 ? `agent:${this.target}` : `pane:${this.target}`;
+          const candidates = [
+            this.target,
+            this.target ? `agent:${this.target}` : "",
+            this.target ? `pane:${this.target}` : "",
+            optionKeys[0],
+          ].filter(Boolean);
+          const initialKey =
+            candidates.find((key) => optionKeys.includes(key)) ?? optionKeys[0];
           dd.setValue(initialKey);
           this.target = initialKey;
         }
@@ -459,26 +593,40 @@ export class DispatchNoteModal extends Modal {
         })
       );
 
+    let sendBtnEl: HTMLButtonElement | null = null;
+    this.scope?.register(["Mod"], "Enter", () => {
+      void this.submit(sendBtnEl);
+      return false;
+    });
     new Setting(contentEl)
       .addButton((btn) =>
         btn.setButtonText("Cancel").onClick(() => {
           this.close();
         })
       )
-      .addButton((btn) =>
+      .addButton((btn) => {
+        sendBtnEl = btn.buttonEl;
         btn
           .setButtonText("Send context")
           .setCta()
           .onClick(() => {
-            void this.submit();
-          })
-      );
+            void this.submit(sendBtnEl);
+          });
+      });
   }
 
-  private async submit(): Promise<void> {
+  private async submit(sendBtnEl: HTMLButtonElement | null): Promise<void> {
+    if (this.submitting) {
+      return;
+    }
     if (!this.target) {
       new Notice("Start a Herdr session or select a target pane first.");
       return;
+    }
+    this.submitting = true;
+    if (sendBtnEl) {
+      sendBtnEl.disabled = true;
+      sendBtnEl.setText("Sending...");
     }
     try {
       const pack = await this.coordinator.buildActiveNoteContextPack({
@@ -498,6 +646,11 @@ export class DispatchNoteModal extends Modal {
       }
       this.close();
     } catch (err) {
+      this.submitting = false;
+      if (sendBtnEl) {
+        sendBtnEl.disabled = false;
+        sendBtnEl.setText("Send context");
+      }
       new Notice(`Context dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -507,7 +660,7 @@ export class DispatchNoteModal extends Modal {
   }
 }
 
-export class SelectProfileModal extends Modal {
+export class SelectProfileModal extends FuzzySuggestModal<TerminalProfile> {
   private readonly profiles: TerminalProfile[];
   private readonly onChoose: (profile: TerminalProfile) => void;
 
@@ -515,33 +668,19 @@ export class SelectProfileModal extends Modal {
     super(app);
     this.profiles = profiles;
     this.onChoose = onChoose;
+    this.setPlaceholder("Choose a terminal profile...");
   }
 
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass("herdr-modal");
-
-    new Setting(contentEl).setName("Open terminal profile").setHeading();
-
-    for (const profile of this.profiles) {
-      new Setting(contentEl)
-        .setName(profile.name)
-        .setDesc(`Mode: ${profile.kind} (${profile.cwdMode})`)
-        .addButton((btn) =>
-          btn
-            .setButtonText("Open")
-            .setCta()
-            .onClick(() => {
-              this.onChoose(profile);
-              this.close();
-            })
-        );
-    }
+  getItems(): TerminalProfile[] {
+    return this.profiles;
   }
 
-  onClose(): void {
-    this.contentEl.empty();
+  getItemText(profile: TerminalProfile): string {
+    return `${profile.name} (${profile.kind})`;
+  }
+
+  onChooseItem(profile: TerminalProfile): void {
+    this.onChoose(profile);
   }
 }
 
@@ -550,6 +689,11 @@ export class EditProfileModal extends Modal {
   private readonly onSave: (profile: TerminalProfile) => void;
   private draft: TerminalProfile;
   private shellArgsRaw: string;
+  private sessionFieldEl: HTMLElement | null = null;
+  private agentTargetFieldEl: HTMLElement | null = null;
+  private remoteTargetFieldEl: HTMLElement | null = null;
+  private shellFieldsEl: HTMLElement | null = null;
+  private customCwdFieldEl: HTMLElement | null = null;
 
   constructor(
     app: App,
@@ -570,14 +714,10 @@ export class EditProfileModal extends Modal {
           kind: "shell",
           cwdMode: "vault-root",
         };
-    this.shellArgsRaw = (this.draft.shellArgs || []).join(" ");
+    this.shellArgsRaw = formatShellArgs(this.draft.shellArgs);
   }
 
   onOpen(): void {
-    this.renderForm();
-  }
-
-  private renderForm(): void {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("herdr-modal");
@@ -612,77 +752,75 @@ export class EditProfileModal extends Modal {
           .setValue(this.draft.kind)
           .onChange((val) => {
             this.draft.kind = val as TerminalProfileKind;
-            this.renderForm();
+            this.syncFieldVisibility();
           })
       );
 
-    if (this.draft.kind !== "shell") {
-      new Setting(contentEl)
-        .setName("Session override")
-        .setDesc("Optional named session override (leave blank for vault default).")
-        .addText((text) =>
-          text
-            .setPlaceholder("Default vault session")
-            .setValue(this.draft.sessionName || "")
-            .onChange((val) => {
-              this.draft.sessionName = val.trim() || undefined;
-            })
-        );
-    }
+    const sessionSetting = new Setting(contentEl)
+      .setName("Session override")
+      .setDesc("Optional named session override (leave blank for vault default).")
+      .addText((text) =>
+        text
+          .setPlaceholder("Default vault session")
+          .setValue(this.draft.sessionName || "")
+          .onChange((val) => {
+            this.draft.sessionName = val.trim() || undefined;
+          })
+      );
+    this.sessionFieldEl = sessionSetting.settingEl;
 
-    if (this.draft.kind === "herdr-agent") {
-      new Setting(contentEl)
-        .setName("Agent target")
-        .setDesc("Agent handle or pane ID to attach to.")
-        .addText((text) =>
-          text
-            .setPlaceholder("Enter agent handle")
-            .setValue(this.draft.agentTarget || "")
-            .onChange((val) => {
-              this.draft.agentTarget = val.trim() || undefined;
-            })
-        );
-    }
+    const agentSetting = new Setting(contentEl)
+      .setName("Agent target")
+      .setDesc("Agent handle or pane ID to attach to.")
+      .addText((text) =>
+        text
+          .setPlaceholder("Enter agent handle")
+          .setValue(this.draft.agentTarget || "")
+          .onChange((val) => {
+            this.draft.agentTarget = val.trim() || undefined;
+          })
+      );
+    this.agentTargetFieldEl = agentSetting.settingEl;
 
-    if (this.draft.kind === "herdr-remote") {
-      new Setting(contentEl)
-        .setName("Remote SSH target")
-        .setDesc("User and host passed to --remote (for example dev@server).")
-        .addText((text) =>
-          text
-            .setPlaceholder("Enter user@host")
-            .setValue(this.draft.remoteTarget || "")
-            .onChange((val) => {
-              this.draft.remoteTarget = val.trim() || undefined;
-            })
-        );
-    }
+    const remoteSetting = new Setting(contentEl)
+      .setName("Remote SSH target")
+      .setDesc("User and host passed to --remote (for example dev@server).")
+      .addText((text) =>
+        text
+          .setPlaceholder("Enter user@host")
+          .setValue(this.draft.remoteTarget || "")
+          .onChange((val) => {
+            this.draft.remoteTarget = val.trim() || undefined;
+          })
+      );
+    this.remoteTargetFieldEl = remoteSetting.settingEl;
 
-    if (this.draft.kind === "shell") {
-      new Setting(contentEl)
-        .setName("Shell executable")
-        .setDesc("Optional shell binary path (leave blank for system default shell).")
-        .addText((text) =>
-          text
-            .setPlaceholder("System default shell")
-            .setValue(this.draft.shellPath || "")
-            .onChange((val) => {
-              this.draft.shellPath = val.trim() || undefined;
-            })
-        );
+    const shellContainer = contentEl.createDiv();
+    this.shellFieldsEl = shellContainer;
 
-      new Setting(contentEl)
-        .setName("Shell arguments")
-        .setDesc("Space-separated flags passed to the shell (for example -i).")
-        .addText((text) =>
-          text
-            .setPlaceholder("-i")
-            .setValue(this.shellArgsRaw)
-            .onChange((val) => {
-              this.shellArgsRaw = val;
-            })
-        );
-    }
+    new Setting(shellContainer)
+      .setName("Shell executable")
+      .setDesc("Optional shell binary path (leave blank for system default shell).")
+      .addText((text) =>
+        text
+          .setPlaceholder("System default shell")
+          .setValue(this.draft.shellPath || "")
+          .onChange((val) => {
+            this.draft.shellPath = val.trim() || undefined;
+          })
+      );
+
+    new Setting(shellContainer)
+      .setName("Shell arguments")
+      .setDesc("Space-separated flags passed to the shell; quotes preserve spaces.")
+      .addText((text) =>
+        text
+          .setPlaceholder("-i")
+          .setValue(this.shellArgsRaw)
+          .onChange((val) => {
+            this.shellArgsRaw = val;
+          })
+      );
 
     new Setting(contentEl)
       .setName("Working directory")
@@ -696,23 +834,22 @@ export class EditProfileModal extends Modal {
           .onChange((val) => {
             this.draft.cwdMode =
               val === "active-note-folder" || val === "custom" ? val : "vault-root";
-            this.renderForm();
+            this.syncFieldVisibility();
           })
       );
 
-    if (this.draft.cwdMode === "custom") {
-      new Setting(contentEl)
-        .setName("Custom directory path")
-        .setDesc("Absolute directory path used when starting the terminal.")
-        .addText((text) =>
-          text
-            .setPlaceholder("/path/to/folder")
-            .setValue(this.draft.customCwd || "")
-            .onChange((val) => {
-              this.draft.customCwd = val.trim() || undefined;
-            })
-        );
-    }
+    const customCwdSetting = new Setting(contentEl)
+      .setName("Custom directory path")
+      .setDesc("Absolute directory path used when starting the terminal.")
+      .addText((text) =>
+        text
+          .setPlaceholder("/path/to/folder")
+          .setValue(this.draft.customCwd || "")
+          .onChange((val) => {
+            this.draft.customCwd = val.trim() || undefined;
+          })
+      );
+    this.customCwdFieldEl = customCwdSetting.settingEl;
 
     new Setting(contentEl)
       .addButton((btn) =>
@@ -728,6 +865,25 @@ export class EditProfileModal extends Modal {
             this.submit();
           })
       );
+
+    this.syncFieldVisibility();
+  }
+
+  private syncFieldVisibility(): void {
+    this.sessionFieldEl?.toggleClass("herdr-is-hidden", this.draft.kind === "shell");
+    this.agentTargetFieldEl?.toggleClass(
+      "herdr-is-hidden",
+      this.draft.kind !== "herdr-agent"
+    );
+    this.remoteTargetFieldEl?.toggleClass(
+      "herdr-is-hidden",
+      this.draft.kind !== "herdr-remote"
+    );
+    this.shellFieldsEl?.toggleClass("herdr-is-hidden", this.draft.kind !== "shell");
+    this.customCwdFieldEl?.toggleClass(
+      "herdr-is-hidden",
+      this.draft.cwdMode !== "custom"
+    );
   }
 
   private submit(): void {
@@ -744,10 +900,11 @@ export class EditProfileModal extends Modal {
       new Notice("Enter a remote SSH target for remote mode.");
       return;
     }
-    const parsedArgs = this.shellArgsRaw
-      .split(/\s+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+    if (this.draft.cwdMode === "custom" && !this.draft.customCwd?.trim()) {
+      new Notice("Enter a custom directory path or choose another working directory mode.");
+      return;
+    }
+    const parsedArgs = tokenizeShellArgs(this.shellArgsRaw);
 
     const saved: TerminalProfile = {
       ...this.draft,
@@ -760,6 +917,11 @@ export class EditProfileModal extends Modal {
   }
 
   onClose(): void {
+    this.sessionFieldEl = null;
+    this.agentTargetFieldEl = null;
+    this.remoteTargetFieldEl = null;
+    this.shellFieldsEl = null;
+    this.customCwdFieldEl = null;
     this.contentEl.empty();
   }
 }

@@ -103,6 +103,78 @@ export function resolvePreferredPosixShell(envShell?: string): string {
   return "/bin/sh";
 }
 
+let cachedExtraBinsHome = "";
+let cachedExtraBinsAt = 0;
+let cachedExtraBins: string[] = [];
+let cachedFlatpakHostConfig: { checkedAt: number; home: string; value: string | null } | null = null;
+const ENV_SCAN_CACHE_MS = 60_000;
+const MISSING_BINARY_CACHE_MS = 5_000;
+
+function getCachedPosixExtraBins(home: string): string[] {
+  const now = Date.now();
+  if (cachedExtraBinsHome === home && now - cachedExtraBinsAt < ENV_SCAN_CACHE_MS) {
+    return cachedExtraBins;
+  }
+  const candidateDirs = [
+    path.join(home, ".local", "bin"),
+    path.join(home, ".cargo", "bin"),
+    path.join(home, ".bun", "bin"),
+    path.join(home, ".opencode", "bin"),
+    path.join(home, ".local", "share", "pnpm", "bin"),
+    path.join(home, ".local", "share", "pnpm"),
+    path.join(home, ".npm-global", "bin"),
+    path.join(home, ".deno", "bin"),
+    path.join(home, "go", "bin"),
+    path.join(home, "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+  ];
+
+  try {
+    const localNode = path.join(home, ".local", "bin", "node");
+    if (fs.existsSync(localNode)) {
+      const realNodeDir = path.dirname(fs.realpathSync(localNode));
+      if (realNodeDir && !candidateDirs.includes(realNodeDir)) {
+        candidateDirs.splice(1, 0, realNodeDir);
+      }
+    }
+  } catch {
+    // Ignore symlink resolution errors
+  }
+
+  cachedExtraBins = candidateDirs.filter((dir) => {
+    try {
+      return fs.statSync(dir).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+  cachedExtraBinsHome = home;
+  cachedExtraBinsAt = now;
+  return cachedExtraBins;
+}
+
+function getCachedFlatpakHostConfig(home: string): string | null {
+  const now = Date.now();
+  if (
+    cachedFlatpakHostConfig &&
+    cachedFlatpakHostConfig.home === home &&
+    now - cachedFlatpakHostConfig.checkedAt < ENV_SCAN_CACHE_MS
+  ) {
+    return cachedFlatpakHostConfig.value;
+  }
+  let value: string | null = null;
+  if (fs.existsSync("/.flatpak-info")) {
+    const hostConfig = path.join(home, ".config");
+    if (fs.existsSync(hostConfig)) {
+      value = hostConfig;
+    }
+  }
+  cachedFlatpakHostConfig = { checkedAt: now, home, value };
+  return value;
+}
+
 /**
  * Normalizes Flatpak and desktop GUI environment overrides so Herdr CLI invocations,
  * daemon panes, and embedded terminals see user-installed binaries (~/.local/bin,
@@ -135,45 +207,12 @@ export function buildHostNormalizedEnv(
     }
   } else {
     const home = os.homedir();
-    const candidateDirs = [
-      path.join(home, ".local", "bin"),
-      path.join(home, ".cargo", "bin"),
-      path.join(home, ".bun", "bin"),
-      path.join(home, ".opencode", "bin"),
-      path.join(home, ".local", "share", "pnpm", "bin"),
-      path.join(home, ".local", "share", "pnpm"),
-      path.join(home, ".npm-global", "bin"),
-      path.join(home, ".deno", "bin"),
-      path.join(home, "go", "bin"),
-      path.join(home, "bin"),
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-      "/home/linuxbrew/.linuxbrew/bin",
-    ];
-
-    try {
-      const localNode = path.join(home, ".local", "bin", "node");
-      if (fs.existsSync(localNode)) {
-        const realNodeDir = path.dirname(fs.realpathSync(localNode));
-        if (realNodeDir && !candidateDirs.includes(realNodeDir)) {
-          candidateDirs.splice(1, 0, realNodeDir);
-        }
-      }
-    } catch {
-      // Ignore symlink resolution errors
-    }
-
-    const extraBins = candidateDirs.filter((dir) => {
-      try {
-        return fs.statSync(dir).isDirectory();
-      } catch {
-        return false;
-      }
-    });
+    const extraBins = getCachedPosixExtraBins(home);
 
     const currentPath = merged.PATH || "";
     const parts = currentPath.split(path.delimiter).filter(Boolean);
-    for (const dir of extraBins.reverse()) {
+    for (let i = extraBins.length - 1; i >= 0; i -= 1) {
+      const dir = extraBins[i];
       if (!parts.includes(dir)) {
         parts.unshift(dir);
       }
@@ -185,12 +224,11 @@ export function buildHostNormalizedEnv(
     }
 
     if (
-      fs.existsSync("/.flatpak-info") &&
       !merged.HERDR_CONFIG_PATH &&
       merged.XDG_CONFIG_HOME?.includes("/.var/app/")
     ) {
-      const hostConfig = path.join(home, ".config");
-      if (fs.existsSync(hostConfig)) {
+      const hostConfig = getCachedFlatpakHostConfig(home);
+      if (hostConfig) {
         merged.XDG_CONFIG_HOME = hostConfig;
       }
     }
@@ -202,6 +240,7 @@ export function buildHostNormalizedEnv(
 export class HerdrCliClient {
   private configuredBinary: string;
   private customEnv: Record<string, string>;
+  private cachedBinaryPath: { value: string | null; checkedAt: number; key: string } | null = null;
 
   constructor(configuredBinary = "", customEnv: Record<string, string> = {}) {
     this.configuredBinary = configuredBinary;
@@ -209,7 +248,14 @@ export class HerdrCliClient {
   }
 
   setConfiguredBinary(nextPath: string): void {
-    this.configuredBinary = nextPath;
+    if (this.configuredBinary !== nextPath) {
+      this.configuredBinary = nextPath;
+      this.cachedBinaryPath = null;
+    }
+  }
+
+  invalidateBinaryCache(): void {
+    this.cachedBinaryPath = null;
   }
 
   setCustomEnv(nextEnv: Record<string, string>): void {
@@ -217,7 +263,21 @@ export class HerdrCliClient {
   }
 
   getBinaryPath(): string | null {
-    return resolveHerdrBinary(this.configuredBinary);
+    const now = Date.now();
+    const key = `${this.configuredBinary}\u0000${process.env.PATH || ""}`;
+    if (
+      this.cachedBinaryPath &&
+      this.cachedBinaryPath.key === key &&
+      // A miss is cached briefly only, so installing Herdr or fixing PATH
+      // is picked up within seconds instead of a minute.
+      now - this.cachedBinaryPath.checkedAt <
+        (this.cachedBinaryPath.value ? ENV_SCAN_CACHE_MS : MISSING_BINARY_CACHE_MS)
+    ) {
+      return this.cachedBinaryPath.value;
+    }
+    const resolved = resolveHerdrBinary(this.configuredBinary);
+    this.cachedBinaryPath = { value: resolved, checkedAt: now, key };
+    return resolved;
   }
 
   exec(

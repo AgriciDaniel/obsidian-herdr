@@ -30,6 +30,14 @@ import {
 
 export const VIEW_TYPE_HERDR_TERMINAL = "herdr-terminal-view";
 
+const PTY_HIGH_WATERMARK_BYTES = 256 * 1024;
+const PTY_LOW_WATERMARK_BYTES = 64 * 1024;
+
+interface FlowControllablePty {
+  pause?: () => void;
+  resume?: () => void;
+}
+
 export interface HerdrTerminalViewState extends Record<string, unknown> {
   profileId?: string;
   customAgentTarget?: string;
@@ -53,13 +61,19 @@ export class HerdrTerminalView extends ItemView {
   private pty: PtySession | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private fitTimer: number | null = null;
+  private pendingInitTimer: number | null = null;
   private ptyLaunchSeq = 0;
+  private startingPty = false;
+  private pendingWrites: string[] = [];
 
   private currentTitle = "Herdr terminal";
   private currentCwd: string | null = null;
   private currentProgramState: AgentStatus = "idle";
   private currentProgramMessage: string | undefined = undefined;
   private searchVisible = false;
+  private lastActiveMarkdownView: MarkdownView | null = null;
+  private lastProfileDropdownSig = "";
+  private lastCustomFontOverride: string | null = null;
 
   private headerStatusBadgeEl: HTMLElement | null = null;
   private headerCwdEl: HTMLElement | null = null;
@@ -119,6 +133,7 @@ export class HerdrTerminalView extends ItemView {
     }
     await super.setState(state, result);
     if (this.xtermMountEl) {
+      this.clearPendingInitTimer();
       this.syncProfileDropdown();
       this.restartPtySession();
     }
@@ -126,8 +141,13 @@ export class HerdrTerminalView extends ItemView {
 
   onOpen(): Promise<void> {
     const root = this.contentEl;
+    const doc = root.doc;
+    const win = root.win;
     root.empty();
     root.addClass("herdr-root", "herdr-terminal-pane");
+
+    this.lastProfileDropdownSig = "";
+    this.lastActiveMarkdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
 
     this.buildToolbar(root);
     this.buildSearchBar(root);
@@ -136,13 +156,28 @@ export class HerdrTerminalView extends ItemView {
     this.xtermMountEl = root.createDiv({ cls: "herdr-terminal-host" });
 
     this.mountXterm(this.xtermMountEl);
-    void this.startPtyForSelectedProfile().catch((err: unknown) => {
-      console.warn("[herdr-obs] Terminal PTY startup failed:", err);
-    });
+    this.clearPendingInitTimer();
+    this.pendingInitTimer = win.setTimeout(() => {
+      this.pendingInitTimer = null;
+      if (!this.xtermMountEl) {
+        return;
+      }
+      void this.startPtyForSelectedProfile().catch((err: unknown) => {
+        console.warn("[herdr-obs] Terminal PTY startup failed:", err);
+      });
+    }, 0);
 
     this.unsubCoord = this.coordinator.onChange(() => {
-      this.syncRuntimeSettings();
+      this.syncRuntimeSettings(false);
     });
+
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf?.view instanceof MarkdownView) {
+          this.lastActiveMarkdownView = leaf.view;
+        }
+      })
+    );
 
     this.registerEvent(
       this.app.workspace.on("css-change", () => {
@@ -150,8 +185,8 @@ export class HerdrTerminalView extends ItemView {
       })
     );
 
-    this.registerDomEvent(document, "visibilitychange", () => {
-      if (!document.hidden) {
+    this.registerDomEvent(doc, "visibilitychange", () => {
+      if (!doc.hidden) {
         this.scheduleFit();
       }
     });
@@ -173,11 +208,15 @@ export class HerdrTerminalView extends ItemView {
   }
 
   onClose(): Promise<void> {
+    const win = this.contentEl.win;
     this.ptyLaunchSeq += 1;
+    this.startingPty = false;
+    this.pendingWrites = [];
+    this.clearPendingInitTimer();
     this.unsubCoord?.();
     this.unsubCoord = null;
-    if (this.fitTimer) {
-      window.clearTimeout(this.fitTimer);
+    if (this.fitTimer !== null) {
+      win.clearTimeout(this.fitTimer);
       this.fitTimer = null;
     }
     if (this.resizeObserver) {
@@ -200,8 +239,25 @@ export class HerdrTerminalView extends ItemView {
       this.terminal.dispose();
       this.terminal = null;
     }
+    this.headerStatusBadgeEl = null;
+    this.headerCwdEl = null;
+    this.profileSelectEl = null;
+    this.searchBarEl = null;
+    this.searchInputEl = null;
+    this.xtermMountEl = null;
+    this.exitBannerEl = null;
+    this.lastActiveMarkdownView = null;
+    this.lastProfileDropdownSig = "";
+    this.lastCustomFontOverride = null;
     this.contentEl.empty();
     return Promise.resolve();
+  }
+
+  private clearPendingInitTimer(): void {
+    if (this.pendingInitTimer !== null) {
+      this.contentEl.win.clearTimeout(this.pendingInitTimer);
+      this.pendingInitTimer = null;
+    }
   }
 
   focusTerminal(): void {
@@ -212,9 +268,14 @@ export class HerdrTerminalView extends ItemView {
     if (this.pty?.isRunning()) {
       this.pty.write(text);
       this.terminal?.focus();
-    } else {
-      new Notice("Terminal session is not running. Reconnect first.");
+      return;
     }
+    if (this.startingPty || this.pendingInitTimer !== null) {
+      this.pendingWrites.push(text);
+      this.terminal?.focus();
+      return;
+    }
+    new Notice("Terminal session is not running. Reconnect first.");
   }
 
   private buildToolbar(parent: HTMLElement): void {
@@ -253,8 +314,16 @@ export class HerdrTerminalView extends ItemView {
       this.pasteActiveNotePath();
     });
 
-    this.createIconBtn(rightGroup, "send", "Send editor selection to terminal", () => {
-      this.sendActiveSelection();
+    const sendSelBtn = this.createIconBtn(
+      rightGroup,
+      "send",
+      "Send editor selection to terminal",
+      () => {
+        this.sendActiveSelection();
+      }
+    );
+    sendSelBtn.addEventListener("mousedown", (ev: MouseEvent) => {
+      ev.preventDefault();
     });
 
     this.createIconBtn(rightGroup, "search", "Find in terminal", () => {
@@ -330,7 +399,10 @@ export class HerdrTerminalView extends ItemView {
   }
 
   private mountXterm(hostEl: HTMLElement): void {
+    const doc = this.contentEl.doc;
+    const win = this.contentEl.win;
     const settings = this.getSettings();
+    this.lastCustomFontOverride = settings.terminalFontFamily;
     const term = new Terminal({
       cursorBlink: settings.terminalCursorBlink,
       fontSize: settings.terminalFontSize,
@@ -346,7 +418,7 @@ export class HerdrTerminalView extends ItemView {
     const search = new SearchAddon();
     const webLinks = new WebLinksAddon((_event, uri) => {
       if (uri.startsWith("http://") || uri.startsWith("https://")) {
-        window.open(uri, "_blank", "noopener,noreferrer");
+        win.open(uri, "_blank", "noopener,noreferrer");
       }
     });
 
@@ -378,7 +450,7 @@ export class HerdrTerminalView extends ItemView {
       }
       if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "c") {
         if (ev.type === "keydown" && term.hasSelection()) {
-          void navigator.clipboard.writeText(term.getSelection()).catch((err: unknown) => {
+          void win.navigator.clipboard.writeText(term.getSelection()).catch((err: unknown) => {
             console.warn("[herdr-obs] Terminal clipboard copy failed:", err);
           });
         }
@@ -386,7 +458,7 @@ export class HerdrTerminalView extends ItemView {
       }
       if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "v") {
         if (ev.type === "keydown") {
-          void navigator.clipboard
+          void win.navigator.clipboard
             .readText()
             .then((clip) => {
               if (clip) {
@@ -407,7 +479,7 @@ export class HerdrTerminalView extends ItemView {
     this.searchAddon = search;
 
     this.resizeObserver = new ResizeObserver(() => {
-      if (!document.hidden) {
+      if (!doc.hidden) {
         this.scheduleFit();
       }
     });
@@ -417,102 +489,143 @@ export class HerdrTerminalView extends ItemView {
 
   private async startPtyForSelectedProfile(): Promise<void> {
     const launchId = ++this.ptyLaunchSeq;
+    this.startingPty = true;
     this.pty?.dispose();
     this.pty = null;
     this.exitBannerEl?.addClass("herdr-is-hidden");
 
-    const profile = this.resolveSelectedProfile();
-    if (
-      (profile.kind === "herdr-vault" || profile.kind === "herdr-agent") &&
-      !profile.sessionName?.trim() &&
-      this.coordinator.cli.getBinaryPath() &&
-      !this.coordinator.getState().serverRunning
-    ) {
-      try {
-        await this.coordinator.startVaultHerdrSession();
-      } catch {
-        // Fall through to direct TUI launch
+    try {
+      const profile = this.resolveSelectedProfile();
+      if (
+        (profile.kind === "herdr-vault" || profile.kind === "herdr-agent") &&
+        !profile.sessionName?.trim() &&
+        this.coordinator.cli.getBinaryPath() &&
+        !this.coordinator.getState().serverRunning
+      ) {
+        try {
+          await this.coordinator.startVaultHerdrSession();
+        } catch {
+          // Fall through to direct TUI launch
+        }
+        if (launchId !== this.ptyLaunchSeq || !this.xtermMountEl) {
+          return;
+        }
       }
+
+      await this.coordinator.ensureBridgeReady();
       if (launchId !== this.ptyLaunchSeq || !this.xtermMountEl) {
         return;
       }
-    }
 
-    await this.coordinator.ensureBridgeReady();
-    if (launchId !== this.ptyLaunchSeq || !this.xtermMountEl) {
-      return;
-    }
-
-    const spawnSpec = this.coordinator.resolveSpawnCommandForProfile(
-      profile,
-      this.cwdOverride || undefined
-    );
-    this.currentCwd = spawnSpec.cwd;
-    this.updateHeaderCwd(spawnSpec.cwd);
-
-    if (shouldFallbackMissingHerdr(profile.kind, this.coordinator.cli.getBinaryPath())) {
-      this.terminal?.writeln(
-        "\x1b[33m[Herdr binary not detected on PATH. Falling back to interactive shell with Vault Control Bridge enabled.]\x1b[0m"
+      const spawnSpec = this.coordinator.resolveSpawnCommandForProfile(
+        profile,
+        this.cwdOverride || undefined
       );
-      const fallbackShell = this.coordinator.resolveSpawnCommandForProfile({
-        id: "shell-fallback",
-        name: "Shell",
-        kind: "shell",
-        cwdMode: "vault-root",
-      });
-      spawnSpec.command = fallbackShell.command;
-      spawnSpec.args = fallbackShell.args;
-    }
+      this.currentCwd = spawnSpec.cwd;
+      this.updateHeaderCwd(spawnSpec.cwd);
 
-    this.currentProgramState = "idle";
-    this.currentProgramMessage = undefined;
-
-    const oscObserver = new OscStreamObserver({
-      onTitle: (title) => {
-        this.currentTitle = title;
-        this.updateLeafHeader();
-      },
-      onCwd: (cwd) => {
-        this.currentCwd = cwd;
-        this.updateHeaderCwd(cwd);
-      },
-      onProgramStatus: (status) => {
-        this.currentProgramState = status.state;
-        this.currentProgramMessage = status.message || undefined;
-        this.refreshStatusBadge();
-      },
-    });
-
-    const cols = this.terminal?.cols || 96;
-    const rows = this.terminal?.rows || 28;
-
-    this.pty = new PtySession({
-      command: spawnSpec.command,
-      args: spawnSpec.args,
-      cwd: spawnSpec.cwd,
-      cols,
-      rows,
-      env: spawnSpec.env,
-      onData: (chunk) => {
-        oscObserver.feed(chunk);
-        this.terminal?.write(chunk);
-      },
-      onExit: (code, signal) => {
-        this.currentProgramState = "idle";
-        this.currentProgramMessage = undefined;
-        this.updateStatusBadge("idle", undefined, "exited");
-        this.showExitBanner(code, signal);
-        void this.coordinator.refreshAll(false).catch((err: unknown) => {
-          console.warn("[herdr-obs] Post-exit refresh failed:", err);
+      if (shouldFallbackMissingHerdr(profile.kind, this.coordinator.cli.getBinaryPath())) {
+        this.terminal?.writeln(
+          "\x1b[33m[Herdr binary not detected on PATH. Falling back to interactive shell with Vault Control Bridge enabled.]\x1b[0m"
+        );
+        const fallbackShell = this.coordinator.resolveSpawnCommandForProfile({
+          id: "shell-fallback",
+          name: "Shell",
+          kind: "shell",
+          cwdMode: "vault-root",
         });
-      },
-    });
+        spawnSpec.command = fallbackShell.command;
+        spawnSpec.args = fallbackShell.args;
+      }
 
-    this.refreshStatusBadge();
-    this.scheduleFit();
-    void this.coordinator.refreshAll(false).catch((err: unknown) => {
-      console.warn("[herdr-obs] Post-launch refresh failed:", err);
-    });
+      this.currentProgramState = "idle";
+      this.currentProgramMessage = undefined;
+
+      const oscObserver = new OscStreamObserver({
+        onTitle: (title) => {
+          this.currentTitle = title;
+          this.updateLeafHeader();
+        },
+        onCwd: (cwd) => {
+          this.currentCwd = cwd;
+          this.updateHeaderCwd(cwd);
+        },
+        onProgramStatus: (status) => {
+          this.currentProgramState = status.state;
+          this.currentProgramMessage = status.message || undefined;
+          this.refreshStatusBadge();
+        },
+      });
+
+      const cols = this.terminal?.cols || 96;
+      const rows = this.terminal?.rows || 28;
+
+      let pendingWriteBytes = 0;
+      let ptyPaused = false;
+      let session: PtySession | null = null;
+
+      session = new PtySession({
+        command: spawnSpec.command,
+        args: spawnSpec.args,
+        cwd: spawnSpec.cwd,
+        cols,
+        rows,
+        env: spawnSpec.env,
+        onData: (chunk) => {
+          oscObserver.feed(chunk);
+          const term = this.terminal;
+          if (!term) {
+            return;
+          }
+          const chunkBytes = chunk.length;
+          pendingWriteBytes += chunkBytes;
+          if (!ptyPaused && pendingWriteBytes > PTY_HIGH_WATERMARK_BYTES) {
+            ptyPaused = true;
+            (session as unknown as FlowControllablePty | null)?.pause?.();
+          }
+          term.write(chunk, () => {
+            pendingWriteBytes = Math.max(0, pendingWriteBytes - chunkBytes);
+            if (ptyPaused && pendingWriteBytes < PTY_LOW_WATERMARK_BYTES) {
+              ptyPaused = false;
+              (session as unknown as FlowControllablePty | null)?.resume?.();
+            }
+          });
+        },
+        onExit: (code, signal) => {
+          this.currentProgramState = "idle";
+          this.currentProgramMessage = undefined;
+          this.updateStatusBadge("idle", undefined, "exited");
+          this.showExitBanner(code, signal);
+          void this.coordinator.refreshAll(false).catch((err: unknown) => {
+            console.warn("[herdr-obs] Post-exit refresh failed:", err);
+          });
+        },
+      });
+
+      this.pty = session;
+
+      if (this.pendingWrites.length > 0 && session.isRunning()) {
+        const queued = this.pendingWrites.splice(0, this.pendingWrites.length);
+        for (const text of queued) {
+          session.write(text);
+        }
+      }
+
+      this.refreshStatusBadge();
+      this.scheduleFit();
+      void this.coordinator.refreshAll(false).catch((err: unknown) => {
+        console.warn("[herdr-obs] Post-launch refresh failed:", err);
+      });
+    } finally {
+      if (launchId === this.ptyLaunchSeq) {
+        this.startingPty = false;
+        // Text queued for a start that failed or was refused must not be
+        // replayed into a session started later (it could run a command).
+        if (this.pendingInitTimer === null && !this.pty?.isRunning()) {
+          this.pendingWrites = [];
+        }
+      }
+    }
   }
 
   restartPtySession(): void {
@@ -568,10 +681,11 @@ export class HerdrTerminalView extends ItemView {
   }
 
   private scheduleFit(): void {
-    if (this.fitTimer) {
-      window.clearTimeout(this.fitTimer);
+    const win = this.contentEl.win;
+    if (this.fitTimer !== null) {
+      win.clearTimeout(this.fitTimer);
     }
-    this.fitTimer = window.setTimeout(() => {
+    this.fitTimer = win.setTimeout(() => {
       this.fitTimer = null;
       if (
         !this.xtermMountEl ||
@@ -596,10 +710,10 @@ export class HerdrTerminalView extends ItemView {
       return;
     }
     this.terminal.options.theme = buildObsidianXtermTheme(this.xtermMountEl);
-    this.syncRuntimeSettings();
+    this.syncRuntimeSettings(true);
   }
 
-  private syncRuntimeSettings(): void {
+  private syncRuntimeSettings(forceFontRefresh = false): void {
     this.syncProfileDropdown();
     this.refreshStatusBadge();
     if (!this.terminal) {
@@ -607,13 +721,16 @@ export class HerdrTerminalView extends ItemView {
     }
     const settings = this.getSettings();
     let needsFit = false;
-    const nextFont = resolveTerminalFontFamily(
-      this.xtermMountEl || undefined,
-      settings.terminalFontFamily
-    );
-    if (this.terminal.options.fontFamily !== nextFont) {
-      this.terminal.options.fontFamily = nextFont;
-      needsFit = true;
+    if (forceFontRefresh || this.lastCustomFontOverride !== settings.terminalFontFamily) {
+      this.lastCustomFontOverride = settings.terminalFontFamily;
+      const nextFont = resolveTerminalFontFamily(
+        this.xtermMountEl || undefined,
+        settings.terminalFontFamily
+      );
+      if (this.terminal.options.fontFamily !== nextFont) {
+        this.terminal.options.fontFamily = nextFont;
+        needsFit = true;
+      }
     }
     if (this.terminal.options.fontSize !== settings.terminalFontSize) {
       this.terminal.options.fontSize = settings.terminalFontSize;
@@ -635,21 +752,37 @@ export class HerdrTerminalView extends ItemView {
     if (!select) {
       return;
     }
-    select.empty();
     const profiles = this.getAvailableProfiles();
-    for (const prof of profiles) {
-      const opt = select.createEl("option", { text: prof.name, value: prof.id });
-      if (prof.id === this.profileId && !this.customAgentTarget) {
-        opt.selected = true;
+    const signature =
+      profiles.map((prof) => `${prof.id}\0${prof.name}`).join("\n") +
+      `\0__attach__:${this.customAgentTarget}`;
+
+    if (signature !== this.lastProfileDropdownSig) {
+      this.lastProfileDropdownSig = signature;
+      select.empty();
+      for (const prof of profiles) {
+        const opt = select.createEl("option", { text: prof.name, value: prof.id });
+        if (prof.id === this.profileId && !this.customAgentTarget) {
+          opt.selected = true;
+        }
       }
+      if (this.customAgentTarget) {
+        const customOpt = select.createEl("option", {
+          text: `Attach: ${this.customAgentTarget}`,
+          value: "__agent_attach__",
+        });
+        customOpt.selected = true;
+        this.profileId = "__agent_attach__";
+      }
+      return;
     }
+
+    const desiredValue = this.customAgentTarget ? "__agent_attach__" : this.profileId;
     if (this.customAgentTarget) {
-      const customOpt = select.createEl("option", {
-        text: `Attach: ${this.customAgentTarget}`,
-        value: "__agent_attach__",
-      });
-      customOpt.selected = true;
       this.profileId = "__agent_attach__";
+    }
+    if (select.value !== desiredValue) {
+      select.value = desiredValue;
     }
   }
 
@@ -696,7 +829,13 @@ export class HerdrTerminalView extends ItemView {
   }
 
   private sendActiveSelection(): void {
-    const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const activeMd = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const trackedMd =
+      this.lastActiveMarkdownView &&
+      this.lastActiveMarkdownView.containerEl?.isConnected
+        ? this.lastActiveMarkdownView
+        : null;
+    const mdView = activeMd ?? trackedMd;
     const sel = mdView?.editor.getSelection() || "";
     if (!sel.trim()) {
       new Notice("Select text in an active Markdown editor first.");
@@ -716,7 +855,12 @@ export class HerdrTerminalView extends ItemView {
     }
     const profile = this.resolveSelectedProfile();
     if (profile.kind === "herdr-vault" || profile.kind === "herdr-agent") {
-      const agents = this.coordinator.getState().snapshot?.agents ?? [];
+      const allAgents = this.coordinator.getState().snapshot?.agents ?? [];
+      const target = (this.customAgentTarget || profile.agentTarget || "").trim();
+      const agents =
+        profile.kind === "herdr-agent" && target
+          ? allAgents.filter((a) => a.name === target || a.pane_id === target)
+          : allAgents;
       if (agents.some((a) => a.agent_status === "blocked")) {
         this.updateStatusBadge("blocked");
         return;

@@ -32,9 +32,9 @@ Pick any of them from **Spawn agent** in Mission Control. Run `herdr integration
 Some things only the app can show: a view, a plugin panel, a layout. Turn on **Let agents see and operate Obsidian** in Herdr settings and agents can:
 
 - **See.** Take a screenshot of the window and list its buttons and fields.
-- **Act.** Click, type (at `Visible` or `Fast` `uiTypingSpeed`), press shortcuts like `Ctrl+P`, scroll, drag, and insert lines directly at note anchors (`--note` with `--heading`, `--after`, `--line`, and `--at start|end`). This also needs the **Full** permission level.
+- **Act.** Click, type (at `Visible` or `Fast` `uiTypingSpeed`), press shortcuts like `Ctrl+P`, scroll, drag, and insert lines directly at note anchors (`--note` with `--heading`, `--after`, `--line`, and `--at start|end`). This also needs the **Full control** permission level.
 - **See who is acting.** Live visual agent cursors show each agent's plain name label as it works in Obsidian, dim after `1,500 ms` idle, auto-hide after `60,000 ms`, and disappear immediately when panes close, collapse, or switch notes.
-- **Verify and stay safe.** `obs-herdr ui insert-line` returns verified proof (`path`, `pane`, `line`, `text`, `heading`, `durationMs`) so extra read-backs are unnecessary. Wait commands confirm visible UI text, and UI actions inside protected areas (Herdr terminal views, Obsidian Settings, and community plugin toggles) fail with `ui_protected_area` unless `allowUiInProtectedAreas` is enabled.
+- **Verify and stay safe.** `obs-herdr ui insert-line` returns verified proof (`path`, `pane`, `line`, `text`, `heading`, `durationMs`) so extra read-backs are unnecessary. Wait commands confirm visible UI text, and UI actions inside protected areas (Herdr terminals, Mission Control, Herdr code block widgets, Bases boards, Obsidian Settings, and community plugin toggles) fail with `ui_protected_area` unless `allowUiInProtectedAreas` is enabled. Screenshots blank out Herdr terminals, Mission Control and Settings.
 
 It is off by default. Typing that changes the open note is logged and can be undone like any other edit.
 
@@ -69,7 +69,7 @@ Want to look around first? Open the [`demo-vault`](demo-vault) folder as a vault
 ## Privacy
 
 - Runs on your machine. No network calls, no telemetry, no account, no API keys.
-- You choose what agents may do: Read-only, Read-write or Full. Turn it off any time.
+- You choose what agents may do: Read only, Edit notes or Full control. Turn it off any time.
 - The settings folder, `.git` and `.env` files are always off limits.
 - Screenshots stay on your machine in a private folder. Like note text, anything an agent reads or sees goes to that agent's provider, so leave UI control off for windows you would not share.
 
@@ -81,13 +81,19 @@ None. The plugin makes no internet requests. It talks to Herdr and to your agent
 
 It needs [Herdr](https://herdr.dev), which you install yourself. The plugin starts Herdr and your shell as local processes, which is why it is desktop only.
 
+It also uses programs most computers already have:
+
+- Python 3 runs the terminal on Linux and macOS. Without it, full-screen programs cannot run and the terminal tells you so.
+- Node.js or Python 3 runs the `obs-herdr` command that agents use to reach your vault.
+- On Windows, the terminal is a small C# helper shipped as source inside the plugin. Windows PowerShell compiles it on your computer when a terminal opens.
+
 ### Files outside the vault
 
-The plugin keeps a private runtime folder at `~/.cache/obs-herdr/` (your temp folder on Windows). It holds the bridge socket, the `obs-herdr` command for agents, its connection details, and UI control screenshots. Delete the folder at any time; it is recreated when needed.
+The plugin keeps a private runtime folder at `~/.cache/obs-herdr/` on Linux and macOS and at `%LOCALAPPDATA%\obs-herdr` on Windows. If that location cannot be used, it falls back to your runtime or temp folder. It holds the bridge socket, the `obs-herdr` command for agents, its connection details, and UI control screenshots. Delete the folder at any time; it is recreated when needed.
 
 ## Status
 
-Tested on Linux with Herdr 0.8.2 and four agents running at once. UI control was tested live in Obsidian 1.15.0 on Linux (Flatpak, Wayland). macOS and Windows are not tested yet. Reports are welcome in [Issues](https://github.com/AgriciDaniel/obsidian-herdr/issues); see [CONTRIBUTING](CONTRIBUTING.md) for what to include.
+Tested on Linux with Herdr 0.8.2 and 0.9.5 and four agents running at once. UI control was tested live in Obsidian 1.15.1 on Linux (Flatpak, Wayland). macOS and Windows are not tested yet. Reports are welcome in [Issues](https://github.com/AgriciDaniel/obsidian-herdr/issues); see [CONTRIBUTING](CONTRIBUTING.md) for what to include.
 
 Good to know:
 
@@ -116,12 +122,12 @@ obs-herdr ui insert-line --note "Specs/Plan.md" --heading "Steps" --text "- veri
 obs-herdr ui click --selector ".workspace-leaf.mod-active .cm-content"
 obs-herdr ui key Mod+P
 obs-herdr ui type "Hello from an agent"
-obs-herdr mcp   # stdio MCP server, 26 tools
+obs-herdr mcp   # stdio MCP server, 27 tools
 ```
 
-UI control goes through Electron's own capture and input APIs from inside the plugin, so it needs no debugging port and no extra install. Selectors must match exactly one visible, uncovered element, password fields are refused, protected areas (`ui_protected_area`: Herdr terminal views, Settings modal, community plugin toggles) are blocked unless `allowUiInProtectedAreas` is enabled, `uiTypingSpeed` selects `visible` or `fast` typing, and input from several agents is queued inside one serialized lock so it never interleaves.
+UI control goes through Electron's own capture and input APIs from inside the plugin, so it needs no debugging port and no extra install. Selectors must match exactly one visible, uncovered element, password fields are refused, protected areas (`ui_protected_area`: Herdr terminals, Mission Control, Herdr code block widgets, Bases boards, Settings, community plugin toggles) are blocked unless `allowUiInProtectedAreas` is enabled, `uiTypingSpeed` selects `visible` or `fast` typing, and input from several agents is queued inside one serialized lock so it never interleaves.
 
-To connect an MCP client, click **Copy MCP JSON config** in Mission Control, Vault tab, under Connection details.
+To connect an MCP client, click **Copy MCP config** in Mission Control, Vault tab, under Connection details.
 
 ### How the bridge is protected
 

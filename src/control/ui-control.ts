@@ -3,79 +3,105 @@
 // See src/control/LICENSE and the NOTICE file in the repository root.
 
 import { EditorView } from "@codemirror/view";
-import type { AgentCursorOverlay, DocumentCursorContext, NoteDocChange } from "./agent-cursor";
-import { performDrag } from "./html-drag";
+import type { AgentCursorOverlay } from "./agent-cursor";
+import { computeDragStepCount, performDrag } from "./html-drag";
 import { buildKeyPress } from "./keys";
 import {
   assertNestedCodeMirrorIntact,
   classifyNestedEditable,
   cmOwnsElementStrict,
   commitNestedEditor,
+  getDeepActiveElement,
   isInTableCellWidget,
   isNestedCodeMirrorOwnership,
   resolveNestedCodeMirror,
   shouldPreserveNestedFocus,
 } from "./nested-editors";
+import {
+  HERDR_TERMINAL_PROTECTED_SELECTOR,
+  SETTINGS_MODAL_PROTECTED_SELECTOR,
+  UiSafetyGuard,
+} from "./safety-guard";
+import {
+  DEFAULT_INSPECT_SELECTOR,
+  UiControlError,
+  base64FromBytes,
+  clampPointToRect,
+  escapeCssIdent,
+  findClosestElement,
+  hasNonZeroBox,
+  isElementContentEditable,
+  isInputOrTextarea,
+  nextFenceState,
+  num,
+  parseCssPx,
+  rectMidY,
+  splitTypingChunks,
+  type BeforeMutationHook,
+  type CaretCoords,
+  type CodeMirrorViewLike,
+  type DocumentCursorContext,
+  type ElementLeafContext,
+  type FocusState,
+  type FocusedOwnership,
+  type InspectedElement,
+  type MutationCompleteCallback,
+  type NoteDocChange,
+  type NoteLeafContext,
+  type OpenFence,
+  type PointAtResultOutput,
+  type PointAtResultTarget,
+  type ResolvedUiTarget,
+  type TerminalInputDeliverer,
+  type UiControlServiceOptions,
+  type UiMutationAction,
+  type UiMutationEdit,
+  type UiTypingSpeed,
+  type WebContentsLike,
+  type WorkspaceLeafLike,
+} from "./types";
 
-/** Subset of Electron's NativeImage used for screenshots. */
-export interface NativeImageLike {
-  isEmpty(): boolean;
-  getSize(): { width: number; height: number };
-  toPNG(): Uint8Array;
-  resize(options: { width: number; quality?: string }): NativeImageLike;
-}
-
-/** Subset of Electron's WebContents used for capture and trusted input. */
-export interface WebContentsLike {
-  capturePage(): Promise<NativeImageLike>;
-  sendInputEvent(event: Record<string, unknown>): void;
-  insertText(text: string): Promise<void> | void;
-  getZoomFactor?(): number;
-}
-
-export interface AnchorTarget {
-  note: string;
-  line?: number;
-  after?: string;
-  heading?: string;
-  at?: "start" | "end";
-}
-
-export type UiTarget = { selector: string } | { x: number; y: number } | AnchorTarget;
-
-export class UiControlError extends Error {
-  readonly code: string;
-
-  constructor(code: string, message: string) {
-    super(message);
-    this.name = "UiControlError";
-    this.code = code;
-  }
-}
-
-export const DEFAULT_INSPECT_SELECTOR =
-  'button,input,textarea,select,[role="button"],[role="tab"],[aria-label],.nav-file-title,.workspace-leaf-resize-handle';
+export { DEFAULT_INSPECT_SELECTOR, UiControlError } from "./types";
+export type {
+  AnchorTarget,
+  BeforeMutationHook,
+  CaretCoords,
+  CodeMirrorDocLike,
+  CodeMirrorViewLike,
+  ElementLeafContext,
+  FocusState,
+  FocusedOwnership,
+  InspectElementInfo,
+  InspectedElement,
+  MutationCompleteCallback,
+  NativeImageLike,
+  NoteLeafContext,
+  OpenNoteLeafInfo,
+  PointAtResultOutput,
+  PointAtResultTarget,
+  ResolvedUiTarget,
+  TerminalInputDeliverer,
+  UiControlServiceOptions,
+  UiMutationAction,
+  UiMutationCompletion,
+  UiMutationContext,
+  UiMutationEdit,
+  UiMutationHook,
+  UiMutationHookContext,
+  UiTarget,
+  UiTargetInput,
+  UiTypingSpeed,
+  WebContentsLike,
+  WorkspaceLeafLike,
+} from "./types";
 
 const MAX_TYPE_CHARS = 20000;
 const MAX_WAIT_MS = 20000;
 const MAX_BATCH_STEPS = 20;
-const MAX_TYPING_CHUNKS = 40;
 const TYPING_BUDGET_PER_100_CHARS_MS = 1400;
 const CARET_SCROLL_MARGIN_LINES = 3;
 const DEFAULT_LINE_HEIGHT_PX = 22;
 const MODAL_SELECTOR = '.modal-container, .modal, .prompt, .menu, [role="dialog"], [role="menu"]';
-const HERDR_TERMINAL_PROTECTED_SELECTOR =
-  '.herdr-terminal-pane, [data-type="herdr-terminal-view"], .herdr-terminal-host, .xterm, .xterm-helper-textarea';
-const COMMUNITY_PLUGIN_PROTECTED_SELECTOR =
-  '.installed-plugins-container, .community-plugin-item, .community-plugins-container, .community-plugin-info, [data-plugin-id]';
-const SETTINGS_MODAL_PROTECTED_SELECTOR =
-  '.mod-settings, .modal-container.mod-settings, .modal.mod-settings, [data-type="settings"]';
-const WINDOW_CONTROL_PROTECTED_SELECTOR =
-  '.titlebar, .titlebar-button-container, .titlebar-button, .titlebar-close, .titlebar-minimize, .titlebar-maximize, .mod-close, .mod-minimize, .mod-maximize, .window-control, .window-controls';
-const APP_QUIT_PROTECTED_SELECTOR =
-  '[data-command="app:quit"], [data-command-id="app:quit"], [data-value="app:quit"], [data-command="window:close"], [data-command-id="window:close"], [data-value="window:close"]';
-const SETTINGS_OPEN_PROTECTED_SELECTOR =
-  '[data-command="app:open-settings"], [data-command-id="app:open-settings"], [data-value="app:open-settings"]';
 // Electron main-menu zoom accelerators bypass renderer sendInputEvent, so map them to Obsidian commands.
 const APP_ACCELERATOR_COMMANDS: ReadonlyArray<{
   keyCodes: readonly string[];
@@ -87,116 +113,6 @@ const APP_ACCELERATOR_COMMANDS: ReadonlyArray<{
   { keyCodes: ["0"], allowShift: false, commandId: "window:reset-zoom" },
 ];
 
-export type UiTypingSpeed = "visible" | "fast";
-
-export interface CaretCoords {
-  left: number;
-  top: number;
-  right?: number;
-  bottom?: number;
-}
-
-export interface CodeMirrorDocLike {
-  length: number;
-  lines: number;
-  toString(): string;
-  line(n: number): { from: number; to: number; number: number; text: string };
-}
-
-export interface CodeMirrorViewLike {
-  dom?: Element | null;
-  contentDOM?: Element | null;
-  scrollDOM?: HTMLElement | null;
-  state?: {
-    doc?: CodeMirrorDocLike;
-    selection?: { main?: { head?: number; anchor?: number; from?: number; to?: number } };
-  };
-  coordsAtPos?(pos: number, side?: number): CaretCoords | null;
-  posAtCoords?(coords: { x: number; y: number }): number | null;
-  dispatch?(spec: unknown): void;
-  focus?(): void;
-}
-
-export type TerminalInputDeliverer = (
-  element: Element,
-  data: string
-) => boolean | void | Promise<boolean | void>;
-
-export interface ElementLeafContext {
-  notePath?: string;
-  pane?: string;
-  activePane?: boolean;
-}
-
-export interface NoteLeafContext {
-  path: string;
-  pane: string;
-  activePane: boolean;
-  containerEl: Element;
-  cm?: CodeMirrorViewLike | null;
-  contentText?: string;
-  view?: WorkspaceLeafLike["view"] | null;
-  workspaceLeaf?: WorkspaceLeafLike | null;
-}
-
-export interface InspectedElement {
-  selector: string;
-  tag: string;
-  role: string | null;
-  label: string;
-  text: string;
-  value?: string;
-  disabled: boolean;
-  protected?: boolean;
-  rect: { x: number; y: number; width: number; height: number };
-  notePath?: string;
-  pane?: string;
-  activePane?: boolean;
-}
-
-export interface FocusState {
-  tag: string | null;
-  label: string;
-  editable: boolean;
-  password: boolean;
-}
-
-export type UiMutationAction = "click" | "type" | "press_key" | "insert_line" | "drag";
-
-export interface UiMutationEdit {
-  from: number;
-  to: number;
-  insert: string;
-}
-
-export interface UiMutationCompletion {
-  ok: boolean;
-  errorCode?: string;
-  insertedChars?: number;
-  edits?: UiMutationEdit[];
-  abortedAfterNoteSwitch?: boolean;
-}
-
-export interface UiMutationContext {
-  action: UiMutationAction;
-  notePath: string | null;
-  paneId: string | null;
-  caller: string;
-  targetView?: unknown;
-  targetCm?: CodeMirrorViewLike | null;
-  targetElement?: Element | null;
-  targetFilePath?: string;
-  expectedFileOperation?: { kind: "trash"; path: string };
-}
-
-export type MutationCompleteCallback = (
-  completion?: UiMutationCompletion
-) => void | Promise<void>;
-
-export type BeforeMutationHook = (
-  context: UiMutationContext
-) => void | MutationCompleteCallback | Promise<void | MutationCompleteCallback>;
-
 interface FocusSnapshot {
   element: HTMLElement | null;
   selectionStart: number | null;
@@ -204,22 +120,6 @@ interface FocusSnapshot {
   selectionDirection: "forward" | "backward" | "none" | null;
   domRanges: Range[];
   visibleModals: Set<Element>;
-}
-
-export interface PointAtResultTarget {
-  notePath?: string;
-  selector?: string;
-  element?: Element | null;
-  prefer?: "auto" | "leaf" | "editor" | "file-tree" | "modal";
-}
-
-export interface PointAtResultOutput {
-  shown: boolean;
-  x?: number;
-  y?: number;
-  notePath?: string;
-  label: string;
-  durationMs?: number;
 }
 
 interface EditorTypingOwnership {
@@ -262,6 +162,9 @@ interface ExpectedAgentEvent {
   altKey: boolean;
   metaKey: boolean;
   expiresAt: number;
+  isInsertText?: boolean;
+  remainingText?: string;
+  targetEl?: Element | null;
 }
 
 interface FocusShieldSession {
@@ -269,139 +172,73 @@ interface FocusShieldSession {
   activeCount: number;
   captured: CapturedUserEvent[];
   detach: (() => void) | null;
+  suspended?: boolean;
 }
 
-interface ResolvedUiTarget {
-  point: { x: number; y: number };
-  element?: Element | null;
-  isSelector?: boolean;
-  notePath?: string;
-  paneId?: string;
-  containerEl?: Element | null;
-  cm?: CodeMirrorViewLike | null;
-  view?: WorkspaceLeafLike["view"] | null;
-  workspaceLeaf?: WorkspaceLeafLike | null;
-  pos?: number;
-  scrolled?: boolean;
+interface CachedInputMirror {
+  el: Element;
+  isTextarea: boolean;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  mirror: HTMLDivElement;
+  marker: HTMLSpanElement | null;
+  textNode: Text | null;
 }
 
-function num(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+interface GraphemeSegmenterLike {
+  segment(input: string): Iterable<{ index: number; segment: string }>;
 }
 
-function base64FromBytes(bytes: Uint8Array): string {
-  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
-}
+let cachedGraphemeSegmenter: GraphemeSegmenterLike | null | undefined;
 
-function hasNonZeroBox(
-  rect:
-    | {
-        left?: number;
-        top?: number;
-        width?: number;
-        height?: number;
-        right?: number;
-        bottom?: number;
-      }
-    | null
-    | undefined
-): rect is CaretCoords & { width?: number; height?: number } {
-  if (!rect) {
-    return false;
+function getGraphemeSegmenter(): GraphemeSegmenterLike | null {
+  if (cachedGraphemeSegmenter !== undefined) {
+    return cachedGraphemeSegmenter;
   }
-  const left = rect.left;
-  const top = rect.top;
-  if (
-    typeof left !== "number" ||
-    !Number.isFinite(left) ||
-    typeof top !== "number" ||
-    !Number.isFinite(top)
-  ) {
-    return false;
-  }
-  const w = Number.isFinite(rect.width)
-    ? (rect.width as number)
-    : Math.max(0, (rect.right ?? left) - left);
-  const h = Number.isFinite(rect.height)
-    ? (rect.height as number)
-    : Math.max(0, (rect.bottom ?? top) - top);
-  return left !== 0 || top !== 0 || w > 0 || h > 0;
-}
-
-function rectMidY(rect: { top: number; bottom?: number; height?: number }): number {
-  if (typeof rect.bottom === "number" && Number.isFinite(rect.bottom)) {
-    return Math.round((rect.top + rect.bottom) / 2);
-  }
-  if (typeof rect.height === "number" && Number.isFinite(rect.height)) {
-    return Math.round(rect.top + rect.height / 2);
-  }
-  return Math.round(rect.top);
-}
-
-function splitTypingChunks(text: string): string[] {
-  const rawTokens = text.match(/\S+\s*|\s+/g) ?? [text];
-  const fine: string[] = [];
-  for (const token of rawTokens) {
-    const cps = Array.from(token);
-    if (cps.length <= 8) {
-      fine.push(token);
-    } else {
-      for (let i = 0; i < cps.length; i += 8) {
-        fine.push(cps.slice(i, i + 8).join(""));
-      }
+  const SegmenterCtor = (
+    Intl as unknown as {
+      Segmenter?: new (
+        locale: string | undefined,
+        options: { granularity: "grapheme" }
+      ) => GraphemeSegmenterLike;
     }
-  }
-  if (fine.length <= MAX_TYPING_CHUNKS) {
-    return fine;
-  }
-  const groupSize = Math.ceil(fine.length / MAX_TYPING_CHUNKS);
-  const merged: string[] = [];
-  for (let i = 0; i < fine.length; i += groupSize) {
-    merged.push(fine.slice(i, i + groupSize).join(""));
-  }
-  return merged;
+  ).Segmenter;
+  cachedGraphemeSegmenter =
+    typeof SegmenterCtor === "function"
+      ? new SegmenterCtor(undefined, { granularity: "grapheme" })
+      : null;
+  return cachedGraphemeSegmenter;
 }
 
-function isInputOrTextarea(el: Element | null): el is HTMLInputElement | HTMLTextAreaElement {
-  if (!el) {
-    return false;
-  }
-  const tag = (el.tagName ?? "").toUpperCase();
-  if (tag === "INPUT" || tag === "TEXTAREA") {
-    return true;
-  }
-  try {
-    return Boolean(el.matches?.("input,textarea"));
-  } catch {
-    return false;
-  }
-}
-
-interface OpenFence {
-  char: "`" | "~";
-  length: number;
-}
-
-function nextFenceState(lineText: string, open: OpenFence | null): OpenFence | null {
-  const trimmed = lineText.trimStart();
-  if (!open) {
-    const backtick = /^(`{3,})([^`]*)$/.exec(trimmed);
-    if (backtick) {
-      return { char: "`", length: backtick[1].length };
-    }
-    const tilde = /^(~{3,})(.*)$/.exec(trimmed);
-    if (tilde) {
-      return { char: "~", length: tilde[1].length };
-    }
-    return null;
-  }
-  const closeRe = open.char === "`" ? /^(`{3,})\s*$/ : /^(~{3,})\s*$/;
-  const close = closeRe.exec(trimmed);
-  if (close && close[1].length >= open.length) {
-    return null;
-  }
-  return open;
-}
+const NATIVE_MIRROR_STYLE_PROPS = [
+  "direction",
+  "fontFamily",
+  "fontSize",
+  "fontStyle",
+  "fontVariant",
+  "fontWeight",
+  "letterSpacing",
+  "lineHeight",
+  "tabSize",
+  "textAlign",
+  "textIndent",
+  "textTransform",
+  "wordSpacing",
+  "paddingTop",
+  "paddingRight",
+  "paddingBottom",
+  "paddingLeft",
+  "borderTopWidth",
+  "borderRightWidth",
+  "borderBottomWidth",
+  "borderLeftWidth",
+  "borderTopStyle",
+  "borderRightStyle",
+  "borderBottomStyle",
+  "borderLeftStyle",
+] as const;
 
 /**
  * Lets agents see and operate the Obsidian window through Electron's own
@@ -422,36 +259,26 @@ export class UiControlService {
   private readonly cursorOverlay: AgentCursorOverlay | null;
   private readonly resolveAgentLabel: (caller: string) => string;
   private readonly getUiTypingSpeed: () => UiTypingSpeed;
-  private readonly getAllowUiInProtectedAreas: () => boolean;
+  private readonly safetyGuard: UiSafetyGuard;
   private readonly deliverToTerminal: TerminalInputDeliverer | null;
   private readonly executeCommandByIdOption: ((commandId: string) => boolean) | null;
+  private readonly getAppOption: (() => unknown) | null;
+  private pendingAbandonCheck: (() => boolean) | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private activeMutationRun: ActiveMutationRun | null = null;
   private activeShield: FocusShieldSession | null = null;
   private expectedAgentLedger: ExpectedAgentEvent[] = [];
-  private deferredUserInputs: CapturedUserEvent[] = [];
   private replayingUserInput = false;
   private dispatchingAgentInput = false;
   private inBatchExecution = false;
+  private inUiAction = false;
+  private activeActionZoom: number | null = null;
+  private cachedInputMirror: CachedInputMirror | null = null;
   private disposed = false;
   private readonly waitAbortCallbacks = new Set<() => void>();
+  private readonly activeTimers = new Set<ReturnType<Window["setTimeout"]>>();
 
-  constructor(options: {
-    win: Window;
-    getWebContents: () => WebContentsLike | null;
-    getCodeMirrorView?: () => CodeMirrorViewLike | null;
-    resolveElementContext?: (el: Element) => ElementLeafContext | null;
-    resolveNoteLeaf?: ((notePath: string) => NoteLeafContext | null);
-    beforeMutation?: BeforeMutationHook;
-    platform?: string;
-    sleep?: (ms: number) => Promise<void>;
-    cursorOverlay?: AgentCursorOverlay | null;
-    resolveAgentLabel?: (caller: string) => string;
-    getUiTypingSpeed?: () => UiTypingSpeed;
-    getAllowUiInProtectedAreas?: () => boolean;
-    deliverToTerminal?: TerminalInputDeliverer;
-    executeCommandById?: (commandId: string) => boolean;
-  }) {
+  constructor(options: UiControlServiceOptions) {
     this.win = options.win;
     this.getWebContents = options.getWebContents;
     this.getCodeMirrorView = options.getCodeMirrorView ?? null;
@@ -460,13 +287,84 @@ export class UiControlService {
     this.beforeMutation = options.beforeMutation ?? null;
     this.platform = options.platform ?? process.platform;
     this.sleep =
-      options.sleep ?? ((ms) => new Promise((resolve) => this.win.setTimeout(resolve, ms)));
+      options.sleep ??
+      ((ms) => {
+        if (this.disposed) {
+          return Promise.resolve();
+        }
+        return new Promise<void>((resolve) => {
+          let settled = false;
+          let timerId: ReturnType<Window["setTimeout"]> | null = null;
+          const finish = (): void => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            if (timerId !== null) {
+              this.win.clearTimeout?.(timerId);
+              this.activeTimers.delete(timerId);
+              timerId = null;
+            }
+            this.waitAbortCallbacks.delete(finish);
+            resolve();
+          };
+          this.waitAbortCallbacks.add(finish);
+          timerId = this.win.setTimeout(finish, ms);
+          this.activeTimers.add(timerId);
+        });
+      });
     this.cursorOverlay = options.cursorOverlay ?? null;
     this.resolveAgentLabel = options.resolveAgentLabel ?? ((caller) => caller);
     this.getUiTypingSpeed = options.getUiTypingSpeed ?? (() => "visible");
-    this.getAllowUiInProtectedAreas = options.getAllowUiInProtectedAreas ?? (() => false);
+    this.safetyGuard = new UiSafetyGuard(
+      options.win,
+      options.getAllowUiInProtectedAreas ?? (() => false)
+    );
     this.deliverToTerminal = options.deliverToTerminal ?? null;
     this.executeCommandByIdOption = options.executeCommandById ?? null;
+    this.getAppOption = options.getApp ?? null;
+  }
+
+  private static readonly MUTATION_HOOK_TIMEOUT_MS = 10000;
+  private static readonly CAPTURE_PAGE_TIMEOUT_MS = 10000;
+
+  private isPromiseLike<T>(value: unknown): value is PromiseLike<T> {
+    return (
+      value !== null &&
+      (typeof value === "object" || typeof value === "function") &&
+      typeof (value as PromiseLike<T>).then === "function"
+    );
+  }
+
+  private async raceWithTimeout<T>(
+    promise: PromiseLike<T>,
+    timeoutMs: number,
+    code: string,
+    message: string
+  ): Promise<T> {
+    if (typeof this.win.setTimeout !== "function" || timeoutMs <= 0) {
+      return promise;
+    }
+    let timer: ReturnType<Window["setTimeout"]> | null = null;
+    try {
+      return await Promise.race([
+        Promise.resolve(promise),
+        new Promise<never>((_, reject) => {
+          timer = this.win.setTimeout(() => {
+            if (timer !== null) {
+              this.activeTimers.delete(timer);
+            }
+            reject(new UiControlError(code, message));
+          }, timeoutMs);
+          this.activeTimers.add(timer);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) {
+        this.activeTimers.delete(timer);
+        this.win.clearTimeout?.(timer);
+      }
+    }
   }
 
   private async timedAsync<T extends object>(
@@ -481,18 +379,30 @@ export class UiControlService {
   private executeUiAction<T extends Record<string, unknown>>(
     task: () => Promise<T>,
     includeFocus = false,
-    borrowFocus = true
+    borrowFocus: boolean | (() => boolean) = true
   ): Promise<T & { durationMs: number }> {
     return this.serialize(() =>
       this.timedAsync(async () => {
-        const result = borrowFocus ? await this.withFocusRestore(task) : await task();
-        if (!includeFocus) {
-          return result;
+        const prevInUiAction = this.inUiAction;
+        this.inUiAction = true;
+        this.activeActionZoom = null;
+        try {
+          const shouldBorrow = typeof borrowFocus === "function" ? borrowFocus() : borrowFocus;
+          const result = shouldBorrow ? await this.withFocusRestore(task) : await task();
+          if (!includeFocus) {
+            return result;
+          }
+          return {
+            ...result,
+            focus: this.focusState(),
+          };
+        } finally {
+          this.activeActionZoom = null;
+          this.inUiAction = prevInUiAction;
+          if (!prevInUiAction) {
+            this.releaseInputMirror();
+          }
         }
-        return {
-          ...result,
-          focus: this.focusState(),
-        };
       })
     );
   }
@@ -540,7 +450,12 @@ export class UiControlService {
     return this.timedAsync(async () => {
       const wc = this.requireWebContents();
       await this.waitForPaint();
-      let image = await wc.capturePage();
+      let image = await this.raceWithTimeout(
+        Promise.resolve(wc.capturePage()),
+        UiControlService.CAPTURE_PAGE_TIMEOUT_MS,
+        "ui_timeout",
+        "Window screenshot capture timed out."
+      );
       if (image.isEmpty()) {
         throw new UiControlError(
           "ui_capture_empty",
@@ -553,10 +468,19 @@ export class UiControlService {
       }
       const size = image.getSize();
       const viewport = this.viewport();
+      // Herdr terminals, Mission Control and Settings are hidden from inspect, so they
+      // are painted over here too: a screenshot must not show what inspect redacts
+      // (for example an API key typed into another agent's terminal).
+      const maskRects = this.protectedCaptureRects(viewport);
+      const png =
+        maskRects.length > 0
+          ? await this.maskCapturedPng(image.toPNG(), size, viewport, maskRects)
+          : image.toPNG();
       return {
-        image: { mimeType: "image/png", data: base64FromBytes(image.toPNG()) },
+        image: { mimeType: "image/png", data: base64FromBytes(png) },
         width: size.width,
         height: size.height,
+        maskedProtectedAreas: maskRects.length,
         viewport,
         cssPixelsPerImagePixel: {
           x: viewport.width / size.width,
@@ -632,6 +556,7 @@ export class UiControlService {
 
   dispose(): void {
     this.disposed = true;
+    this.releaseInputMirror();
     if (this.activeShield) {
       try {
         this.activeShield.detach?.();
@@ -642,7 +567,14 @@ export class UiControlService {
       this.activeShield = null;
     }
     this.expectedAgentLedger = [];
-    this.deferredUserInputs = [];
+    for (const timerId of Array.from(this.activeTimers)) {
+      try {
+        this.win.clearTimeout?.(timerId);
+      } catch {
+        // Ignore timer cleanup errors during plugin unload
+      }
+    }
+    this.activeTimers.clear();
     for (const abort of Array.from(this.waitAbortCallbacks)) {
       try {
         abort();
@@ -651,6 +583,41 @@ export class UiControlService {
       }
     }
     this.waitAbortCallbacks.clear();
+  }
+
+  private findVisibleTextMatchesViaTreeWalker(text: string, limit: number): InspectedElement[] | null {
+    const doc = this.win.document;
+    const body = doc?.body;
+    if (!body || typeof doc.createTreeWalker !== "function") {
+      return null;
+    }
+    const allowProtected = this.safetyGuard.isProtectedAreasAllowed();
+    const showText = typeof NodeFilter !== "undefined" ? NodeFilter.SHOW_TEXT : 4;
+    const walker = doc.createTreeWalker(body, showText);
+    const matchedEls: Element[] = [];
+    const seen = new Set<Element>();
+    let node: Node | null = walker.nextNode();
+    while (node) {
+      const val = node.nodeValue ?? "";
+      if (val.includes(text)) {
+        const parent = node.parentElement;
+        if (
+          parent &&
+          !seen.has(parent) &&
+          this.isVisible(parent) &&
+          !this.safetyGuard.isPasswordField(parent) &&
+          (allowProtected || !this.safetyGuard.detectProtectedArea(parent))
+        ) {
+          seen.add(parent);
+          matchedEls.push(parent);
+          if (matchedEls.length >= limit) {
+            break;
+          }
+        }
+      }
+      node = walker.nextNode();
+    }
+    return this.formatInspectedElements(matchedEls, limit);
   }
 
   waitFor(params: Record<string, unknown> = {}, caller = "agent"): Promise<unknown> {
@@ -667,12 +634,32 @@ export class UiControlService {
           throw new UiControlError("ui_unavailable", "UI control service was disposed.");
         }
         const doc = this.win.document;
-        // Match against the full visible text first, then collect bounded element previews.
-        const found = selector
-          ? this.collect(selector, 20, text).total > 0
-          : (doc.body?.innerText ?? "").includes(text);
+        let found = false;
+        let matches: InspectedElement[] = [];
+        if (selector) {
+          const collected = this.collect(selector, 20, text, true);
+          found = collected.total > 0;
+          if (found) {
+            matches = collected.elements;
+          }
+        } else {
+          const walked = this.findVisibleTextMatchesViaTreeWalker(text, 20);
+          if (walked !== null) {
+            found = walked.length > 0;
+            matches = walked;
+          } else {
+            // Fallback for minimal unit-test mocks without document.createTreeWalker.
+            const bodyNodes = this.queryAll("body *");
+            if (bodyNodes.length > 0) {
+              const collected = this.collect("body *", 20, text, true);
+              found = collected.total > 0;
+              matches = collected.elements;
+            } else {
+              found = (doc.body?.innerText ?? "").includes(text);
+            }
+          }
+        }
         if (found) {
-          const matches = this.collect(selector ?? "body *", 20, text, true).elements;
           if (matches.length > 0) {
             const r = matches[0].rect;
             this.showCursor(
@@ -752,16 +739,17 @@ export class UiControlService {
         : undefined);
     const resolved = await this.resolveTargetAsync(targetParam);
     const rawEl = resolved.element ?? resolved.containerEl ?? null;
-    if (!rawEl || rawEl.tagName.toLowerCase() !== "select") {
+    const selectCandidate = rawEl ? findClosestElement(rawEl, "select") : null;
+    if (!selectCandidate || selectCandidate.tagName.toLowerCase() !== "select") {
       throw new UiControlError(
         "invalid_params",
         `ui.select target must be a <select> element (got ${rawEl ? `<${rawEl.tagName.toLowerCase()}>` : "none"}).`
       );
     }
-    this.assertElementNotProtected(rawEl, "select");
-    this.assertPointReceiverSafe(resolved.point, "select", this.expectedTargetContainer(resolved));
+    this.safetyGuard.assertElementNotProtected(selectCandidate, "select");
+    this.safetyGuard.assertPointReceiverSafe(resolved.point, "select", this.expectedTargetContainer(resolved));
 
-    const selectEl = rawEl as HTMLSelectElement;
+    const selectEl = selectCandidate as HTMLSelectElement;
     if (selectEl.disabled) {
       throw new UiControlError("ui_target_disabled", "Target <select> element is disabled.");
     }
@@ -794,7 +782,7 @@ export class UiControlService {
     }
     const parentEl = (matched as unknown as { parentElement?: Element | null }).parentElement ?? null;
     const parentOptgroupDisabled =
-      Boolean(this.findClosestElement(matched as unknown as Element, "optgroup[disabled]")) ||
+      Boolean(findClosestElement(matched as unknown as Element, "optgroup[disabled]")) ||
       (parentEl?.tagName?.toLowerCase() === "optgroup" &&
         Boolean((parentEl as unknown as { disabled?: boolean }).disabled));
     if (matched.disabled || parentOptgroupDisabled) {
@@ -815,34 +803,53 @@ export class UiControlService {
       docCtx
     );
 
-    const previousValue = selectEl.value;
-    selectEl.value = matched.value;
-    matched.selected = true;
+    const targetCtx = this.resolveTargetLeafMeta(resolved);
+    const applySelect = async (): Promise<Record<string, unknown>> => {
+      const previousValue = selectEl.value;
+      selectEl.value = matched.value;
+      matched.selected = true;
 
-    const makeEvent = (type: string): Event => {
-      const EventCtor = (this.win as unknown as { Event?: typeof Event }).Event ?? Event;
-      return new EventCtor(type, { bubbles: true });
+      const makeEvent = (type: string): Event => {
+        const EventCtor = (this.win as unknown as { Event?: typeof Event }).Event ?? Event;
+        return new EventCtor(type, { bubbles: true });
+      };
+      selectEl.dispatchEvent(makeEvent("input"));
+      selectEl.dispatchEvent(makeEvent("change"));
+
+      if (selectEl.value !== matched.value) {
+        throw new UiControlError(
+          "ui_effect_failed",
+          `Expected <select> value '${matched.value}', but element kept '${selectEl.value}'.`
+        );
+      }
+      await this.waitForCursorSettled(caller);
+
+      return {
+        selected: true,
+        value: selectEl.value,
+        label: optionLabel(matched),
+        previousValue,
+        changed: selectEl.value !== previousValue,
+        point: resolved.point,
+        selector: this.selectorPath(selectEl),
+      };
     };
-    selectEl.dispatchEvent(makeEvent("input"));
-    selectEl.dispatchEvent(makeEvent("change"));
 
-    if (selectEl.value !== matched.value) {
-      throw new UiControlError(
-        "ui_effect_failed",
-        `Expected <select> value '${matched.value}', but element kept '${selectEl.value}'.`
-      );
+    if (!this.beforeMutation) {
+      return applySelect();
     }
-    await this.waitForCursorSettled(caller);
-
-    return {
-      selected: true,
-      value: selectEl.value,
-      label: optionLabel(matched),
-      previousValue,
-      changed: selectEl.value !== previousValue,
-      point: resolved.point,
-      selector: this.selectorPath(selectEl),
-    };
+    return this.withMutationHook(
+      "select",
+      targetCtx?.notePath ?? null,
+      targetCtx?.paneId ?? null,
+      caller,
+      applySelect,
+      {
+        targetView: resolved.view ?? undefined,
+        targetCm: resolved.cm ?? undefined,
+        targetElement: selectEl,
+      }
+    );
   }
 
   private async dispatchResolvedClick(
@@ -872,7 +879,7 @@ export class UiControlService {
     const at = this.toWindowPoint(wc, point);
     wc.sendInputEvent({ type: "mouseMove", ...at });
     // Validate the topmost element right before sending mouseDown so late overlays block the click.
-    this.assertPointReceiverSafe(point, actionName, expectedContainer);
+    this.safetyGuard.assertPointReceiverSafe(point, actionName, expectedContainer);
     for (let i = 1; i <= count; i += 1) {
       try {
         wc.sendInputEvent({ type: "mouseDown", ...at, button, clickCount: i });
@@ -926,29 +933,31 @@ export class UiControlService {
     caller: string,
     notifyMutation = true
   ): Promise<Record<string, unknown>> {
-    return this.timedAsync(async () => {
-      const wc = this.requireWebContents();
-      const resolved = await this.resolveTargetAsync(params.target);
-      this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "click");
-      this.assertPointReceiverSafe(resolved.point, "click", this.expectedTargetContainer(resolved));
-      const targetCtx = notifyMutation ? this.resolveTargetLeafMeta(resolved) : null;
-      const run = () => this.dispatchResolvedClick(wc, resolved, params, caller, "click");
-      if (!targetCtx) {
-        return run();
+    const wc = this.requireWebContents();
+    const resolved = await this.resolveTargetAsync(params.target);
+    const clickEl = resolved.element ?? resolved.containerEl ?? null;
+    this.safetyGuard.assertElementNotProtected(clickEl, "click");
+    if (this.safetyGuard.isPasswordField(clickEl)) {
+      throw new UiControlError("ui_password_field", "Refused to click a password field.");
+    }
+    this.safetyGuard.assertPointReceiverSafe(resolved.point, "click", this.expectedTargetContainer(resolved));
+    const targetCtx = notifyMutation ? this.resolveTargetLeafMeta(resolved) : null;
+    const run = () => this.dispatchResolvedClick(wc, resolved, params, caller, "click");
+    if (!targetCtx) {
+      return run();
+    }
+    return this.withMutationHook(
+      "click",
+      targetCtx.notePath,
+      targetCtx.paneId,
+      caller,
+      run,
+      {
+        targetView: resolved.view ?? undefined,
+        targetCm: resolved.cm ?? undefined,
+        targetElement: resolved.element ?? resolved.containerEl ?? null,
       }
-      return this.withMutationHook(
-        "click",
-        targetCtx.notePath,
-        targetCtx.paneId,
-        caller,
-        run,
-        {
-          targetView: resolved.view ?? undefined,
-          targetCm: resolved.cm ?? undefined,
-          targetElement: resolved.element ?? resolved.containerEl ?? null,
-        }
-      );
-    });
+    );
   }
 
   hover(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
@@ -956,23 +965,21 @@ export class UiControlService {
   }
 
   private async hoverNow(params: Record<string, unknown>, caller: string): Promise<Record<string, unknown>> {
-    return this.timedAsync(async () => {
-      const wc = this.requireWebContents();
-      const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
-      this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "hover");
-      this.assertPointReceiverSafe(resolved.point, "hover", this.expectedTargetContainer(resolved));
-      const docCtx = this.docContextForResolvedTarget(resolved);
-      const point = resolved.point;
-      this.showCursor(caller, "move", point.x, point.y, "hover", params, docCtx);
-      const at = this.toWindowPoint(wc, point);
-      wc.sendInputEvent({ type: "mouseMove", ...at });
-      const settleMs = this.actionDelayMs(100, 10);
-      if (settleMs > 0) {
-        await this.sleep(settleMs);
-      }
-      await this.waitForCursorSettled(caller);
-      return { dispatched: true, point };
-    });
+    const wc = this.requireWebContents();
+    const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
+    this.safetyGuard.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "hover");
+    this.safetyGuard.assertPointReceiverSafe(resolved.point, "hover", this.expectedTargetContainer(resolved));
+    const docCtx = this.docContextForResolvedTarget(resolved);
+    const point = resolved.point;
+    this.showCursor(caller, "move", point.x, point.y, "hover", params, docCtx);
+    const at = this.toWindowPoint(wc, point);
+    wc.sendInputEvent({ type: "mouseMove", ...at });
+    const settleMs = this.actionDelayMs(100, 10);
+    if (settleMs > 0) {
+      await this.sleep(settleMs);
+    }
+    await this.waitForCursorSettled(caller);
+    return { dispatched: true, point };
   }
 
   type(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
@@ -1076,8 +1083,8 @@ export class UiControlService {
       insertedChars > 0
         ? `Typing stopped after inserting ${insertedChars} of ${totalChars} characters`
         : "Typing aborted before inserting any characters";
-    if (!this.isProtectedAreasAllowed()) {
-      const area = this.detectProtectedArea(ownership.containerEl);
+    if (!this.safetyGuard.isProtectedAreasAllowed()) {
+      const area = this.safetyGuard.detectProtectedArea(ownership.containerEl);
       if (area) {
         throw new UiControlError(
           "ui_protected_area",
@@ -1098,8 +1105,8 @@ export class UiControlService {
         ? `Typing stopped after inserting ${insertedChars} of ${totalChars} characters`
         : "Typing aborted before inserting any characters";
     const current = this.deepActiveElement();
-    if (!this.isProtectedAreasAllowed()) {
-      const protectedArea = this.detectProtectedArea(current);
+    if (!this.safetyGuard.isProtectedAreasAllowed()) {
+      const protectedArea = this.safetyGuard.detectProtectedArea(current);
       if (protectedArea) {
         throw new UiControlError(
           "ui_protected_area",
@@ -1182,16 +1189,7 @@ export class UiControlService {
   private static readonly INSERT_TEXT_TIMEOUT_MS = 2000;
 
   private deepActiveElement(): Element | null {
-    let el: Element | null = this.win.document.activeElement ?? null;
-    for (let depth = 0; depth < 16 && el; depth += 1) {
-      const next = (el as Element & { shadowRoot?: { activeElement?: Element | null } | null })
-        .shadowRoot?.activeElement;
-      if (!next || next === el) {
-        break;
-      }
-      el = next;
-    }
-    return el;
+    return getDeepActiveElement(this.win.document);
   }
 
   private async insertTextWithTimeout(wc: WebContentsLike, chunk: string): Promise<void> {
@@ -1218,6 +1216,9 @@ export class UiControlService {
 
   private async dispatchAgentInsertText(wc: WebContentsLike, chunk: string): Promise<void> {
     const entry = this.pushExpectedAgentEvent("beforeinput", chunk);
+    entry.isInsertText = true;
+    entry.remainingText = chunk.replace(/\r\n/g, "\n");
+    entry.targetEl = this.deepActiveElement();
     try {
       await this.insertTextWithTimeout(wc, chunk);
     } finally {
@@ -1319,6 +1320,9 @@ export class UiControlService {
     };
 
     try {
+      if (this.disposed) {
+        throw new UiControlError("ui_unavailable", "UI control service was disposed.");
+      }
       if (this.typingSpeed() === "fast") {
         this.assertAnchoredOwnershipIntact(ownership, 0, text.length);
         await applyChunkAndSync(text, 0);
@@ -1339,6 +1343,9 @@ export class UiControlService {
       const delayMs = Math.min(55, Math.max(12, Math.floor(budgetMs / chunks.length)));
       let insertedChars = 0;
       for (const chunk of chunks) {
+        if (this.disposed) {
+          throw new UiControlError("ui_unavailable", "UI control service was disposed.");
+        }
         this.assertAnchoredOwnershipIntact(ownership, insertedChars, text.length);
         await applyChunkAndSync(chunk, delayMs);
         insertedChars += chunk.length;
@@ -1365,7 +1372,7 @@ export class UiControlService {
     }
   ): Promise<void> {
     const expectedActive = this.deepActiveElement();
-    const activeCm = preferredCm ?? this.findFocusedCodeMirrorView(expectedActive);
+    let activeCm = preferredCm ?? this.findFocusedCodeMirrorView(expectedActive);
     const ownership: EditorTypingOwnership = {
       expectedActive,
       notePath: docHint?.notePath ?? null,
@@ -1390,26 +1397,75 @@ export class UiControlService {
     this.showCursor(caller, "type", startPt.x, startPt.y, undefined, params, lastDocCtx);
 
     const routeTabAsKey = this.isTableOrPropertyElement(expectedActive);
+    const tabScopeEl = routeTabAsKey
+      ? (findClosestElement(expectedActive, ".cm-table-widget, .metadata-container") ??
+        findClosestElement(expectedActive, ".metadata-property"))
+      : null;
+    const outerViewCm = this.extractCodeMirrorView(
+      docHint?.view?.editor?.cm ?? docHint?.leaf?.view?.editor?.cm
+    );
     const sendTabPress = async (): Promise<void> => {
-      this.dispatchAgentKeyInput(wc, { type: "keyDown", keyCode: "Tab", modifiers: [] });
-      this.dispatchAgentKeyInput(wc, { type: "keyUp", keyCode: "Tab", modifiers: [] });
-      const tabDelay = this.actionDelayMs(25, 0);
-      if (tabDelay > 0) {
-        await this.sleep(tabDelay);
+      const ledgerEntries: ExpectedAgentEvent[] = [];
+      try {
+        try {
+          ledgerEntries.push(
+            ...this.dispatchAgentKeyInput(wc, { type: "keyDown", keyCode: "Tab", modifiers: [] })
+          );
+        } finally {
+          ledgerEntries.push(
+            ...this.dispatchAgentKeyInput(wc, { type: "keyUp", keyCode: "Tab", modifiers: [] })
+          );
+        }
+        const tabDelay = this.actionDelayMs(25, 0);
+        if (tabDelay > 0) {
+          await this.sleep(tabDelay);
+        }
+      } finally {
+        for (const entry of ledgerEntries) {
+          const idx = this.expectedAgentLedger.indexOf(entry);
+          if (idx >= 0) {
+            this.expectedAgentLedger.splice(idx, 1);
+          }
+        }
       }
     };
 
-    const insertChunkAndSync = async (chunk: string, delayMs: number): Promise<void> => {
+    const insertChunkAndSync = async (
+      chunk: string,
+      delayMs: number,
+      insertedBefore: number
+    ): Promise<void> => {
       const parts = routeTabAsKey ? chunk.split("\t") : [chunk];
+      let insertedInChunk = 0;
       for (let i = 0; i < parts.length; i += 1) {
+        if (this.disposed) {
+          throw new UiControlError("ui_unavailable", "UI control service was disposed.");
+        }
         if (i > 0) {
           await sendTabPress();
+          const nextActive = this.deepActiveElement();
+          if (
+            nextActive &&
+            nextActive.isConnected !== false &&
+            !this.safetyGuard.isPasswordField(nextActive) &&
+            (this.safetyGuard.isProtectedAreasAllowed() || !this.safetyGuard.detectProtectedArea(nextActive)) &&
+            this.isTableOrPropertyElement(nextActive) &&
+            (!tabScopeEl || this.safetyGuard.isElementWithinContainer(nextActive, tabScopeEl))
+          ) {
+            ownership.expectedActive = nextActive;
+            const nextNested = resolveNestedCodeMirror(nextActive, { outerCm: outerViewCm });
+            activeCm = nextNested.cm;
+            ownership.cm = activeCm;
+          }
+          this.assertTypingOwnershipIntact(ownership, insertedBefore + insertedInChunk, text.length);
+          insertedInChunk += 1;
         }
         const piece = parts[i];
         const beforeHead = activeCm?.state?.selection?.main?.head;
         if (piece) {
           await this.dispatchAgentInsertText(wc, piece);
           this.recordMutationInsert(beforeHead, piece);
+          insertedInChunk += piece.length;
         }
         if (delayMs > 0) {
           await this.sleep(delayMs);
@@ -1429,16 +1485,19 @@ export class UiControlService {
     };
 
     try {
+      if (this.disposed) {
+        throw new UiControlError("ui_unavailable", "UI control service was disposed.");
+      }
       if (this.typingSpeed() === "fast") {
         this.assertTypingOwnershipIntact(ownership, 0, text.length);
-        await insertChunkAndSync(text, 0);
+        await insertChunkAndSync(text, 0, 0);
         return;
       }
 
       const chunks = splitTypingChunks(text);
       if (chunks.length <= 1) {
         this.assertTypingOwnershipIntact(ownership, 0, text.length);
-        await insertChunkAndSync(text, 80);
+        await insertChunkAndSync(text, 80, 0);
         return;
       }
 
@@ -1449,8 +1508,11 @@ export class UiControlService {
       const delayMs = Math.min(55, Math.max(12, Math.floor(budgetMs / chunks.length)));
       let insertedChars = 0;
       for (const chunk of chunks) {
+        if (this.disposed) {
+          throw new UiControlError("ui_unavailable", "UI control service was disposed.");
+        }
         this.assertTypingOwnershipIntact(ownership, insertedChars, text.length);
-        await insertChunkAndSync(chunk, delayMs);
+        await insertChunkAndSync(chunk, delayMs, insertedChars);
         insertedChars += chunk.length;
       }
     } finally {
@@ -1487,9 +1549,9 @@ export class UiControlService {
         cm = nested.cm;
       } else {
         cm = this.findFocusedCodeMirrorView(el);
-        if (!cm && this.findClosestElement(el, ".cm-editor, .cm-content, .cm-line")) {
+        if (!cm && findClosestElement(el, ".cm-editor, .cm-content, .cm-line")) {
           const leafContainer =
-            meta.containerEl ?? this.findClosestElement(el, ".workspace-leaf");
+            meta.containerEl ?? findClosestElement(el, ".workspace-leaf");
           const leafCm = this.extractCodeMirrorView(meta.view?.editor?.cm);
           cm = leafCm ?? (leafContainer ? this.findCodeMirrorInContainer(leafContainer) : null);
         }
@@ -1521,7 +1583,7 @@ export class UiControlService {
         }
       }
       if (typeof pos !== "number" && resolved.element) {
-        const lineEl = this.findClosestElement(resolved.element, ".cm-line");
+        const lineEl = findClosestElement(resolved.element, ".cm-line");
         const lineText = lineEl?.textContent?.trim();
         if (lineText) {
           const doc = cm.state.doc;
@@ -1551,177 +1613,177 @@ export class UiControlService {
   }
 
   private async typeNow(params: Record<string, unknown>, caller: string): Promise<Record<string, unknown>> {
-    return this.timedAsync(async () => {
-      const text = this.validateTypeParams(params);
-      if (params.target !== undefined) {
-        const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
-        this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "type");
-        this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
-        const skipEditorRouteForNestedTab =
-          text.includes("\t") && this.isTableOrPropertyElement(resolved.element);
-        const editorTarget = skipEditorRouteForNestedTab
-          ? null
-          : this.resolveMarkdownEditorForResolvedTarget(params.target, resolved);
-        if (editorTarget) {
-          const ownership: EditorTypingOwnership = {
-            expectedActive: null,
-            notePath: editorTarget.notePath,
-            paneId: editorTarget.paneId,
-            containerEl: editorTarget.containerEl,
-            leaf: editorTarget.leaf,
-            view: editorTarget.view,
-            cm: editorTarget.cm,
-          };
-          return this.withMutationHook(
-            "type",
-            editorTarget.notePath,
-            editorTarget.paneId,
-            caller,
-            async () => {
-              this.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
-              if (resolved.scrolled) {
-                this.showCursor(
-                  caller,
-                  "move",
-                  resolved.point.x,
-                  resolved.point.y,
-                  "scroll",
-                  params,
-                  this.docContextForResolvedTarget(resolved)
-                );
-              }
-              await this.dispatchCmChunks(
-                editorTarget.cm,
-                text,
-                editorTarget.pos,
+    const text = this.validateTypeParams(params);
+    if (params.target !== undefined) {
+      const resolved = await this.resolveTargetAsync(params.target, { focusLeaf: false });
+      this.safetyGuard.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "type");
+      this.safetyGuard.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
+      const skipEditorRouteForNestedTab =
+        text.includes("\t") && this.isTableOrPropertyElement(resolved.element);
+      const editorTarget = skipEditorRouteForNestedTab
+        ? null
+        : this.resolveMarkdownEditorForResolvedTarget(params.target, resolved);
+      if (editorTarget) {
+        const ownership: EditorTypingOwnership = {
+          expectedActive: null,
+          notePath: editorTarget.notePath,
+          paneId: editorTarget.paneId,
+          containerEl: editorTarget.containerEl,
+          leaf: editorTarget.leaf,
+          view: editorTarget.view,
+          cm: editorTarget.cm,
+        };
+        return this.withMutationHook(
+          "type",
+          editorTarget.notePath,
+          editorTarget.paneId,
+          caller,
+          async () => {
+            this.safetyGuard.assertPointReceiverSafe(resolved.point, "type", this.expectedTargetContainer(resolved));
+            if (resolved.scrolled) {
+              this.showCursor(
                 caller,
+                "move",
+                resolved.point.x,
+                resolved.point.y,
+                "scroll",
                 params,
-                ownership,
-                {
-                  notePath: editorTarget.notePath,
-                  paneId: editorTarget.paneId,
-                  containerEl: editorTarget.containerEl,
-                }
+                this.docContextForResolvedTarget(resolved)
               );
-              return { dispatched: true, characters: text.length, focus: this.focusState() };
-            },
-            { targetView: editorTarget.view, targetCm: editorTarget.cm, targetElement: resolved.element ?? editorTarget.containerEl ?? null }
-          );
-        }
-
-        const wc = this.requireWebContents();
-        const clickStep = { ...params, target: params.target };
-        const targetMeta = this.resolveTargetLeafMeta(resolved);
-        const runRawTargeted = (): Promise<Record<string, unknown>> =>
-          this.runWithUserInputShield(async () => {
-            const focusedOwnership = this.resolveFocusedOwnership();
-            const notePath = targetMeta.notePath ?? focusedOwnership.notePath;
-            const paneId = targetMeta.paneId ?? focusedOwnership.paneId;
-            const targetView = resolved.view ?? targetMeta.view ?? focusedOwnership.view ?? null;
-            const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? focusedOwnership.leaf ?? null;
-            const containerEl =
-              resolved.containerEl ?? targetMeta.containerEl ?? focusedOwnership.containerEl ?? null;
-            const preferredCm = resolved.cm ?? null;
-            return this.withMutationHook(
-              "type",
-              notePath,
-              paneId,
+            }
+            await this.dispatchCmChunks(
+              editorTarget.cm,
+              text,
+              editorTarget.pos,
               caller,
-              async () => {
-                await this.dispatchResolvedClick(wc, resolved, clickStep, caller, "type");
-                this.assertElementNotProtected(this.deepActiveElement(), "type");
-                const focus = this.focusState();
-                if (!focus.editable || focus.password) {
-                  throw new UiControlError(
-                    "ui_not_editable",
-                    "Focus an editable text field before typing. Password fields are excluded."
-                  );
-                }
-                const liveActive = this.deepActiveElement();
-                const outerViewCm = this.extractCodeMirrorView(targetView?.editor?.cm ?? targetLeaf?.view?.editor?.cm);
-                const nestedResolved = resolveNestedCodeMirror(liveActive, { outerCm: outerViewCm });
-                const effectiveCm =
-                  nestedResolved.cm ??
-                  (nestedResolved.inTableCell ? null : preferredCm ?? this.findFocusedCodeMirrorView(liveActive));
-                await this.typeChunks(wc, text, caller, params, effectiveCm, {
-                  notePath,
-                  paneId,
-                  containerEl,
-                  leaf: targetLeaf,
-                  view: targetView,
-                });
-                const nestedKind = classifyNestedEditable(liveActive);
-                if (
-                  !this.inBatchExecution &&
-                  liveActive &&
-                  nestedKind &&
-                  nestedKind !== "table-cell"
-                ) {
-                  commitNestedEditor(liveActive, this.win, {
-                    triggerEnter: nestedKind === "inline-title" || nestedKind === "file-explorer-rename",
-                    triggerBlur: true,
-                    text,
-                  });
-                }
-                return { dispatched: true, characters: text.length, focus: this.focusState() };
-              },
+              params,
+              ownership,
               {
-                targetView,
-                targetCm: preferredCm,
-                targetElement: resolved.element ?? containerEl ?? null,
+                notePath: editorTarget.notePath,
+                paneId: editorTarget.paneId,
+                containerEl: editorTarget.containerEl,
               }
             );
-          });
-        return this.activeShield ? runRawTargeted() : this.withFocusRestore(runRawTargeted);
+            return { dispatched: true, characters: text.length, focus: this.focusState() };
+          },
+          { targetView: editorTarget.view, targetCm: editorTarget.cm, targetElement: resolved.element ?? editorTarget.containerEl ?? null }
+        );
       }
 
       const wc = this.requireWebContents();
-      return this.runWithUserInputShield(async () => {
-        this.assertElementNotProtected(this.deepActiveElement(), "type");
-        const focus = this.focusState();
-        if (!focus.editable || focus.password) {
-          throw new UiControlError(
-            "ui_not_editable",
-            "Focus an editable text field before typing. Password fields are excluded."
-          );
-        }
-        const focusedOwnership = this.resolveFocusedOwnership();
-        return this.withMutationHook(
-          "type",
-          focusedOwnership.notePath,
-          focusedOwnership.paneId,
-          caller,
-          async () => {
-            const liveActive = this.deepActiveElement();
-            await this.typeChunks(wc, text, caller, params, focusedOwnership.cm, {
-              notePath: focusedOwnership.notePath,
-              paneId: focusedOwnership.paneId,
-              containerEl: focusedOwnership.containerEl,
-              leaf: focusedOwnership.leaf,
-              view: focusedOwnership.view,
-            });
-            const nestedKind = classifyNestedEditable(liveActive);
-            if (
-              !this.inBatchExecution &&
-              liveActive &&
-              nestedKind &&
-              nestedKind !== "table-cell"
-            ) {
-              commitNestedEditor(liveActive, this.win, {
-                triggerEnter: nestedKind === "inline-title" || nestedKind === "file-explorer-rename",
-                triggerBlur: true,
-                text,
+      const clickStep = { ...params, target: params.target };
+      const targetMeta = this.resolveTargetLeafMeta(resolved);
+      const runRawTargeted = (): Promise<Record<string, unknown>> =>
+        this.runWithUserInputShield(async () => {
+          const focusedOwnership = this.resolveFocusedOwnership();
+          const notePath = targetMeta.notePath ?? focusedOwnership.notePath;
+          const paneId = targetMeta.paneId ?? focusedOwnership.paneId;
+          const targetView = resolved.view ?? targetMeta.view ?? focusedOwnership.view ?? null;
+          const targetLeaf = resolved.workspaceLeaf ?? targetMeta.leaf ?? focusedOwnership.leaf ?? null;
+          const containerEl =
+            resolved.containerEl ?? targetMeta.containerEl ?? focusedOwnership.containerEl ?? null;
+          const preferredCm = resolved.cm ?? null;
+          return this.withMutationHook(
+            "type",
+            notePath,
+            paneId,
+            caller,
+            async () => {
+              await this.dispatchResolvedClick(wc, resolved, clickStep, caller, "type");
+              this.safetyGuard.assertElementNotProtected(this.deepActiveElement(), "type");
+              const focus = this.focusState();
+              if (!focus.editable || focus.password) {
+                throw new UiControlError(
+                  "ui_not_editable",
+                  "Focus an editable text field before typing. Password fields are excluded."
+                );
+              }
+              const liveActive = this.deepActiveElement();
+              const outerViewCm = this.extractCodeMirrorView(targetView?.editor?.cm ?? targetLeaf?.view?.editor?.cm);
+              const nestedResolved = resolveNestedCodeMirror(liveActive, { outerCm: outerViewCm });
+              const effectiveCm =
+                nestedResolved.cm ??
+                (nestedResolved.inTableCell ? null : preferredCm ?? this.findFocusedCodeMirrorView(liveActive));
+              await this.typeChunks(wc, text, caller, params, effectiveCm, {
+                notePath,
+                paneId,
+                containerEl,
+                leaf: targetLeaf,
+                view: targetView,
               });
+              const postTypeActive = this.deepActiveElement() ?? liveActive;
+              const nestedKind = classifyNestedEditable(postTypeActive);
+              if (
+                !this.inBatchExecution &&
+                postTypeActive &&
+                nestedKind &&
+                nestedKind !== "table-cell"
+              ) {
+                commitNestedEditor(postTypeActive, this.win, {
+                  triggerEnter: nestedKind === "inline-title" || nestedKind === "file-explorer-rename",
+                  triggerBlur: true,
+                  text,
+                });
+              }
+              return { dispatched: true, characters: text.length, focus: this.focusState() };
+            },
+            {
+              targetView,
+              targetCm: preferredCm,
+              targetElement: resolved.element ?? containerEl ?? null,
             }
-            return { dispatched: true, characters: text.length, focus: this.focusState() };
-          },
-          {
-            targetView: focusedOwnership.view,
-            targetCm: focusedOwnership.cm,
-            targetElement: this.deepActiveElement() ?? focusedOwnership.containerEl ?? null,
-          }
+          );
+        });
+      return this.activeShield ? runRawTargeted() : this.withFocusRestore(runRawTargeted);
+    }
+
+    const wc = this.requireWebContents();
+    return this.runWithUserInputShield(async () => {
+      this.safetyGuard.assertElementNotProtected(this.deepActiveElement(), "type");
+      const focus = this.focusState();
+      if (!focus.editable || focus.password) {
+        throw new UiControlError(
+          "ui_not_editable",
+          "Focus an editable text field before typing. Password fields are excluded."
         );
-      });
+      }
+      const focusedOwnership = this.resolveFocusedOwnership();
+      return this.withMutationHook(
+        "type",
+        focusedOwnership.notePath,
+        focusedOwnership.paneId,
+        caller,
+        async () => {
+          const liveActive = this.deepActiveElement();
+          await this.typeChunks(wc, text, caller, params, focusedOwnership.cm, {
+            notePath: focusedOwnership.notePath,
+            paneId: focusedOwnership.paneId,
+            containerEl: focusedOwnership.containerEl,
+            leaf: focusedOwnership.leaf,
+            view: focusedOwnership.view,
+          });
+          const postTypeActive = this.deepActiveElement() ?? liveActive;
+          const nestedKind = classifyNestedEditable(postTypeActive);
+          if (
+            !this.inBatchExecution &&
+            postTypeActive &&
+            nestedKind &&
+            nestedKind !== "table-cell"
+          ) {
+            commitNestedEditor(postTypeActive, this.win, {
+              triggerEnter: nestedKind === "inline-title" || nestedKind === "file-explorer-rename",
+              triggerBlur: true,
+              text,
+            });
+          }
+          return { dispatched: true, characters: text.length, focus: this.focusState() };
+        },
+        {
+          targetView: focusedOwnership.view,
+          targetCm: focusedOwnership.cm,
+          targetElement: this.deepActiveElement() ?? focusedOwnership.containerEl ?? null,
+        }
+      );
     });
   }
 
@@ -1741,103 +1803,101 @@ export class UiControlService {
       );
     }
 
-    return this.timedAsync(async () => {
-      const rawTarget =
-        params.target && typeof params.target === "object" ? params.target : params;
-      const anchor = await this.resolveAnchorTarget(rawTarget, false);
-      this.assertElementNotProtected(anchor.leaf.containerEl, "insert_line");
-      this.assertPointReceiverSafe(anchor.point, "insert_line", anchor.leaf.containerEl);
-      const cm = anchor.cm;
-      if (!cm || !cm.state?.doc || typeof cm.dispatch !== "function") {
-        throw new UiControlError(
-          "ui_not_editable",
-          `Target note '${anchor.leaf.path}' does not have an active CodeMirror editor view. Switch the pane to Editing view before running insert_line.`
-        );
-      }
-      const leafMeta = {
-        notePath: anchor.leaf.path,
-        paneId: anchor.leaf.pane,
-        containerEl: anchor.leaf.containerEl,
-        leaf: anchor.leaf.workspaceLeaf ?? null,
-        view: anchor.leaf.view ?? null,
-      };
-      const buildAnchorCtx = (pos?: number): DocumentCursorContext | undefined =>
-        this.buildDocContext({
-          notePath: leafMeta.notePath,
-          paneId: leafMeta.paneId,
-          containerEl: leafMeta.containerEl,
+    const rawTarget =
+      params.target && typeof params.target === "object" ? params.target : params;
+    const anchor = await this.resolveAnchorTarget(rawTarget, false);
+    this.safetyGuard.assertElementNotProtected(anchor.leaf.containerEl, "insert_line");
+    this.safetyGuard.assertPointReceiverSafe(anchor.point, "insert_line", anchor.leaf.containerEl);
+    const cm = anchor.cm;
+    if (!cm || !cm.state?.doc || typeof cm.dispatch !== "function") {
+      throw new UiControlError(
+        "ui_not_editable",
+        `Target note '${anchor.leaf.path}' does not have an active CodeMirror editor view. Switch the pane to Editing view before running insert_line.`
+      );
+    }
+    const leafMeta = {
+      notePath: anchor.leaf.path,
+      paneId: anchor.leaf.pane,
+      containerEl: anchor.leaf.containerEl,
+      leaf: anchor.leaf.workspaceLeaf ?? null,
+      view: anchor.leaf.view ?? null,
+    };
+    const buildAnchorCtx = (pos?: number): DocumentCursorContext | undefined =>
+      this.buildDocContext({
+        notePath: leafMeta.notePath,
+        paneId: leafMeta.paneId,
+        containerEl: leafMeta.containerEl,
+        cm,
+        pos,
+      });
+
+    return this.withMutationHook(
+      "insert_line",
+      anchor.leaf.path,
+      anchor.leaf.pane,
+      caller,
+      async () => {
+        this.safetyGuard.assertPointReceiverSafe(anchor.point, "insert_line", anchor.leaf.containerEl);
+        const ownership: EditorTypingOwnership = {
+          expectedActive: null,
+          notePath: anchor.leaf.path,
+          paneId: anchor.leaf.pane,
+          containerEl: anchor.leaf.containerEl,
+          leaf: anchor.leaf.workspaceLeaf ?? null,
+          view: anchor.leaf.view ?? null,
           cm,
-          pos,
+        };
+        this.assertAnchoredOwnershipIntact(ownership, 0, text.length);
+
+        const initialCtx = buildAnchorCtx(anchor.pos);
+        if (anchor.scrolled) {
+          this.showCursor(caller, "move", anchor.point.x, anchor.point.y, "scroll", params, initialCtx);
+        } else {
+          this.showCursor(caller, "move", anchor.point.x, anchor.point.y, "insert_line", params, initialCtx);
+        }
+
+        const insertAt = anchor.at === "start" ? anchor.from : anchor.to;
+        const newCaretPos = anchor.at === "start" ? anchor.from : anchor.to + 1;
+        cm.dispatch?.({
+          changes: { from: insertAt, insert: "\n" },
+        });
+        this.recordMutationInsert(insertAt, "\n");
+        await this.waitForPaint();
+        await this.ensureCaretInView(cm, newCaretPos);
+        this.notifyOverlayNoteUpdated(anchor.leaf.path, {
+          from: insertAt,
+          to: insertAt,
+          insertLength: 1,
         });
 
-      return this.withMutationHook(
-        "insert_line",
-        anchor.leaf.path,
-        anchor.leaf.pane,
-        caller,
-        async () => {
-          this.assertPointReceiverSafe(anchor.point, "insert_line", anchor.leaf.containerEl);
-          const ownership: EditorTypingOwnership = {
-            expectedActive: null,
-            notePath: anchor.leaf.path,
-            paneId: anchor.leaf.pane,
-            containerEl: anchor.leaf.containerEl,
-            leaf: anchor.leaf.workspaceLeaf ?? null,
-            view: anchor.leaf.view ?? null,
-            cm,
-          };
-          this.assertAnchoredOwnershipIntact(ownership, 0, text.length);
-
-          const initialCtx = buildAnchorCtx(anchor.pos);
-          if (anchor.scrolled) {
-            this.showCursor(caller, "move", anchor.point.x, anchor.point.y, "scroll", params, initialCtx);
-          } else {
-            this.showCursor(caller, "move", anchor.point.x, anchor.point.y, "insert_line", params, initialCtx);
-          }
-
-          const insertAt = anchor.at === "start" ? anchor.from : anchor.to;
-          const newCaretPos = anchor.at === "start" ? anchor.from : anchor.to + 1;
-          cm.dispatch?.({
-            changes: { from: insertAt, insert: "\n" },
-          });
-          this.recordMutationInsert(insertAt, "\n");
-          await this.waitForPaint();
-          await this.ensureCaretInView(cm, newCaretPos);
-          this.notifyOverlayNoteUpdated(anchor.leaf.path, {
-            from: insertAt,
-            to: insertAt,
-            insertLength: 1,
-          });
-
-          if (text.length > 0) {
-            await this.dispatchCmChunks(cm, text, newCaretPos, caller, params, ownership, leafMeta);
-          } else {
-            const caretPt = this.resolveCaretOrFocusPoint(cm, newCaretPos);
-            const afterCtx = buildAnchorCtx(newCaretPos);
-            this.showCursor(caller, "move", caretPt.x, caretPt.y, "insert_line", params, afterCtx);
-            this.cursorOverlay?.finishTyping?.(caller, afterCtx);
-          }
-
-          const expectedLine = anchor.at === "start" ? anchor.lineNumber : anchor.lineNumber + 1;
-          const proof = this.readInsertedLineProof(anchor.leaf, cm, expectedLine, newCaretPos);
-          return {
-            dispatched: true,
-            path: proof.path,
-            pane: anchor.leaf.pane,
-            line: proof.line,
-            text: proof.text,
-            heading: proof.heading,
-            characters: text.length,
-            scrolled: anchor.scrolled,
-            focus: this.focusState(),
-          };
-        },
-        {
-          targetView: anchor.leaf.view ?? undefined,
-          targetCm: cm,
+        if (text.length > 0) {
+          await this.dispatchCmChunks(cm, text, newCaretPos, caller, params, ownership, leafMeta);
+        } else {
+          const caretPt = this.resolveCaretOrFocusPoint(cm, newCaretPos);
+          const afterCtx = buildAnchorCtx(newCaretPos);
+          this.showCursor(caller, "move", caretPt.x, caretPt.y, "insert_line", params, afterCtx);
+          this.cursorOverlay?.finishTyping?.(caller, afterCtx);
         }
-      );
-    });
+
+        const expectedLine = anchor.at === "start" ? anchor.lineNumber : anchor.lineNumber + 1;
+        const proof = this.readInsertedLineProof(anchor.leaf, cm, expectedLine, newCaretPos);
+        return {
+          dispatched: true,
+          path: proof.path,
+          pane: anchor.leaf.pane,
+          line: proof.line,
+          text: proof.text,
+          heading: proof.heading,
+          characters: text.length,
+          scrolled: anchor.scrolled,
+          focus: this.focusState(),
+        };
+      },
+      {
+        targetView: anchor.leaf.view ?? undefined,
+        targetCm: cm,
+      }
+    );
   }
 
   pressKey(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
@@ -1895,14 +1955,15 @@ export class UiControlService {
     if (this.executeCommandByIdOption) {
       return Boolean(this.executeCommandByIdOption(commandId));
     }
-    const winWithApp = this.win as unknown as {
-      app?: { commands?: { executeCommandById?: (id: string) => boolean } };
-    };
-    const fn = winWithApp.app?.commands?.executeCommandById;
+    const app = this.getAppOption?.() as
+      | { commands?: { executeCommandById?: (id: string) => boolean } }
+      | null
+      | undefined;
+    const fn = app?.commands?.executeCommandById;
     if (typeof fn !== "function") {
       return false;
     }
-    return Boolean(fn.call(winWithApp.app?.commands, commandId));
+    return Boolean(fn.call(app?.commands, commandId));
   }
 
   private dismissRemainingMenusOnEscape(): void {
@@ -1977,190 +2038,167 @@ export class UiControlService {
     }
   }
 
-  private isAppQuitShortcut(keyCode: string, modifiers: readonly string[]): boolean {
-    if (keyCode === "Q") {
-      return (modifiers.includes("control") || modifiers.includes("meta")) && !modifiers.includes("alt");
-    }
-    if (keyCode === "F4") {
-      return modifiers.includes("alt");
-    }
-    return false;
-  }
-
-  private isSettingsOpenShortcut(keyCode: string, modifiers: readonly string[]): boolean {
-    return (
-      keyCode === "," &&
-      (modifiers.includes("control") || modifiers.includes("meta")) &&
-      !modifiers.includes("alt") &&
-      !modifiers.includes("shift")
-    );
-  }
-
   private async pressKeyNow(
     params: Record<string, unknown>,
     caller: string,
     notifyMutation = true
   ): Promise<Record<string, unknown>> {
-    return this.timedAsync(async () => {
-      const wc = this.requireWebContents();
-      const rawKey = typeof params.key === "string" ? params.key : "";
-      const { key, modifiers } = this.parseKeyAndModifiers(rawKey, params.modifiers);
-      let press;
-      try {
-        press = buildKeyPress(key, modifiers, this.platform);
-      } catch (err) {
-        throw new UiControlError("invalid_params", err instanceof Error ? err.message : String(err));
+    const wc = this.requireWebContents();
+    const rawKey = typeof params.key === "string" ? params.key : "";
+    const { key, modifiers } = this.parseKeyAndModifiers(rawKey, params.modifiers);
+    let press;
+    try {
+      press = buildKeyPress(key, modifiers, this.platform);
+    } catch (err) {
+      throw new UiControlError("invalid_params", err instanceof Error ? err.message : String(err));
+    }
+    this.safetyGuard.assertShortcutAllowed(press.keyCode, press.modifiers);
+    const activeBeforeKey = this.deepActiveElement();
+    this.safetyGuard.assertElementNotProtected(activeBeforeKey, "press_key");
+    if (this.safetyGuard.isPasswordField(activeBeforeKey)) {
+      throw new UiControlError("ui_password_field", "Refused ui.press_key inside a password field.");
+    }
+    if (
+      !this.safetyGuard.isProtectedAreasAllowed() &&
+      (press.keyCode === "Enter" || press.keyCode === "Space")
+    ) {
+      for (const selectedEl of this.safetyGuard.findSelectedActivationElements(
+        activeBeforeKey,
+        (sel) => this.queryAll(sel)
+      )) {
+        this.safetyGuard.assertElementNotProtected(selectedEl, "press_key");
       }
-      if (!this.isProtectedAreasAllowed() && this.isAppQuitShortcut(press.keyCode, press.modifiers)) {
-        throw new UiControlError(
-          "ui_protected_area",
-          "Refused ui.press_key for app quit shortcut. Ask the user to quit Obsidian manually, or enable allowUiInProtectedAreas in Herdr settings if explicitly authorized."
-        );
-      }
-      if (!this.isProtectedAreasAllowed() && this.isSettingsOpenShortcut(press.keyCode, press.modifiers)) {
-        throw new UiControlError(
-          "ui_protected_area",
-          "Refused ui.press_key for Settings shortcut. Ask the user to open Obsidian Settings manually, or enable allowUiInProtectedAreas in Herdr settings if explicitly authorized."
-        );
-      }
-      const activeBeforeKey = this.deepActiveElement();
-      this.assertElementNotProtected(activeBeforeKey, "press_key");
-      if (
-        !this.isProtectedAreasAllowed() &&
-        (press.keyCode === "Enter" || press.keyCode === "Space")
-      ) {
-        for (const selectedEl of this.findSelectedActivationElements(activeBeforeKey)) {
-          this.assertElementNotProtected(selectedEl, "press_key");
-        }
-      }
-      const acceleratorCommandId = this.resolveAppAcceleratorCommandId(press.keyCode, press.modifiers);
-      const run = (): Promise<Record<string, unknown>> =>
-        this.runWithUserInputShield(async () => {
-          const pt = this.resolveCaretOrFocusPoint();
-          const combo = [...modifiers, key].filter(Boolean).join("+");
-          const beforeCtx = this.buildDocContext();
-          this.showCursor(caller, "move", pt.x, pt.y, combo || "key", params, beforeCtx);
-          let executedCommandId: string | null = null;
-          const isPlainEscape = press.keyCode === "Escape" && press.modifiers.length === 0;
-          const openMenusBefore = isPlainEscape
-            ? this.queryAll('.menu, [role="menu"]').filter((el) => this.isVisible(el))
-            : [];
-          const keyLedgerEntries: ExpectedAgentEvent[] = [];
-          try {
-            if (acceleratorCommandId && this.executeObsidianCommandById(acceleratorCommandId)) {
-              executedCommandId = acceleratorCommandId;
-            } else {
-              try {
-                keyLedgerEntries.push(
-                  ...this.dispatchAgentKeyInput(wc, {
-                    type: "keyDown",
-                    keyCode: press.keyCode,
-                    modifiers: press.modifiers,
-                  })
-                );
-                if (press.text !== null) {
-                  keyLedgerEntries.push(
-                    ...this.dispatchAgentKeyInput(wc, {
-                      type: "char",
-                      keyCode: press.text,
-                      modifiers: press.modifiers,
-                    })
-                  );
-                }
-              } finally {
-                keyLedgerEntries.push(
-                  ...this.dispatchAgentKeyInput(wc, {
-                    type: "keyUp",
-                    keyCode: press.keyCode,
-                    modifiers: press.modifiers,
-                  })
-                );
-              }
+    }
+    const acceleratorCommandId = this.resolveAppAcceleratorCommandId(press.keyCode, press.modifiers);
+    const run = (): Promise<Record<string, unknown>> =>
+      this.runWithUserInputShield(async () => {
+        const pt = this.resolveCaretOrFocusPoint();
+        const combo = [...modifiers, key].filter(Boolean).join("+");
+        const beforeCtx = this.buildDocContext();
+        this.showCursor(caller, "move", pt.x, pt.y, combo || "key", params, beforeCtx);
+        let executedCommandId: string | null = null;
+        const isPlainEscape = press.keyCode === "Escape" && press.modifiers.length === 0;
+        const openMenusBefore = isPlainEscape
+          ? this.queryAll('.menu, [role="menu"]').filter((el) => this.isVisible(el))
+          : [];
+        const keyLedgerEntries: ExpectedAgentEvent[] = [];
+        try {
+          if (acceleratorCommandId && this.executeObsidianCommandById(acceleratorCommandId)) {
+            executedCommandId = acceleratorCommandId;
+            if (executedCommandId.startsWith("window:")) {
+              this.activeActionZoom = null;
             }
-            const settleMs = this.actionDelayMs(80, 10);
-            if (settleMs > 0) {
-              await this.sleep(settleMs);
-            }
-            if (openMenusBefore.length > 0) {
-              this.dismissRemainingMenusOnEscape();
-            }
-          } finally {
-            for (const entry of keyLedgerEntries) {
-              const idx = this.expectedAgentLedger.indexOf(entry);
-              if (idx >= 0) {
-                this.expectedAgentLedger.splice(idx, 1);
-              }
-            }
-          }
-          const doc = this.win.document;
-          const afterActive = this.deepActiveElement();
-          const afterProtected = this.detectProtectedArea(afterActive);
-          const afterRect =
-            afterActive &&
-            typeof (afterActive as { getBoundingClientRect?: unknown }).getBoundingClientRect === "function"
-              ? afterActive.getBoundingClientRect()
-              : null;
-          const afterStyle =
-            afterActive && typeof this.win.getComputedStyle === "function"
-              ? this.win.getComputedStyle(afterActive)
-              : null;
-          const afterHidden = Boolean(
-            afterRect &&
-              (afterRect.width <= 0 ||
-                afterRect.height <= 0 ||
-                afterStyle?.visibility === "hidden" ||
-                afterStyle?.display === "none")
-          );
-          const focusLeftTargetArea =
-            Boolean(afterProtected) ||
-            !afterActive ||
-            afterActive === doc.body ||
-            afterActive === doc.documentElement ||
-            afterActive.isConnected === false ||
-            afterHidden;
-          if (focusLeftTargetArea) {
-            this.cursorOverlay?.exitAgent?.(caller);
           } else {
-            await this.ensureCaretInView();
-            const afterPt = this.resolveCaretOrFocusPoint();
-            const afterCtx = this.buildDocContext();
-            this.showCursor(caller, "move", afterPt.x, afterPt.y, combo || "key", params, afterCtx);
-            if (
-              afterCtx?.notePath &&
-              (press.text !== null ||
-                press.keyCode === "Backspace" ||
-                press.keyCode === "Delete" ||
-                press.keyCode === "Return")
-            ) {
-              this.notifyOverlayNoteUpdated(afterCtx.notePath);
+            try {
+              keyLedgerEntries.push(
+                ...this.dispatchAgentKeyInput(wc, {
+                  type: "keyDown",
+                  keyCode: press.keyCode,
+                  modifiers: press.modifiers,
+                })
+              );
+              if (press.text !== null) {
+                keyLedgerEntries.push(
+                  ...this.dispatchAgentKeyInput(wc, {
+                    type: "char",
+                    keyCode: press.text,
+                    modifiers: press.modifiers,
+                  })
+                );
+              }
+            } finally {
+              keyLedgerEntries.push(
+                ...this.dispatchAgentKeyInput(wc, {
+                  type: "keyUp",
+                  keyCode: press.keyCode,
+                  modifiers: press.modifiers,
+                })
+              );
             }
-            await this.waitForCursorSettled(caller);
           }
-          return {
-            dispatched: true,
-            ...(executedCommandId ? { commandId: executedCommandId } : {}),
-            key,
-            modifiers: press.modifiers,
-            focus: this.focusState(),
-          };
-        });
-      if (!notifyMutation) {
-        return run();
-      }
-      const focusedOwnership = this.resolveFocusedOwnership();
-      return this.withMutationHook(
-        "press_key",
-        focusedOwnership.notePath,
-        focusedOwnership.paneId,
-        caller,
-        run,
-        {
-          targetView: focusedOwnership.view,
-          targetCm: focusedOwnership.cm,
-          targetElement: this.deepActiveElement() ?? focusedOwnership.containerEl ?? null,
+          const settleMs = this.actionDelayMs(80, 10);
+          if (settleMs > 0) {
+            await this.sleep(settleMs);
+          }
+          if (openMenusBefore.length > 0) {
+            this.dismissRemainingMenusOnEscape();
+          }
+        } finally {
+          for (const entry of keyLedgerEntries) {
+            const idx = this.expectedAgentLedger.indexOf(entry);
+            if (idx >= 0) {
+              this.expectedAgentLedger.splice(idx, 1);
+            }
+          }
         }
-      );
-    });
+        const doc = this.win.document;
+        const afterActive = this.deepActiveElement();
+        const afterProtected = this.safetyGuard.detectProtectedArea(afterActive);
+        const afterRect =
+          afterActive &&
+          typeof (afterActive as { getBoundingClientRect?: unknown }).getBoundingClientRect === "function"
+            ? afterActive.getBoundingClientRect()
+            : null;
+        const afterStyle =
+          afterActive && typeof this.win.getComputedStyle === "function"
+            ? this.win.getComputedStyle(afterActive)
+            : null;
+        const afterHidden = Boolean(
+          afterRect &&
+            (afterRect.width <= 0 ||
+              afterRect.height <= 0 ||
+              afterStyle?.visibility === "hidden" ||
+              afterStyle?.display === "none")
+        );
+        const focusLeftTargetArea =
+          Boolean(afterProtected) ||
+          !afterActive ||
+          afterActive === doc.body ||
+          afterActive === doc.documentElement ||
+          afterActive.isConnected === false ||
+          afterHidden;
+        if (focusLeftTargetArea) {
+          this.cursorOverlay?.exitAgent?.(caller);
+        } else {
+          await this.ensureCaretInView();
+          const afterPt = this.resolveCaretOrFocusPoint();
+          const afterCtx = this.buildDocContext();
+          this.showCursor(caller, "move", afterPt.x, afterPt.y, combo || "key", params, afterCtx);
+          if (
+            afterCtx?.notePath &&
+            (press.text !== null ||
+              press.keyCode === "Backspace" ||
+              press.keyCode === "Delete" ||
+              press.keyCode === "Enter")
+          ) {
+            this.notifyOverlayNoteUpdated(afterCtx.notePath);
+          }
+          await this.waitForCursorSettled(caller);
+        }
+        return {
+          dispatched: true,
+          ...(executedCommandId ? { commandId: executedCommandId } : {}),
+          key,
+          modifiers: press.modifiers,
+          focus: this.focusState(),
+        };
+      });
+    if (!notifyMutation) {
+      return run();
+    }
+    const focusedOwnership = this.resolveFocusedOwnership();
+    return this.withMutationHook(
+      "press_key",
+      focusedOwnership.notePath,
+      focusedOwnership.paneId,
+      caller,
+      run,
+      {
+        targetView: focusedOwnership.view,
+        targetCm: focusedOwnership.cm,
+        targetElement: this.deepActiveElement() ?? focusedOwnership.containerEl ?? null,
+      }
+    );
   }
 
   scroll(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
@@ -2237,42 +2275,40 @@ export class UiControlService {
     caller: string,
     fadeOnComplete = true
   ): Promise<Record<string, unknown>> {
-    return this.timedAsync(async () => {
-      const wc = this.requireWebContents();
-      const noteOnlyPath = this.isNoteOnlyScrollTarget(params.target);
-      const resolved = noteOnlyPath
-        ? this.resolveNoteOnlyScrollTarget(noteOnlyPath)
-        : await this.resolveTargetAsync(params.target, { focusLeaf: false });
-      this.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "scroll");
-      this.assertPointReceiverSafe(resolved.point, "scroll", this.expectedTargetContainer(resolved));
-      const point = resolved.point;
-      const deltaX = num(params.deltaX, 0);
-      const deltaY = num(params.deltaY, 0);
-      if (deltaX === 0 && deltaY === 0) {
-        throw new UiControlError("invalid_params", "ui.scroll needs a non-zero deltaX or deltaY.");
-      }
-      // Clear any existing doc anchor immediately and avoid anchoring to text under the scroll point.
-      this.showCursor(caller, "move", point.x, point.y, "scroll", params, null);
-      const at = this.toWindowPoint(wc, point);
-      wc.sendInputEvent({ type: "mouseMove", ...at });
-      // Electron uses wheel deltas where positive scrolls up; the public contract follows DOM
-      // WheelEvent (positive scrolls down/right), so the sign is flipped here.
-      wc.sendInputEvent({
-        type: "mouseWheel",
-        ...at,
-        deltaX: -Math.round(deltaX),
-        deltaY: -Math.round(deltaY),
-        canScroll: true,
-      });
-      const settleMs = this.actionDelayMs(180, 30);
-      if (settleMs > 0) {
-        await this.sleep(settleMs);
-      }
-      if (fadeOnComplete) {
-        this.cursorOverlay?.exitAgent?.(caller);
-      }
-      return { dispatched: true, point, deltaX, deltaY };
+    const wc = this.requireWebContents();
+    const noteOnlyPath = this.isNoteOnlyScrollTarget(params.target);
+    const resolved = noteOnlyPath
+      ? this.resolveNoteOnlyScrollTarget(noteOnlyPath)
+      : await this.resolveTargetAsync(params.target, { focusLeaf: false });
+    this.safetyGuard.assertElementNotProtected(resolved.element ?? resolved.containerEl ?? null, "scroll");
+    this.safetyGuard.assertPointReceiverSafe(resolved.point, "scroll", this.expectedTargetContainer(resolved));
+    const point = resolved.point;
+    const deltaX = num(params.deltaX, 0);
+    const deltaY = num(params.deltaY, 0);
+    if (deltaX === 0 && deltaY === 0) {
+      throw new UiControlError("invalid_params", "ui.scroll needs a non-zero deltaX or deltaY.");
+    }
+    // Clear any existing doc anchor immediately and avoid anchoring to text under the scroll point.
+    this.showCursor(caller, "move", point.x, point.y, "scroll", params, null);
+    const at = this.toWindowPoint(wc, point);
+    wc.sendInputEvent({ type: "mouseMove", ...at });
+    // Electron uses wheel deltas where positive scrolls up; the public contract follows DOM
+    // WheelEvent (positive scrolls down/right), so the sign is flipped here.
+    wc.sendInputEvent({
+      type: "mouseWheel",
+      ...at,
+      deltaX: -Math.round(deltaX),
+      deltaY: -Math.round(deltaY),
+      canScroll: true,
     });
+    const settleMs = this.actionDelayMs(180, 30);
+    if (settleMs > 0) {
+      await this.sleep(settleMs);
+    }
+    if (fadeOnComplete) {
+      this.cursorOverlay?.exitAgent?.(caller);
+    }
+    return { dispatched: true, point, deltaX, deltaY };
   }
 
   drag(params: Record<string, unknown>, caller = "agent"): Promise<unknown> {
@@ -2280,97 +2316,96 @@ export class UiControlService {
   }
 
   private async dragNow(params: Record<string, unknown>, caller: string): Promise<Record<string, unknown>> {
-    return this.timedAsync(async () => {
-      const wc = this.requireWebContents();
-      let resolvedStart = await this.resolveTargetAsync(params.from);
-      this.assertElementNotProtected(resolvedStart.element ?? resolvedStart.containerEl ?? null, "drag");
-      const resolvedEnd = await this.resolveTargetAsync(params.to);
-      this.assertElementNotProtected(resolvedEnd.element ?? resolvedEnd.containerEl ?? null, "drag");
-      if (resolvedEnd.scrolled) {
-        try {
-          resolvedStart = await this.resolveTargetAsync(params.from, {
-            allowScroll: false,
-            focusLeaf: false,
-          });
-          this.assertElementNotProtected(resolvedStart.element ?? resolvedStart.containerEl ?? null, "drag");
-        } catch (err) {
-          if (err instanceof UiControlError && err.code === "ui_target_outside") {
-            throw new UiControlError(
-              "ui_target_outside",
-              "Drag start and destination targets cannot both fit in the viewport at the same time."
-            );
-          }
-          throw err;
+    const wc = this.requireWebContents();
+    let resolvedStart = await this.resolveTargetAsync(params.from);
+    this.safetyGuard.assertElementNotProtected(resolvedStart.element ?? resolvedStart.containerEl ?? null, "drag");
+    const resolvedEnd = await this.resolveTargetAsync(params.to);
+    this.safetyGuard.assertElementNotProtected(resolvedEnd.element ?? resolvedEnd.containerEl ?? null, "drag");
+    if (resolvedEnd.scrolled) {
+      try {
+        resolvedStart = await this.resolveTargetAsync(params.from, {
+          allowScroll: false,
+          focusLeaf: false,
+        });
+        this.safetyGuard.assertElementNotProtected(resolvedStart.element ?? resolvedStart.containerEl ?? null, "drag");
+      } catch (err) {
+        if (err instanceof UiControlError && err.code === "ui_target_outside") {
+          throw new UiControlError(
+            "ui_target_outside",
+            "Drag start and destination targets cannot both fit in the viewport at the same time."
+          );
         }
+        throw err;
       }
-      const expectedStartContainer = this.expectedTargetContainer(resolvedStart);
-      const expectedEndContainer = this.expectedTargetContainer(resolvedEnd);
-      const start = resolvedStart.point;
-      const end = resolvedEnd.point;
-      const explicitSteps =
-        params.steps !== undefined ? Math.min(60, Math.max(1, Math.round(num(params.steps, 12)))) : undefined;
-      const startElement = resolvedStart.element ?? this.elementAtPoint(start);
-      const endElement = resolvedEnd.element ?? this.elementAtPoint(end);
+    }
+    const expectedStartContainer = this.expectedTargetContainer(resolvedStart);
+    const expectedEndContainer = this.expectedTargetContainer(resolvedEnd);
+    const start = resolvedStart.point;
+    const end = resolvedEnd.point;
+    const explicitSteps =
+      params.steps !== undefined ? Math.min(60, Math.max(1, Math.round(num(params.steps, 12)))) : undefined;
+    const startElement = resolvedStart.element ?? this.safetyGuard.elementAtPoint(start);
+    const endElement = resolvedEnd.element ?? this.safetyGuard.elementAtPoint(end);
 
-      // Preflight start, destination, and interpolated path before sending any drag input.
-      this.assertPointReceiverSafe(start, "drag", expectedStartContainer);
-      const preflightSteps = explicitSteps ?? 16;
-      for (let i = 1; i <= preflightSteps; i += 1) {
-        const pt = {
-          x: start.x + ((end.x - start.x) * i) / preflightSteps,
-          y: start.y + ((end.y - start.y) * i) / preflightSteps,
+    // Preflight start, destination, and interpolated path before sending any drag input.
+    this.safetyGuard.assertPointReceiverSafe(start, "drag", expectedStartContainer);
+    const preflightSteps = computeDragStepCount(start, end, explicitSteps);
+    for (let i = 1; i <= preflightSteps; i += 1) {
+      const pt = {
+        x: start.x + ((end.x - start.x) * i) / preflightSteps,
+        y: start.y + ((end.y - start.y) * i) / preflightSteps,
+      };
+      this.safetyGuard.assertPointReceiverSafe(pt, "drag", i === preflightSteps ? expectedEndContainer : undefined);
+    }
+
+    const startMeta = this.resolveTargetLeafMeta(resolvedStart);
+    const endMeta = this.resolveTargetLeafMeta(resolvedEnd);
+    const startDocCtx = this.docContextForResolvedTarget(resolvedStart);
+    const endDocCtx = this.docContextForResolvedTarget(resolvedEnd);
+    const dragZoom = this.readZoomFactor(wc);
+    return this.withMutationHook(
+      "drag",
+      startMeta.notePath ?? endMeta.notePath,
+      startMeta.paneId ?? endMeta.paneId,
+      caller,
+      async () => {
+        const stepDelayMs = this.actionDelayMs(16, 4);
+        const dropSettleMs = this.actionDelayMs(100, 10);
+        const dragRes = await performDrag({
+          win: this.win,
+          wc,
+          from: start,
+          to: end,
+          toWindowPoint: (pt) => this.toWindowPoint(wc, pt, dragZoom),
+          fromElement: startElement,
+          toElement: endElement,
+          steps: explicitSteps,
+          stepDelayMs,
+          dropSettleMs,
+          sleep: this.sleep,
+          onBeforeStart: (pt) => this.safetyGuard.assertPointReceiverSafe(pt, "drag", expectedStartContainer),
+          onStart: (pt) => this.showCursor(caller, "click", pt.x, pt.y, "drag", params, startDocCtx),
+          onBeforeStep: (pt, isLast) =>
+            this.safetyGuard.assertPointReceiverSafe(pt, "drag", isLast ? expectedEndContainer : undefined),
+          onStep: (pt) => this.showCursor(caller, "move", pt.x, pt.y, "drag", params, startDocCtx),
+          onComplete: (pt) => this.showCursor(caller, "move", pt.x, pt.y, "drop", params, endDocCtx),
+        });
+        await this.waitForCursorSettled(caller);
+        return {
+          dispatched: true,
+          mode: dragRes.mode,
+          dropped: dragRes.dropped,
+          from: start,
+          to: end,
+          steps: dragRes.steps,
         };
-        this.assertPointReceiverSafe(pt, "drag", i === preflightSteps ? expectedEndContainer : undefined);
+      },
+      {
+        targetView: resolvedStart.view ?? resolvedEnd.view ?? undefined,
+        targetCm: resolvedStart.cm ?? resolvedEnd.cm ?? undefined,
+        targetElement: startElement ?? endElement ?? null,
       }
-
-      const startMeta = this.resolveTargetLeafMeta(resolvedStart);
-      const endMeta = this.resolveTargetLeafMeta(resolvedEnd);
-      const startDocCtx = this.docContextForResolvedTarget(resolvedStart);
-      const endDocCtx = this.docContextForResolvedTarget(resolvedEnd);
-      return this.withMutationHook(
-        "drag",
-        startMeta.notePath ?? endMeta.notePath,
-        startMeta.paneId ?? endMeta.paneId,
-        caller,
-        async () => {
-          const stepDelayMs = this.actionDelayMs(16, 4);
-          const dropSettleMs = this.actionDelayMs(100, 10);
-          const dragRes = await performDrag({
-            win: this.win,
-            wc,
-            from: start,
-            to: end,
-            toWindowPoint: (pt) => this.toWindowPoint(wc, pt),
-            fromElement: startElement,
-            toElement: endElement,
-            steps: explicitSteps,
-            stepDelayMs,
-            dropSettleMs,
-            sleep: this.sleep,
-            onBeforeStart: (pt) => this.assertPointReceiverSafe(pt, "drag", expectedStartContainer),
-            onStart: (pt) => this.showCursor(caller, "click", pt.x, pt.y, "drag", params, startDocCtx),
-            onBeforeStep: (pt, isLast) =>
-              this.assertPointReceiverSafe(pt, "drag", isLast ? expectedEndContainer : undefined),
-            onStep: (pt) => this.showCursor(caller, "move", pt.x, pt.y, "drag", params, startDocCtx),
-            onComplete: (pt) => this.showCursor(caller, "move", pt.x, pt.y, "drop", params, endDocCtx),
-          });
-          await this.waitForCursorSettled(caller);
-          return {
-            dispatched: true,
-            mode: dragRes.mode,
-            dropped: dragRes.dropped,
-            from: start,
-            to: end,
-            steps: dragRes.steps,
-          };
-        },
-        {
-          targetView: resolvedStart.view ?? resolvedEnd.view ?? undefined,
-          targetCm: resolvedStart.cm ?? resolvedEnd.cm ?? undefined,
-          targetElement: startElement ?? endElement ?? null,
-        }
-      );
-    });
+    );
   }
 
   private stepBorrowsFocus(rawStep: unknown): boolean {
@@ -2379,7 +2414,7 @@ export class UiControlService {
     }
     const step = rawStep as Record<string, unknown>;
     const action = typeof step.action === "string" ? step.action : "";
-    if (action === "click" || action === "drag" || action === "press_key") {
+    if (action === "click" || action === "select" || action === "drag" || action === "press_key") {
       return true;
     }
     if (action === "type") {
@@ -2423,7 +2458,6 @@ export class UiControlService {
         )
       );
     }
-    const borrowFocus = rawSteps.some((step) => this.stepBorrowsFocus(step));
     return this.executeUiAction(
       async () => {
         const batchAgentName =
@@ -2437,6 +2471,9 @@ export class UiControlService {
         this.inBatchExecution = true;
         try {
           for (let i = 0; i < stepsList.length; i += 1) {
+            if (this.disposed) {
+              throw new UiControlError("ui_unavailable", "UI control service was disposed.");
+            }
             const rawStep = stepsList[i];
             if (!rawStep || typeof rawStep !== "object") {
               throw new UiControlError("invalid_params", "Each ui.batch step must be an object.");
@@ -2449,21 +2486,21 @@ export class UiControlService {
                 : baseStep;
             const action = typeof step.action === "string" ? step.action : "";
             if (action === "click") {
-              results.push(await this.clickNow(step, caller));
+              results.push(await this.timedAsync(() => this.clickNow(step, caller)));
             } else if (action === "select") {
-              results.push(await this.selectNow(step, caller));
+              results.push(await this.timedAsync(() => this.selectNow(step, caller)));
             } else if (action === "hover") {
-              results.push(await this.hoverNow(step, caller));
+              results.push(await this.timedAsync(() => this.hoverNow(step, caller)));
             } else if (action === "type") {
-              results.push(await this.typeNow(step, caller));
+              results.push(await this.timedAsync(() => this.typeNow(step, caller)));
             } else if (action === "insert_line") {
-              results.push(await this.insertLineNow(step, caller));
+              results.push(await this.timedAsync(() => this.insertLineNow(step, caller)));
             } else if (action === "press_key") {
-              results.push(await this.pressKeyNow(step, caller));
+              results.push(await this.timedAsync(() => this.pressKeyNow(step, caller)));
             } else if (action === "scroll") {
-              results.push(await this.scrollNow(step, caller, isLastStep));
+              results.push(await this.timedAsync(() => this.scrollNow(step, caller, isLastStep)));
             } else if (action === "drag") {
-              results.push(await this.dragNow(step, caller));
+              results.push(await this.timedAsync(() => this.dragNow(step, caller)));
             } else if (action === "wait_for") {
               results.push(await this.waitFor(step, caller));
             } else {
@@ -2479,7 +2516,7 @@ export class UiControlService {
         }
       },
       false,
-      borrowFocus
+      () => rawSteps.some((step) => this.stepBorrowsFocus(step))
     );
   }
 
@@ -2529,7 +2566,7 @@ export class UiControlService {
     const cmEl = cm?.contentDOM ?? cm?.dom ?? null;
     const cmCtx = cmEl ? this.resolveElementLeafContext(cmEl) : null;
     const focusedCtx =
-      !opts?.notePath && !cmCtx?.notePath && (!cm || this.cmOwnsElement(cm, activeEl))
+      !opts?.notePath && !cmCtx?.notePath && (!cm || !activeEl || this.cmOwnsElement(cm, activeEl))
         ? this.resolveFocusedLeafContext()
         : null;
     const notePath = opts?.notePath ?? cmCtx?.notePath ?? focusedCtx?.notePath ?? undefined;
@@ -2657,12 +2694,13 @@ export class UiControlService {
   }
 
   private findFocusedCodeMirrorView(activeEl: Element | null): CodeMirrorViewLike | null {
-    const winWithApp = this.win as unknown as {
-      app?: { workspace?: { activeEditor?: { editor?: { cm?: unknown } } } };
-    };
+    const app = this.getAppOption?.() as
+      | { workspace?: { activeEditor?: { editor?: { cm?: unknown } } } }
+      | null
+      | undefined;
     const outerHookCm = this.extractCodeMirrorView(this.getCodeMirrorView?.());
     const outerWorkspaceCm = this.extractCodeMirrorView(
-      winWithApp.app?.workspace?.activeEditor?.editor?.cm
+      app?.workspace?.activeEditor?.editor?.cm
     );
     const outerCm = outerWorkspaceCm ?? outerHookCm;
 
@@ -2699,11 +2737,11 @@ export class UiControlService {
       node = node.parentElement ?? null;
     }
 
-    if (outerHookCm && this.cmOwnsElement(outerHookCm, activeEl)) {
+    if (outerHookCm && (!activeEl || this.cmOwnsElement(outerHookCm, activeEl))) {
       return outerHookCm;
     }
 
-    if (outerWorkspaceCm && this.cmOwnsElement(outerWorkspaceCm, activeEl)) {
+    if (outerWorkspaceCm && (!activeEl || this.cmOwnsElement(outerWorkspaceCm, activeEl))) {
       return outerWorkspaceCm;
     }
 
@@ -2827,29 +2865,17 @@ export class UiControlService {
     return null;
   }
 
-  private parseCssPx(value: string | undefined): number | null {
-    if (!value) {
-      return null;
+  private releaseInputMirror(): void {
+    const cached = this.cachedInputMirror;
+    if (!cached) {
+      return;
     }
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
-  }
-
-  private clampPointToRect(
-    x: number,
-    y: number,
-    rect: { left: number; top: number; right?: number; bottom?: number; width: number; height: number }
-  ): { x: number; y: number } {
-    const right = typeof rect.right === "number" ? rect.right : rect.left + rect.width;
-    const bottom = typeof rect.bottom === "number" ? rect.bottom : rect.top + rect.height;
-    const minX = rect.left + Math.min(4, rect.width * 0.2);
-    const maxX = Math.max(minX, right - 4);
-    const minY = rect.top + Math.min(4, rect.height * 0.2);
-    const maxY = Math.max(minY, bottom - 4);
-    return {
-      x: Math.round(Math.min(maxX, Math.max(minX, x))),
-      y: Math.round(Math.min(maxY, Math.max(minY, y))),
-    };
+    this.cachedInputMirror = null;
+    try {
+      cached.mirror.remove?.();
+    } catch {
+      // Ignore cleanup errors on disconnected or mock mirrors.
+    }
   }
 
   private nativeInputMirrorPoint(
@@ -2863,69 +2889,103 @@ export class UiControlService {
       return null;
     }
 
-    let mirror: HTMLDivElement | null = null;
+    const isTextarea = (el.tagName ?? "").toUpperCase() === "TEXTAREA";
+    let cached = this.cachedInputMirror;
+    const reuseCached = Boolean(
+      cached &&
+        cached.el === el &&
+        cached.isTextarea === isTextarea &&
+        (cached.mirror as { isConnected?: boolean }).isConnected !== false
+    );
+    let ephemeralMirror: HTMLDivElement | null = null;
     try {
-      mirror = body.createDiv();
-      if (!mirror || !mirror.style || typeof mirror.createSpan !== "function") {
-        return null;
-      }
-      const isTextarea = (el.tagName ?? "").toUpperCase() === "TEXTAREA";
-      const s = mirror.style;
-      s.position = "fixed";
-      s.left = `${rect.left}px`;
-      s.top = `${rect.top}px`;
-      s.width = `${rect.width}px`;
-      s.height = `${rect.height}px`;
-      s.visibility = "hidden";
-      s.pointerEvents = "none";
-      s.margin = "0";
-      s.overflow = "hidden";
-      s.boxSizing = "border-box";
-      s.whiteSpace = isTextarea ? style?.whiteSpace || "pre-wrap" : "pre";
-      if (isTextarea) {
-        s.overflowWrap = "break-word";
-      }
-      if (style) {
-        const copyProps = [
-          "direction",
-          "fontFamily",
-          "fontSize",
-          "fontStyle",
-          "fontVariant",
-          "fontWeight",
-          "letterSpacing",
-          "lineHeight",
-          "tabSize",
-          "textAlign",
-          "textIndent",
-          "textTransform",
-          "wordSpacing",
-          "paddingTop",
-          "paddingRight",
-          "paddingBottom",
-          "paddingLeft",
-          "borderTopWidth",
-          "borderRightWidth",
-          "borderBottomWidth",
-          "borderLeftWidth",
-          "borderTopStyle",
-          "borderRightStyle",
-          "borderBottomStyle",
-          "borderLeftStyle",
-        ] as const;
-        for (const prop of copyProps) {
-          const val = style[prop];
-          if (val) {
-            (s as unknown as Record<string, string>)[prop] = val;
+      if (!reuseCached) {
+        this.releaseInputMirror();
+        const mirror = body.createDiv();
+        if (!mirror || !mirror.style || typeof mirror.createSpan !== "function") {
+          mirror?.remove?.();
+          return null;
+        }
+        const s = mirror.style;
+        s.position = "fixed";
+        s.left = `${rect.left}px`;
+        s.top = `${rect.top}px`;
+        s.width = `${rect.width}px`;
+        s.height = `${rect.height}px`;
+        s.visibility = "hidden";
+        s.pointerEvents = "none";
+        s.margin = "0";
+        s.overflow = "hidden";
+        s.boxSizing = "border-box";
+        s.whiteSpace = isTextarea ? style?.whiteSpace || "pre-wrap" : "pre";
+        if (isTextarea) {
+          s.overflowWrap = "break-word";
+        }
+        if (style) {
+          for (const prop of NATIVE_MIRROR_STYLE_PROPS) {
+            const val = style[prop];
+            if (val) {
+              (s as unknown as Record<string, string>)[prop] = val;
+            }
           }
+        }
+        const canReuseNodes =
+          typeof this.win.document.createTextNode === "function" &&
+          typeof mirror.appendChild === "function";
+        let textNode: Text | null = null;
+        let marker: HTMLSpanElement | null = null;
+        if (canReuseNodes) {
+          textNode = this.win.document.createTextNode("");
+          mirror.appendChild(textNode);
+          marker = mirror.createSpan({ text: "\u200b" });
+        }
+        cached = {
+          el,
+          isTextarea,
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+          mirror,
+          marker,
+          textNode,
+        };
+        if (this.inUiAction) {
+          this.cachedInputMirror = cached;
+        } else {
+          ephemeralMirror = mirror;
+        }
+      } else if (cached) {
+        const s = cached.mirror.style;
+        if (cached.left !== rect.left) {
+          s.left = `${rect.left}px`;
+          cached.left = rect.left;
+        }
+        if (cached.top !== rect.top) {
+          s.top = `${rect.top}px`;
+          cached.top = rect.top;
+        }
+        if (cached.width !== rect.width) {
+          s.width = `${rect.width}px`;
+          cached.width = rect.width;
+        }
+        if (cached.height !== rect.height) {
+          s.height = `${rect.height}px`;
+          cached.height = rect.height;
         }
       }
 
-      if (beforeText) {
-        mirror.textContent = beforeText;
+      if (!cached) {
+        return null;
       }
-
-      const marker = mirror.createSpan({ text: "\u200b" });
+      let marker: HTMLSpanElement;
+      if (cached.textNode && cached.marker) {
+        cached.textNode.nodeValue = beforeText;
+        marker = cached.marker;
+      } else {
+        cached.mirror.textContent = beforeText;
+        marker = cached.mirror.createSpan({ text: "\u200b" });
+      }
       const mr = marker.getBoundingClientRect?.();
       if (!mr || !(mr.height > 0)) {
         return null;
@@ -2934,11 +2994,12 @@ export class UiControlService {
       const scrollTop = typeof el.scrollTop === "number" ? el.scrollTop : 0;
       const x = mr.left - scrollLeft;
       const y = isTextarea ? mr.top + mr.height * 0.5 - scrollTop : rect.top + rect.height * 0.5;
-      return this.clampPointToRect(x, y, rect);
+      return clampPointToRect(x, y, rect);
     } catch {
+      this.releaseInputMirror();
       return null;
     } finally {
-      mirror?.remove?.();
+      ephemeralMirror?.remove?.();
     }
   }
 
@@ -2970,11 +3031,11 @@ export class UiControlService {
     }
 
     const isTextarea = (el.tagName ?? "").toUpperCase() === "TEXTAREA";
-    const padLeft = this.parseCssPx(style?.paddingLeft) ?? Math.min(10, r.width * 0.2);
-    const padTop = this.parseCssPx(style?.paddingTop) ?? 6;
-    const fontSize = this.parseCssPx(style?.fontSize) ?? 14;
+    const padLeft = parseCssPx(style?.paddingLeft) ?? Math.min(10, r.width * 0.2);
+    const padTop = parseCssPx(style?.paddingTop) ?? 6;
+    const fontSize = parseCssPx(style?.fontSize) ?? 14;
     const charWidth = fontSize * 0.56;
-    const lineHeight = this.parseCssPx(style?.lineHeight) ?? Math.round(fontSize * 1.4);
+    const lineHeight = parseCssPx(style?.lineHeight) ?? Math.round(fontSize * 1.4);
     const lines = beforeText.split("\n");
     const lastLine = lines[lines.length - 1] ?? "";
     const scrollLeft = typeof el.scrollLeft === "number" ? el.scrollLeft : 0;
@@ -2982,11 +3043,11 @@ export class UiControlService {
 
     const rawX = r.left + padLeft + lastLine.length * charWidth - scrollLeft;
     const rawY = isTextarea
-      ? lines.length > 1 || text.includes("\n") || this.parseCssPx(style?.lineHeight) !== null
+      ? lines.length > 1 || text.includes("\n") || parseCssPx(style?.lineHeight) !== null
         ? r.top + padTop + (lines.length - 1) * lineHeight + lineHeight * 0.5 - scrollTop
         : r.top + Math.min(r.height * 0.5, 22)
       : r.top + r.height * 0.5;
-    return this.clampPointToRect(rawX, rawY, r);
+    return clampPointToRect(rawX, rawY, r);
   }
 
   private resolveCaretOrFocusPoint(
@@ -3119,7 +3180,11 @@ export class UiControlService {
     if (!wanted) {
       return null;
     }
-    for (const sel of [".nav-file-title[data-path]", "[data-path]"]) {
+    for (const sel of [
+      ".nav-files-container .nav-file-title[data-path]",
+      ".nav-files-container [data-path]",
+      ".nav-file-title[data-path]",
+    ]) {
       let candidates: Element[];
       try {
         candidates = this.queryAll(sel);
@@ -3186,8 +3251,7 @@ export class UiControlService {
     notePath?: string;
     docContext: DocumentCursorContext | null;
   } | null {
-    const ws = this.workspaceLike();
-    const activeLeaf = ws?.activeLeaf ?? null;
+    const activeLeaf = this.mostRecentLeaf();
     if (!activeLeaf) {
       return null;
     }
@@ -3519,6 +3583,7 @@ export class UiControlService {
 
   private consumeAgentDispatchedEvent(ev: {
     type?: string;
+    target?: unknown;
     key?: string;
     data?: string | null;
     inputType?: string;
@@ -3545,6 +3610,7 @@ export class UiControlService {
       }
       if (entry.eventType === "beforeinput") {
         let matched = false;
+        let fullyConsumed = true;
         if (entry.keyMatch === "__enter__") {
           matched =
             ev.inputType === "insertLineBreak" ||
@@ -3556,12 +3622,45 @@ export class UiControlService {
         } else if (entry.keyMatch === "__delete__") {
           matched = ev.inputType === "deleteContentForward";
         } else {
-          matched = (ev.data ?? "") === entry.keyMatch;
+          const evTarget =
+            ev.target && typeof ev.target === "object" ? (ev.target as Element) : null;
+          const targetMatches =
+            !entry.targetEl ||
+            !evTarget ||
+            evTarget === entry.targetEl ||
+            Boolean(entry.targetEl.contains?.(evTarget)) ||
+            Boolean(evTarget.contains?.(entry.targetEl));
+          if (!targetMatches) {
+            continue;
+          }
+          if ((ev.data ?? "") === entry.keyMatch) {
+            matched = true;
+          } else if (entry.isInsertText && typeof entry.remainingText === "string" && entry.remainingText.length > 0) {
+            const isLineBreak =
+              ev.inputType === "insertLineBreak" ||
+              ev.inputType === "insertParagraph" ||
+              ev.data === "\n" ||
+              ev.data === "\r";
+            if (isLineBreak && entry.remainingText.startsWith("\n")) {
+              entry.remainingText = entry.remainingText.slice(1);
+              matched = true;
+              fullyConsumed = entry.remainingText.length === 0;
+            } else if (typeof ev.data === "string" && ev.data.length > 0) {
+              const normalizedData = ev.data.replace(/\r\n/g, "\n");
+              if (entry.remainingText.startsWith(normalizedData)) {
+                entry.remainingText = entry.remainingText.slice(normalizedData.length);
+                matched = true;
+                fullyConsumed = entry.remainingText.length === 0;
+              }
+            }
+          }
         }
         if (!matched) {
           continue;
         }
-        this.expectedAgentLedger.splice(i, 1);
+        if (fullyConsumed) {
+          this.expectedAgentLedger.splice(i, 1);
+        }
         return true;
       }
       if (
@@ -3610,7 +3709,7 @@ export class UiControlService {
 
     const types: Array<CapturedUserEvent["type"]> = ["keydown", "keypress", "beforeinput"];
     const handler = (rawEvent: unknown): void => {
-      if (this.replayingUserInput || !rawEvent || typeof rawEvent !== "object") {
+      if (session.suspended || this.replayingUserInput || !rawEvent || typeof rawEvent !== "object") {
         return;
       }
       const expectedBase = session.userElement ?? this.win.document.body ?? null;
@@ -3620,6 +3719,7 @@ export class UiControlService {
       }
       const ev = rawEvent as {
         type?: string;
+        target?: unknown;
         isTrusted?: boolean;
         key?: string;
         code?: string;
@@ -3785,20 +3885,13 @@ export class UiControlService {
     if (clamped === 0) {
       return 0;
     }
-    const SegmenterCtor = (
-      Intl as unknown as {
-        Segmenter?: new (
-          locale: string | undefined,
-          options: { granularity: "grapheme" }
-        ) => { segment(input: string): Iterable<{ index: number; segment: string }> };
-      }
-    ).Segmenter;
-    if (typeof SegmenterCtor === "function") {
+    const segmenter = getGraphemeSegmenter();
+    if (segmenter) {
       const { start, end } = this.clampCleanSliceBounds(text, clamped);
       const slice = text.slice(start, end);
       const rel = clamped - start;
       let prev = 0;
-      for (const seg of new SegmenterCtor(undefined, { granularity: "grapheme" }).segment(slice)) {
+      for (const seg of segmenter.segment(slice)) {
         if (seg.index >= rel) {
           break;
         }
@@ -3823,19 +3916,12 @@ export class UiControlService {
     if (clamped >= text.length) {
       return text.length;
     }
-    const SegmenterCtor = (
-      Intl as unknown as {
-        Segmenter?: new (
-          locale: string | undefined,
-          options: { granularity: "grapheme" }
-        ) => { segment(input: string): Iterable<{ index: number; segment: string }> };
-      }
-    ).Segmenter;
-    if (typeof SegmenterCtor === "function") {
+    const segmenter = getGraphemeSegmenter();
+    if (segmenter) {
       const { start, end } = this.clampCleanSliceBounds(text, clamped);
       const slice = text.slice(start, end);
       const rel = clamped - start;
-      for (const seg of new SegmenterCtor(undefined, { granularity: "grapheme" }).segment(slice)) {
+      for (const seg of segmenter.segment(slice)) {
         const segEnd = seg.index + seg.segment.length;
         if (segEnd > rel) {
           return start + segEnd;
@@ -3950,7 +4036,8 @@ export class UiControlService {
     captured: CapturedUserEvent[]
   ): Array<
     | { kind: "text"; text: string; ev: CapturedUserEvent }
-    | { kind: "backspace" | "delete" | "enter" | "select_all"; ev: CapturedUserEvent }
+    | { kind: "backspace" | "delete"; word?: boolean; ev: CapturedUserEvent }
+    | { kind: "enter" | "select_all"; ev: CapturedUserEvent }
     | {
         kind: "nav";
         dir: "left" | "right" | "up" | "down" | "home" | "end";
@@ -3963,7 +4050,8 @@ export class UiControlService {
   > {
     const ops: Array<
       | { kind: "text"; text: string; ev: CapturedUserEvent }
-      | { kind: "backspace" | "delete" | "enter" | "select_all"; ev: CapturedUserEvent }
+      | { kind: "backspace" | "delete"; word?: boolean; ev: CapturedUserEvent }
+      | { kind: "enter" | "select_all"; ev: CapturedUserEvent }
       | {
           kind: "nav";
           dir: "left" | "right" | "up" | "down" | "home" | "end";
@@ -3995,6 +4083,7 @@ export class UiControlService {
         }
         lastKeyChar = null;
         const isPrimaryMod = this.platform === "darwin" ? Boolean(ev.metaKey && !ev.ctrlKey) : Boolean(ev.ctrlKey && !ev.metaKey);
+        const isWordDeleteMod = Boolean((ev.ctrlKey || ev.altKey) && !ev.metaKey && !(ev.ctrlKey && ev.altKey));
         if (isPrimaryMod && !ev.altKey && (key === "a" || key === "A")) {
           ops.push({ kind: "select_all", ev });
         } else if (Object.prototype.hasOwnProperty.call(navKeyMap, key)) {
@@ -4009,9 +4098,13 @@ export class UiControlService {
             ev,
           });
         } else if (key === "Backspace" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-          ops.push({ kind: "backspace", ev });
+          ops.push({ kind: "backspace", word: false, ev });
+        } else if (key === "Backspace" && isWordDeleteMod) {
+          ops.push({ kind: "backspace", word: true, ev });
         } else if ((key === "Delete" || key === "Del") && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-          ops.push({ kind: "delete", ev });
+          ops.push({ kind: "delete", word: false, ev });
+        } else if ((key === "Delete" || key === "Del") && isWordDeleteMod) {
+          ops.push({ kind: "delete", word: true, ev });
         } else if ((key === "Enter" || key === "Return") && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
           ops.push({ kind: "enter", ev });
         } else if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
@@ -4038,9 +4131,13 @@ export class UiControlService {
         }
         lastKeyChar = null;
         if (ev.inputType === "deleteContentBackward") {
-          ops.push({ kind: "backspace", ev });
+          ops.push({ kind: "backspace", word: false, ev });
+        } else if (ev.inputType === "deleteWordBackward") {
+          ops.push({ kind: "backspace", word: true, ev });
         } else if (ev.inputType === "deleteContentForward") {
-          ops.push({ kind: "delete", ev });
+          ops.push({ kind: "delete", word: false, ev });
+        } else if (ev.inputType === "deleteWordForward") {
+          ops.push({ kind: "delete", word: true, ev });
         } else if (data) {
           ops.push({ kind: "text", text: data, ev });
         }
@@ -4070,9 +4167,9 @@ export class UiControlService {
       if (op.kind === "text") {
         out += op.text;
       } else if (op.kind === "backspace") {
-        out += "\x7f";
+        out += op.word ? (op.ev.altKey ? "\x1b\x7f" : "\x17") : "\x7f";
       } else if (op.kind === "delete") {
-        out += "\x1b[3~";
+        out += op.word ? "\x1bd" : "\x1b[3~";
       } else if (op.kind === "enter") {
         out += "\r";
       } else if (op.kind === "nav") {
@@ -4107,7 +4204,7 @@ export class UiControlService {
     if (direct && direct.state?.doc && typeof direct.dispatch === "function") {
       return direct;
     }
-    const leafEl = this.findClosestElement(target, ".workspace-leaf");
+    const leafEl = findClosestElement(target, ".workspace-leaf");
     if (leafEl && !isInTableCellWidget(target)) {
       const leaf = this.findWorkspaceLeafForElement(target);
       const fromLeaf =
@@ -4191,7 +4288,12 @@ export class UiControlService {
         head = nextAnchor;
         readLiveSelection();
       } else if (op.kind === "backspace") {
-        const delFrom = from !== to ? from : this.prevGraphemeBoundary(liveText, from);
+        const delFrom =
+          from !== to
+            ? from
+            : op.word
+              ? this.stepWordLeft(liveText, from)
+              : this.prevGraphemeBoundary(liveText, from);
         const delTo = to;
         if (delTo > delFrom) {
           cm.dispatch({
@@ -4205,7 +4307,12 @@ export class UiControlService {
         }
       } else if (op.kind === "delete") {
         const delFrom = from;
-        const delTo = from !== to ? to : this.nextGraphemeBoundary(liveText, to);
+        const delTo =
+          from !== to
+            ? to
+            : op.word
+              ? this.stepWordRight(liveText, to)
+              : this.nextGraphemeBoundary(liveText, to);
         if (delTo > delFrom) {
           cm.dispatch({
             changes: { from: delFrom, to: delTo, insert: "" },
@@ -4237,7 +4344,8 @@ export class UiControlService {
   private applyTextToNativeInput(
     target: HTMLInputElement | HTMLTextAreaElement,
     insertText: string,
-    mode: "insert" | "backspace" | "delete" = "insert"
+    mode: "insert" | "backspace" | "delete" = "insert",
+    word = false
   ): void {
     const value = typeof target.value === "string" ? target.value : "";
     const rawStart =
@@ -4250,10 +4358,20 @@ export class UiControlService {
     let delTo = end;
     let replacement = insertText;
     if (mode === "backspace") {
-      delFrom = start === end ? this.prevGraphemeBoundary(value, start) : start;
+      delFrom =
+        start === end
+          ? word
+            ? this.stepWordLeft(value, start)
+            : this.prevGraphemeBoundary(value, start)
+          : start;
       replacement = "";
     } else if (mode === "delete") {
-      delTo = start === end ? this.nextGraphemeBoundary(value, end) : end;
+      delTo =
+        start === end
+          ? word
+            ? this.stepWordRight(value, end)
+            : this.nextGraphemeBoundary(value, end)
+          : end;
       replacement = "";
     }
     const nextPos = delFrom + replacement.length;
@@ -4283,9 +4401,13 @@ export class UiControlService {
       ).InputEvent;
       const inputType =
         mode === "backspace"
-          ? "deleteContentBackward"
+          ? word
+            ? "deleteWordBackward"
+            : "deleteContentBackward"
           : mode === "delete"
-            ? "deleteContentForward"
+            ? word
+              ? "deleteWordForward"
+              : "deleteContentForward"
             : "insertText";
       const data = mode === "insert" ? insertText : null;
       const inputEv =
@@ -4349,7 +4471,7 @@ export class UiControlService {
     this.replayingUserInput = true;
     try {
       // 1) Terminal adapter: deliver UTF-8 key bytes directly to owning PtySession without moving focus.
-      if (this.deliverToTerminal && this.findClosestElement(target, HERDR_TERMINAL_PROTECTED_SELECTOR)) {
+      if (this.deliverToTerminal && this.safetyGuard.isHerdrTerminalElement(target)) {
         const bytes = this.encodeOpsForTerminal(ops);
         if (bytes.length > 0) {
           const handled = await this.deliverToTerminal(target, bytes);
@@ -4360,9 +4482,23 @@ export class UiControlService {
       }
 
       // 2) Live Electron when focus was restored back to the user control.
-      if (isElectron && wc && !preserveCurrentFocus && this.deepActiveElement() === target) {
+      if (
+        isElectron &&
+        wc &&
+        !preserveCurrentFocus &&
+        this.deepActiveElement() === target &&
+        !this.safetyGuard.isPasswordField(target)
+      ) {
         let lastKeyChar: string | null = null;
         for (const ev of captured) {
+          const currentActive = this.deepActiveElement();
+          if (
+            currentActive !== target ||
+            (target as { isConnected?: boolean }).isConnected === false ||
+            this.safetyGuard.isPasswordField(currentActive)
+          ) {
+            break;
+          }
           if (ev.type === "keydown") {
             const key = ev.key ?? "";
             if (!key || key === "Shift" || key === "Control" || key === "Alt" || key === "Meta") {
@@ -4373,19 +4509,33 @@ export class UiControlService {
             if (ev.ctrlKey) modifiers.push("Control");
             if (ev.altKey) modifiers.push("Alt");
             if (ev.metaKey) modifiers.push("Meta");
+            let press: ReturnType<typeof buildKeyPress> | null = null;
             try {
-              const press = buildKeyPress(key, modifiers, this.platform);
-              wc.sendInputEvent({ type: "keyDown", keyCode: press.keyCode, modifiers: press.modifiers });
-              if (press.text !== null) {
-                wc.sendInputEvent({ type: "char", keyCode: press.text, modifiers: press.modifiers });
-              }
-              wc.sendInputEvent({ type: "keyUp", keyCode: press.keyCode, modifiers: press.modifiers });
-              lastKeyChar = press.text;
+              press = buildKeyPress(key, modifiers, this.platform);
             } catch {
-              if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-                await this.insertTextWithTimeout(wc, key);
-                lastKeyChar = key;
+              press = null;
+            }
+            if (press) {
+              let sentDown = false;
+              try {
+                wc.sendInputEvent({ type: "keyDown", keyCode: press.keyCode, modifiers: press.modifiers });
+                sentDown = true;
+                if (press.text !== null) {
+                  wc.sendInputEvent({ type: "char", keyCode: press.text, modifiers: press.modifiers });
+                }
+              } finally {
+                if (sentDown) {
+                  try {
+                    wc.sendInputEvent({ type: "keyUp", keyCode: press.keyCode, modifiers: press.modifiers });
+                  } catch {
+                    // Ignore keyUp cleanup errors if WebContents was destroyed.
+                  }
+                }
               }
+              lastKeyChar = press.text;
+            } else if (key.length === 1 && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+              await this.insertTextWithTimeout(wc, key);
+              lastKeyChar = key;
             }
           } else if (ev.type === "keypress") {
             const ch = ev.key || ev.data || "";
@@ -4416,9 +4566,7 @@ export class UiControlService {
       const cm = this.findEditorCmForReplay(target);
       if (cm) {
         const unhandled = this.replayCodeMirrorOps(target, cm, ops);
-        if (unhandled.length > 0 && preserveCurrentFocus) {
-          this.deferredUserInputs.push(...unhandled);
-        } else if (unhandled.length > 0) {
+        if (unhandled.length > 0 && !preserveCurrentFocus) {
           const dispatcher = target as unknown as { dispatchEvent?: (event: unknown) => boolean };
           for (const ev of unhandled) {
             dispatcher.dispatchEvent?.(this.buildReplayDomEvent(ev));
@@ -4443,7 +4591,6 @@ export class UiControlService {
           Home: "home",
           End: "end",
         };
-        const unhandled: CapturedUserEvent[] = [];
         let insertedForKey: string | null = null;
         for (const ev of captured) {
           const domEv = this.buildReplayDomEvent(ev);
@@ -4459,6 +4606,7 @@ export class UiControlService {
             }
             const isPrimaryMod =
               this.platform === "darwin" ? Boolean(ev.metaKey && !ev.ctrlKey) : Boolean(ev.ctrlKey && !ev.metaKey);
+            const isWordDeleteMod = Boolean((ev.ctrlKey || ev.altKey) && !ev.metaKey && !(ev.ctrlKey && ev.altKey));
             if (isPrimaryMod && !ev.altKey && (key === "a" || key === "A")) {
               const val = typeof nativeTarget.value === "string" ? nativeTarget.value : "";
               this.applySelectionToNativeInput(nativeTarget, 0, val.length);
@@ -4474,10 +4622,16 @@ export class UiControlService {
               this.applySelectionToNativeInput(nativeTarget, next.anchor, next.head);
               insertedForKey = null;
             } else if (key === "Backspace" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-              this.applyTextToNativeInput(nativeTarget, "", "backspace");
+              this.applyTextToNativeInput(nativeTarget, "", "backspace", false);
+              insertedForKey = null;
+            } else if (key === "Backspace" && isWordDeleteMod) {
+              this.applyTextToNativeInput(nativeTarget, "", "backspace", true);
               insertedForKey = null;
             } else if ((key === "Delete" || key === "Del") && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
-              this.applyTextToNativeInput(nativeTarget, "", "delete");
+              this.applyTextToNativeInput(nativeTarget, "", "delete", false);
+              insertedForKey = null;
+            } else if ((key === "Delete" || key === "Del") && isWordDeleteMod) {
+              this.applyTextToNativeInput(nativeTarget, "", "delete", true);
               insertedForKey = null;
             } else if (
               (key === "Enter" || key === "Return") &&
@@ -4493,7 +4647,6 @@ export class UiControlService {
               insertedForKey = key;
             } else {
               insertedForKey = null;
-              unhandled.push(ev);
             }
           } else if (ev.type === "keypress") {
             const ch = ev.key || ev.data || "";
@@ -4512,22 +4665,22 @@ export class UiControlService {
             }
             insertedForKey = null;
             if (ev.inputType === "deleteContentBackward") {
-              this.applyTextToNativeInput(nativeTarget, "", "backspace");
+              this.applyTextToNativeInput(nativeTarget, "", "backspace", false);
+            } else if (ev.inputType === "deleteWordBackward") {
+              this.applyTextToNativeInput(nativeTarget, "", "backspace", true);
             } else if (ev.inputType === "deleteContentForward") {
-              this.applyTextToNativeInput(nativeTarget, "", "delete");
+              this.applyTextToNativeInput(nativeTarget, "", "delete", false);
+            } else if (ev.inputType === "deleteWordForward") {
+              this.applyTextToNativeInput(nativeTarget, "", "delete", true);
             } else if (data) {
               this.applyTextToNativeInput(nativeTarget, data, "insert");
             }
           }
         }
-        if (unhandled.length > 0 && preserveCurrentFocus) {
-          this.deferredUserInputs.push(...unhandled);
-        }
         return;
       }
 
       if (preserveCurrentFocus) {
-        this.deferredUserInputs.push(...captured);
         return;
       }
       for (const ev of captured) {
@@ -4560,61 +4713,45 @@ export class UiControlService {
     try {
       return await task();
     } finally {
-      if (ownsShield) {
-        shieldSession.detach?.();
-        shieldSession.detach = null;
-        this.activeShield = null;
-        this.expectedAgentLedger = [];
-      }
       const beforeEl = before.element;
       const afterEl = (this.deepActiveElement() as HTMLElement | null) ?? null;
       let blockedByModal = false;
       let preserveNestedRename = false;
-      if (beforeEl && beforeEl.isConnected !== false && afterEl !== beforeEl) {
-        const afterModals = this.visibleModalElements();
-        const openedNewModal = afterModals.some((el) => !before.visibleModals.has(el));
-        const beforeInModal = Boolean(beforeEl.closest?.(MODAL_SELECTOR));
-        const afterInModal = Boolean(afterEl?.closest?.(MODAL_SELECTOR));
-        blockedByModal = openedNewModal || (afterInModal && !beforeInModal);
-        preserveNestedRename = shouldPreserveNestedFocus(beforeEl, afterEl);
-        if (!blockedByModal && !preserveNestedRename) {
-          this.restoreElementFocusAndSelection(beforeEl, before);
+      try {
+        if (beforeEl && beforeEl.isConnected !== false && afterEl !== beforeEl) {
+          const afterModals = this.visibleModalElements();
+          const openedNewModal = afterModals.some((el) => !before.visibleModals.has(el));
+          const beforeInModal = Boolean(beforeEl.closest?.(MODAL_SELECTOR));
+          const afterInModal = Boolean(afterEl?.closest?.(MODAL_SELECTOR));
+          blockedByModal = openedNewModal || (afterInModal && !beforeInModal);
+          preserveNestedRename = shouldPreserveNestedFocus(beforeEl, afterEl);
+          if (!blockedByModal && !preserveNestedRename) {
+            this.restoreElementFocusAndSelection(beforeEl, before);
+          }
+        }
+      } finally {
+        if (ownsShield) {
+          shieldSession.detach?.();
+          shieldSession.detach = null;
+          this.activeShield = null;
+          this.expectedAgentLedger = [];
         }
       }
       const keepCurrentFocus = blockedByModal || preserveNestedRename;
-      if (ownsShield && shieldSession.captured.length > 0) {
-        if (beforeEl && beforeEl.isConnected !== false) {
+      if (ownsShield && shieldSession.captured.length > 0 && beforeEl && beforeEl.isConnected !== false) {
+        try {
           await this.replayCapturedUserInputs(beforeEl, shieldSession.captured, keepCurrentFocus);
-          if (keepCurrentFocus && afterEl && afterEl.isConnected !== false && this.deepActiveElement() !== afterEl) {
-            try {
-              afterEl.focus?.({ preventScroll: true });
-            } catch {
-              afterEl.focus?.();
-            }
+        } catch {
+          // Never allow user-input replay failures to mask action outcomes.
+        }
+        if (keepCurrentFocus && afterEl && afterEl.isConnected !== false && this.deepActiveElement() !== afterEl) {
+          try {
+            afterEl.focus?.({ preventScroll: true });
+          } catch {
+            afterEl.focus?.();
           }
-        } else {
-          this.deferredUserInputs.push(...shieldSession.captured);
         }
       }
-    }
-  }
-
-  private isProtectedAreasAllowed(): boolean {
-    try {
-      return this.getAllowUiInProtectedAreas() === true;
-    } catch {
-      return false;
-    }
-  }
-
-  private findClosestElement(el: Element | null | undefined, selector: string): Element | null {
-    if (!el || typeof el.closest !== "function") {
-      return null;
-    }
-    try {
-      return el.closest(selector);
-    } catch {
-      return null;
     }
   }
 
@@ -4627,202 +4764,8 @@ export class UiControlService {
       return true;
     }
     return Boolean(
-      this.findClosestElement(el, ".cm-table-widget, .metadata-container, .metadata-property")
+      findClosestElement(el, ".cm-table-widget, .metadata-container, .metadata-property")
     );
-  }
-
-  private findSelectedActivationElements(activeEl: Element | null): Element[] {
-    if (!activeEl) {
-      return [];
-    }
-    const seen = new Set<Element>();
-    const out: Element[] = [];
-    const pushIfShown = (cand: Element | null | undefined): void => {
-      if (!cand || seen.has(cand) || (cand as { isConnected?: boolean }).isConnected === false) {
-        return;
-      }
-      if (typeof this.win.getComputedStyle === "function") {
-        try {
-          const style = this.win.getComputedStyle(cand);
-          if (style?.display === "none" || style?.visibility === "hidden") {
-            return;
-          }
-        } catch {
-          // Ignore mock style errors.
-        }
-      }
-      seen.add(cand);
-      out.push(cand);
-    };
-
-    const doc = this.win.document as Document & { getElementById?: (id: string) => Element | null };
-    const activeDescId =
-      typeof activeEl.getAttribute === "function"
-        ? (activeEl.getAttribute("aria-activedescendant") ?? "").trim()
-        : "";
-    if (activeDescId) {
-      const byId =
-        doc.getElementById?.(activeDescId) ??
-        (() => {
-          try {
-            return doc.querySelector?.(`[id="${activeDescId.replace(/["\\]/g, "\\$&")}"]`) ?? null;
-          } catch {
-            return null;
-          }
-        })();
-      pushIfShown(byId);
-    }
-
-    const scope = this.findClosestElement(
-      activeEl,
-      '.prompt, .modal-container, .modal, .suggestion-container, .menu, [role="dialog"], [role="menu"], [role="listbox"]'
-    );
-    const selectedSelector =
-      '.suggestion-item.is-selected, .menu-item.selected, .menu-item.is-selected, [role="option"][aria-selected="true"], [role="menuitem"][aria-selected="true"], [role="menuitem"].is-selected, [aria-selected="true"], .is-selected';
-    const scopeQueryAll = (scope as { querySelectorAll?: (sel: string) => ArrayLike<Element> } | null)
-      ?.querySelectorAll;
-    if (scope && typeof scopeQueryAll === "function") {
-      try {
-        for (const item of Array.from(scopeQueryAll.call(scope, selectedSelector))) {
-          pushIfShown(item);
-        }
-      } catch {
-        // Ignore query errors on minimal mocks.
-      }
-    } else if (
-      this.findClosestElement(activeEl, ".prompt-input, .menu, .suggestion-container") ||
-      (typeof activeEl.matches === "function" && activeEl.matches(".prompt-input"))
-    ) {
-      for (const item of this.queryAll(
-        `.prompt ${selectedSelector}, .suggestion-container ${selectedSelector}, .menu ${selectedSelector}`
-      )) {
-        pushIfShown(item);
-      }
-    }
-    return out;
-  }
-
-  private detectProtectedArea(el: Element | null | undefined): string | null {
-    if (!el) {
-      return null;
-    }
-    if (this.findClosestElement(el, HERDR_TERMINAL_PROTECTED_SELECTOR)) {
-      return "the Herdr terminal view";
-    }
-    if (this.findClosestElement(el, COMMUNITY_PLUGIN_PROTECTED_SELECTOR)) {
-      return "community plugin settings and toggles";
-    }
-    if (this.findClosestElement(el, SETTINGS_MODAL_PROTECTED_SELECTOR)) {
-      return "the Obsidian Settings modal";
-    }
-    if (this.findClosestElement(el, WINDOW_CONTROL_PROTECTED_SELECTOR)) {
-      return "Obsidian window controls";
-    }
-    if (
-      this.findClosestElement(el, APP_QUIT_PROTECTED_SELECTOR) ||
-      Boolean(el.querySelector?.(APP_QUIT_PROTECTED_SELECTOR))
-    ) {
-      return "app quit controls";
-    }
-    if (
-      this.findClosestElement(el, SETTINGS_OPEN_PROTECTED_SELECTOR) ||
-      Boolean(el.querySelector?.(SETTINGS_OPEN_PROTECTED_SELECTOR))
-    ) {
-      return "Obsidian Settings controls";
-    }
-    const ariaHost = this.findClosestElement(el, "[aria-label]") ?? el;
-    const aria =
-      typeof ariaHost.getAttribute === "function"
-        ? (ariaHost.getAttribute("aria-label") ?? "").trim().toLowerCase()
-        : "";
-    if (
-      aria === "close window" ||
-      aria === "minimize" ||
-      aria === "maximize" ||
-      aria === "restore" ||
-      aria === "quit" ||
-      aria === "quit obsidian"
-    ) {
-      return "Obsidian window and quit controls";
-    }
-    if (aria === "settings" || aria === "open settings") {
-      return "Obsidian Settings controls";
-    }
-    const cmdMenu = this.findClosestElement(
-      el,
-      '.menu-item, .suggestion-item, [role="option"], [role="menuitem"]'
-    );
-    if (cmdMenu) {
-      if (cmdMenu.querySelector?.(APP_QUIT_PROTECTED_SELECTOR)) {
-        return "app quit controls";
-      }
-      if (cmdMenu.querySelector?.(SETTINGS_OPEN_PROTECTED_SELECTOR)) {
-        return "Obsidian Settings controls";
-      }
-      const rawTitle =
-        cmdMenu.querySelector?.(".menu-item-title, .suggestion-title")?.textContent ??
-        cmdMenu.textContent ??
-        "";
-      const firstLine = (rawTitle.split(/\r?\n/)[0] ?? "").replace(/\s+/g, " ").trim().toLowerCase();
-      if (
-        firstLine === "quit" ||
-        firstLine === "quit obsidian" ||
-        firstLine === "close window" ||
-        /^(quit obsidian|close window)\b/.test(firstLine)
-      ) {
-        return "app quit controls";
-      }
-      if (firstLine === "open settings" || /^open settings\b/.test(firstLine)) {
-        return "Obsidian Settings controls";
-      }
-    }
-    const modal = this.findClosestElement(el, '.modal, .modal-container, [role="dialog"]');
-    if (modal) {
-      try {
-        if (
-          modal.querySelector?.(".mod-settings, .installed-plugins-container, .vertical-tabs-container") ||
-          modal.querySelector?.(".modal-title")?.textContent?.trim() === "Settings"
-        ) {
-          return "the Obsidian Settings modal";
-        }
-      } catch {
-        // Ignore query errors on minimal mocks.
-      }
-    }
-    return null;
-  }
-
-  private assertElementNotProtected(el: Element | null | undefined, action: string): void {
-    if (this.isProtectedAreasAllowed()) {
-      return;
-    }
-    const area = this.detectProtectedArea(el);
-    if (!area) {
-      return;
-    }
-    throw new UiControlError(
-      "ui_protected_area",
-      `Refused ui.${action} inside ${area}. Ask the user to operate protected controls manually, or enable allowUiInProtectedAreas in Herdr settings if explicitly authorized.`
-    );
-  }
-
-  private elementAtPoint(point: { x: number; y: number }): Element | null {
-    try {
-      return this.win.document.elementFromPoint?.(point.x, point.y) ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  private isElementWithinContainer(el: Element, container: Element): boolean {
-    if (el === container || Boolean(container.contains?.(el))) {
-      return true;
-    }
-    try {
-      return typeof el.closest === "function" && el.closest(".workspace-leaf") === container;
-    } catch {
-      return false;
-    }
   }
 
   private expectedTargetContainer(resolved: ResolvedUiTarget): Element | null {
@@ -4833,28 +4776,6 @@ export class UiControlService {
       return resolved.element ?? null;
     }
     return null;
-  }
-
-  /**
-   * Validates the topmost element under the dispatch point right before input delivery so
-   * overlays (protected Settings/Terminal areas or ordinary covering modals) block the event.
-   */
-  private assertPointReceiverSafe(
-    point: { x: number; y: number },
-    action: string,
-    expectedContainer?: Element | null
-  ): void {
-    const hit = this.elementAtPoint(point);
-    if (!hit) {
-      return;
-    }
-    this.assertElementNotProtected(hit, action);
-    if (expectedContainer && !this.isElementWithinContainer(hit, expectedContainer)) {
-      throw new UiControlError(
-        "ui_target_covered",
-        `Target for ui.${action} is covered by another element.`
-      );
-    }
   }
 
   private findSectionHeadingAbove(
@@ -4981,7 +4902,7 @@ export class UiControlService {
     const editable =
       !input.readOnly &&
       !input.disabled &&
-      (el.isContentEditable ||
+      (isElementContentEditable(el) ||
         matchesFn(
           'textarea,input:not([type]),input[type="text"],input[type="search"],input[type="email"],input[type="url"],input[type="tel"],input[type="number"]'
         ));
@@ -4993,16 +4914,40 @@ export class UiControlService {
     };
   }
 
+  /**
+   * Runs `fn` for one bridge request. The first UI action `fn` queues (synchronously) is
+   * skipped if `isAbandoned()` is true by the time its turn comes.
+   */
+  runForRequest<T>(isAbandoned: () => boolean, fn: () => T): T {
+    const previous = this.pendingAbandonCheck;
+    this.pendingAbandonCheck = isAbandoned;
+    try {
+      return fn();
+    } finally {
+      this.pendingAbandonCheck = previous;
+    }
+  }
+
   private serialize<T>(task: () => Promise<T>): Promise<T> {
     if (this.disposed) {
       return Promise.reject(
         new UiControlError("ui_unavailable", "UI control service was disposed.")
       );
     }
+    const isAbandoned = this.pendingAbandonCheck;
+    this.pendingAbandonCheck = null;
     const guarded = () => {
       if (this.disposed) {
         return Promise.reject(
           new UiControlError("ui_unavailable", "UI control service was disposed.")
+        );
+      }
+      if (isAbandoned?.()) {
+        return Promise.reject(
+          new UiControlError(
+            "ui_request_abandoned",
+            "The agent stopped waiting for this UI action before its turn, so it was not run."
+          )
         );
       }
       return task();
@@ -5028,6 +4973,88 @@ export class UiControlService {
     return wc;
   }
 
+  /** Visible boxes (CSS pixels, clipped to the viewport) that screenshots must hide. */
+  private protectedCaptureRects(viewport: {
+    width: number;
+    height: number;
+  }): Array<{ x: number; y: number; width: number; height: number }> {
+    if (this.safetyGuard.isProtectedAreasAllowed()) {
+      return [];
+    }
+    const doc = this.win.document as Document | undefined;
+    if (!doc || !("querySelectorAll" in doc)) {
+      return [];
+    }
+    const rects: Array<{ x: number; y: number; width: number; height: number }> = [];
+    const selector = `${HERDR_TERMINAL_PROTECTED_SELECTOR}, ${SETTINGS_MODAL_PROTECTED_SELECTOR}`;
+    for (const el of Array.from(doc.querySelectorAll(selector))) {
+      // Same membership test that inspect uses to redact protected areas.
+      if (!findClosestElement(el, selector)) {
+        continue;
+      }
+      const box = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect() : null;
+      if (!box || !(box.width > 0) || !(box.height > 0)) {
+        continue;
+      }
+      const left = Math.max(0, box.left);
+      const top = Math.max(0, box.top);
+      const right = Math.min(viewport.width, box.right);
+      const bottom = Math.min(viewport.height, box.bottom);
+      if (right > left && bottom > top) {
+        rects.push({ x: left, y: top, width: right - left, height: bottom - top });
+      }
+    }
+    return rects;
+  }
+
+  /** Paints over protected boxes in a captured PNG; refuses the capture if it cannot. */
+  private async maskCapturedPng(
+    png: Uint8Array,
+    size: { width: number; height: number },
+    viewport: { width: number; height: number },
+    rects: Array<{ x: number; y: number; width: number; height: number }>
+  ): Promise<Uint8Array> {
+    const host = this.win as unknown as {
+      createImageBitmap?: (blob: Blob) => Promise<ImageBitmap>;
+      OffscreenCanvas?: new (width: number, height: number) => OffscreenCanvas;
+    };
+    const fail = (): never => {
+      throw new UiControlError(
+        "ui_capture_mask_unavailable",
+        "The screenshot was not taken: protected areas (Herdr terminals, Mission Control, Settings) could not be hidden in it."
+      );
+    };
+    if (typeof host.createImageBitmap !== "function" || typeof host.OffscreenCanvas !== "function") {
+      return fail();
+    }
+    try {
+      const bitmap = await host.createImageBitmap(new Blob([png], { type: "image/png" }));
+      const canvas = new host.OffscreenCanvas(size.width, size.height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        bitmap.close();
+        return fail();
+      }
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      const sx = size.width / Math.max(1, viewport.width);
+      const sy = size.height / Math.max(1, viewport.height);
+      ctx.fillStyle = "rgb(48, 48, 48)";
+      for (const r of rects) {
+        const x = Math.max(0, Math.floor(r.x * sx) - 1);
+        const y = Math.max(0, Math.floor(r.y * sy) - 1);
+        ctx.fillRect(x, y, Math.ceil(r.width * sx) + 2, Math.ceil(r.height * sy) + 2);
+      }
+      const blob = await canvas.convertToBlob({ type: "image/png" });
+      return new Uint8Array(await blob.arrayBuffer());
+    } catch (err) {
+      if (err instanceof UiControlError) {
+        throw err;
+      }
+      return fail();
+    }
+  }
+
   private viewport(): { width: number; height: number; devicePixelRatio: number } {
     return {
       width: this.win.innerWidth,
@@ -5037,25 +5064,71 @@ export class UiControlService {
   }
 
   private waitForPaint(): Promise<void> {
+    if (this.disposed) {
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
       let done = false;
+      let timer: ReturnType<Window["setTimeout"]> | null = null;
+      let raf1: number | null = null;
+      let raf2: number | null = null;
+      const cleanup = (): void => {
+        if (timer !== null) {
+          this.win.clearTimeout?.(timer);
+          this.activeTimers.delete(timer);
+          timer = null;
+        }
+        if (raf1 !== null) {
+          this.win.cancelAnimationFrame?.(raf1);
+          raf1 = null;
+        }
+        if (raf2 !== null) {
+          this.win.cancelAnimationFrame?.(raf2);
+          raf2 = null;
+        }
+        this.waitAbortCallbacks.delete(finish);
+      };
       const finish = (): void => {
         if (!done) {
           done = true;
+          cleanup();
           resolve();
         }
       };
-      try {
-        this.win.requestAnimationFrame(() => this.win.requestAnimationFrame(finish));
-      } catch {
+      this.waitAbortCallbacks.add(finish);
+      if (typeof this.win.requestAnimationFrame === "function") {
+        try {
+          raf1 = this.win.requestAnimationFrame(() => {
+            raf1 = null;
+            if (done) {
+              return;
+            }
+            try {
+              raf2 = this.win.requestAnimationFrame(() => {
+                raf2 = null;
+                finish();
+              });
+            } catch {
+              finish();
+            }
+          });
+        } catch {
+          finish();
+        }
+      } else {
         finish();
       }
-      this.win.setTimeout(finish, 300);
+      if (!done && typeof this.win.setTimeout === "function") {
+        timer = this.win.setTimeout(finish, 300);
+        this.activeTimers.add(timer);
+      }
     });
   }
 
-  /** CSS pixels from getBoundingClientRect to window coordinates for sendInputEvent. */
-  private toWindowPoint(wc: WebContentsLike, point: { x: number; y: number }): { x: number; y: number } {
+  private readZoomFactor(wc: WebContentsLike): number {
+    if (this.inUiAction && this.activeActionZoom !== null) {
+      return this.activeActionZoom;
+    }
     let zoom = 1;
     try {
       zoom = wc.getZoomFactor?.() ?? 1;
@@ -5065,6 +5138,22 @@ export class UiControlService {
     if (!Number.isFinite(zoom) || zoom <= 0) {
       zoom = 1;
     }
+    if (this.inUiAction) {
+      this.activeActionZoom = zoom;
+    }
+    return zoom;
+  }
+
+  /** CSS pixels from getBoundingClientRect to window coordinates for sendInputEvent. */
+  private toWindowPoint(
+    wc: WebContentsLike,
+    point: { x: number; y: number },
+    zoomOverride?: number
+  ): { x: number; y: number } {
+    const zoom =
+      typeof zoomOverride === "number" && Number.isFinite(zoomOverride) && zoomOverride > 0
+        ? zoomOverride
+        : this.readZoomFactor(wc);
     return { x: Math.round(point.x * zoom), y: Math.round(point.y * zoom) };
   }
 
@@ -5089,11 +5178,7 @@ export class UiControlService {
     const root = this.win.document.documentElement;
     while (node && node !== root) {
       if (node.id) {
-        const escaped =
-          typeof CSS !== "undefined" && typeof CSS.escape === "function"
-            ? CSS.escape(node.id)
-            : node.id.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
-        parts.unshift(`#${escaped}`);
+        parts.unshift(`#${escapeCssIdent(node.id)}`);
         break;
       }
       const parent: Element | null = node.parentElement;
@@ -5105,11 +5190,60 @@ export class UiControlService {
   }
 
   private queryAll(selector: string): Element[] {
+    if (selector.length > 512 || /:has\([^)]*:has\(/.test(selector)) {
+      throw new UiControlError("invalid_params", "CSS selector exceeds length or complexity limits.");
+    }
     try {
       return Array.from(this.win.document.querySelectorAll(selector));
     } catch {
       throw new UiControlError("invalid_params", `Invalid CSS selector: ${selector}`);
     }
+  }
+
+  private formatInspectedElements(all: Element[], limit: number): InspectedElement[] {
+    const textOf = (el: Element): string =>
+      (el as HTMLElement).innerText || el.textContent || "";
+    const normalEls: Element[] = [];
+    const protectedEls: Element[] = [];
+    for (const el of all) {
+      if (this.safetyGuard.detectProtectedArea(el)) {
+        protectedEls.push(el);
+      } else {
+        normalEls.push(el);
+      }
+    }
+    const ordered = [...normalEls, ...protectedEls];
+    const normalCount = normalEls.length;
+    const allowProtected = this.safetyGuard.isProtectedAreasAllowed();
+    return ordered.slice(0, limit).map((el, idx): InspectedElement => {
+      const r = el.getBoundingClientRect();
+      const field = el as HTMLInputElement;
+      const isProtected = idx >= normalCount;
+      const redactProtected = isProtected && !allowProtected;
+      const isPassword = this.safetyGuard.isPasswordField(el);
+      const isField =
+        !redactProtected &&
+        !isPassword &&
+        el.matches('input:not([type="password"]),textarea,select');
+      const ctx = this.resolveElementLeafContext(el);
+      const item: InspectedElement = {
+        selector: this.selectorPath(el),
+        tag: el.tagName.toLowerCase(),
+        role: el.getAttribute("role"),
+        label: redactProtected
+          ? (el.getAttribute("aria-label") ?? "")
+          : (el.getAttribute("aria-label") ?? el.getAttribute("title") ?? ""),
+        text: redactProtected || isPassword ? "" : textOf(el).trim().slice(0, 180),
+        ...(isField ? { value: field.value } : {}),
+        disabled: Boolean(field.disabled),
+        ...(isProtected ? { protected: true } : {}),
+        rect: { x: r.x, y: r.y, width: r.width, height: r.height },
+        ...(ctx?.notePath ? { notePath: ctx.notePath } : {}),
+        ...(ctx?.pane ? { pane: ctx.pane } : {}),
+        ...(ctx && typeof ctx.activePane === "boolean" ? { activePane: ctx.activePane } : {}),
+      };
+      return this.safetyGuard.redactProtectedInspectElement(item);
+    });
   }
 
   private collect(
@@ -5120,71 +5254,57 @@ export class UiControlService {
   ): { viewport: unknown; total: number; truncated: boolean; elements: InspectedElement[] } {
     const textOf = (el: Element): string =>
       (el as HTMLElement).innerText || el.textContent || "";
+    const allowProtected = this.safetyGuard.isProtectedAreasAllowed();
     let all = this.queryAll(selector)
       .filter((el) => this.isVisible(el))
-      .filter(
-        (el) =>
-          matchText === null ||
+      .filter((el) => {
+        if (matchText === null) {
+          return true;
+        }
+        if (this.safetyGuard.isPasswordField(el)) {
+          return false;
+        }
+        if (!allowProtected && this.safetyGuard.detectProtectedArea(el)) {
+          return false;
+        }
+        return (
           textOf(el).includes(matchText) ||
           (el.getAttribute("aria-label") ?? el.getAttribute("title") ?? "").includes(matchText)
-      );
+        );
+      });
     if (innermostOnly) {
       all = all.filter((el) => !all.some((other) => other !== el && el.contains(other)));
     }
-    const normalEls: Element[] = [];
-    const protectedEls: Element[] = [];
-    for (const el of all) {
-      if (this.detectProtectedArea(el)) {
-        protectedEls.push(el);
-      } else {
-        normalEls.push(el);
-      }
-    }
-    const ordered = [...normalEls, ...protectedEls];
-    const normalCount = normalEls.length;
-    const elements = ordered.slice(0, limit).map((el, idx): InspectedElement => {
-      const r = el.getBoundingClientRect();
-      const field = el as HTMLInputElement;
-      const isField = el.matches('input:not([type="password"]),textarea,select');
-      const ctx = this.resolveElementLeafContext(el);
-      const isProtected = idx >= normalCount;
-      return {
-        selector: this.selectorPath(el),
-        tag: el.tagName.toLowerCase(),
-        role: el.getAttribute("role"),
-        label: el.getAttribute("aria-label") ?? el.getAttribute("title") ?? "",
-        text: textOf(el).trim().slice(0, 180),
-        ...(isField ? { value: field.value } : {}),
-        disabled: Boolean(field.disabled),
-        ...(isProtected ? { protected: true } : {}),
-        rect: { x: r.x, y: r.y, width: r.width, height: r.height },
-        ...(ctx?.notePath ? { notePath: ctx.notePath } : {}),
-        ...(ctx?.pane ? { pane: ctx.pane } : {}),
-        ...(ctx && typeof ctx.activePane === "boolean" ? { activePane: ctx.activePane } : {}),
-      };
-    });
+    const elements = this.formatInspectedElements(all, limit);
     return { viewport: this.viewport(), total: all.length, truncated: all.length > elements.length, elements };
   }
 
   private workspaceLike(): {
-    activeLeaf?: WorkspaceLeafLike | null;
+    getMostRecentLeaf?: () => WorkspaceLeafLike | null;
     leftSplit?: unknown;
     rightSplit?: unknown;
     iterateAllLeaves?: (cb: (leaf: WorkspaceLeafLike) => void) => void;
     getLeavesOfType?: (type: string) => WorkspaceLeafLike[];
   } | null {
-    const winWithApp = this.win as unknown as {
-      app?: {
-        workspace?: {
-          activeLeaf?: WorkspaceLeafLike | null;
-          leftSplit?: unknown;
-          rightSplit?: unknown;
-          iterateAllLeaves?: (cb: (leaf: WorkspaceLeafLike) => void) => void;
-          getLeavesOfType?: (type: string) => WorkspaceLeafLike[];
-        };
-      };
-    };
-    return winWithApp.app?.workspace ?? null;
+    const app = this.getAppOption?.() as
+      | {
+          workspace?: {
+            getMostRecentLeaf?: () => WorkspaceLeafLike | null;
+            leftSplit?: unknown;
+            rightSplit?: unknown;
+            iterateAllLeaves?: (cb: (leaf: WorkspaceLeafLike) => void) => void;
+            getLeavesOfType?: (type: string) => WorkspaceLeafLike[];
+          };
+        }
+      | null
+      | undefined;
+    return app?.workspace ?? null;
+  }
+
+  /** The most recently focused note leaf, via the public workspace API. */
+  private mostRecentLeaf(): WorkspaceLeafLike | null {
+    const ws = this.workspaceLike();
+    return typeof ws?.getMostRecentLeaf === "function" ? ws.getMostRecentLeaf() ?? null : null;
   }
 
   private collectWorkspaceLeaves(typeFilter?: string): WorkspaceLeafLike[] {
@@ -5295,11 +5415,11 @@ export class UiControlService {
   }
 
   private isLeafActive(leaf: WorkspaceLeafLike | null, containerEl: Element | null): boolean {
-    const ws = this.workspaceLike();
-    if (leaf && ws?.activeLeaf) {
-      return ws.activeLeaf === leaf;
+    if (containerEl?.classList) {
+      return containerEl.classList.contains("mod-active");
     }
-    return Boolean(containerEl?.classList?.contains("mod-active"));
+    const recent = this.mostRecentLeaf();
+    return Boolean(leaf && recent && recent === leaf);
   }
 
   private resolveElementLeafContext(el: Element): ElementLeafContext | null {
@@ -6248,7 +6368,7 @@ export class UiControlService {
   ): Promise<T> {
     let complete: MutationCompleteCallback | void = undefined;
     if (this.beforeMutation) {
-      complete = await this.beforeMutation({
+      const hookResult = this.beforeMutation({
         action,
         notePath,
         paneId,
@@ -6261,6 +6381,14 @@ export class UiControlService {
           ? { expectedFileOperation: extra.expectedFileOperation }
           : {}),
       });
+      complete = this.isPromiseLike<MutationCompleteCallback | void>(hookResult)
+        ? await this.raceWithTimeout(
+            hookResult,
+            UiControlService.MUTATION_HOOK_TIMEOUT_MS,
+            "ui_timeout",
+            `beforeMutation hook for ui.${action} timed out.`
+          )
+        : hookResult;
     }
     const prevRun = this.activeMutationRun;
     const run: ActiveMutationRun = {
@@ -6281,13 +6409,25 @@ export class UiControlService {
     } finally {
       this.activeMutationRun = prevRun;
       if (typeof complete === "function") {
-        await complete({
-          ok,
-          ...(errorCode ? { errorCode } : {}),
-          ...(run.insertedChars > 0 ? { insertedChars: run.insertedChars } : {}),
-          ...(run.edits.length > 0 ? { edits: [...run.edits] } : {}),
-          ...(run.abortedAfterNoteSwitch ? { abortedAfterNoteSwitch: true } : {}),
-        });
+        try {
+          const completeResult = complete({
+            ok,
+            ...(errorCode ? { errorCode } : {}),
+            ...(run.insertedChars > 0 ? { insertedChars: run.insertedChars } : {}),
+            ...(run.edits.length > 0 ? { edits: [...run.edits] } : {}),
+            ...(run.abortedAfterNoteSwitch ? { abortedAfterNoteSwitch: true } : {}),
+          });
+          if (this.isPromiseLike<void>(completeResult)) {
+            await this.raceWithTimeout(
+              completeResult,
+              UiControlService.MUTATION_HOOK_TIMEOUT_MS,
+              "ui_timeout",
+              `Mutation completion hook for ui.${action} timed out.`
+            );
+          }
+        } catch {
+          // Never let completion hook errors or timeouts mask task() outcome or deadlock this.queue.
+        }
       }
     }
   }
@@ -6296,7 +6436,7 @@ export class UiControlService {
     if (!el) {
       return null;
     }
-    const leafEl = this.findClosestElement(el, ".workspace-leaf");
+    const leafEl = findClosestElement(el, ".workspace-leaf");
     for (const leaf of this.collectWorkspaceLeaves()) {
       const container = this.leafContainer(leaf);
       if (!container) {
@@ -6343,7 +6483,7 @@ export class UiControlService {
       const leaf = this.findWorkspaceLeafForElement(resolved.element);
       const containerEl =
         (leaf ? this.leafContainer(leaf) : null) ??
-        this.findClosestElement(resolved.element, ".workspace-leaf");
+        findClosestElement(resolved.element, ".workspace-leaf");
       if (ctx || leaf) {
         return {
           notePath: ctx?.notePath ?? leaf?.view?.file?.path ?? null,
@@ -6357,17 +6497,10 @@ export class UiControlService {
     return { notePath: null, paneId: null, containerEl: null, leaf: null, view: null };
   }
 
-  private resolveFocusedOwnership(): {
-    notePath: string | null;
-    paneId: string | null;
-    containerEl: Element | null;
-    leaf: WorkspaceLeafLike | null;
-    view: WorkspaceLeafLike["view"] | null;
-    cm: CodeMirrorViewLike | null;
-  } {
+  private resolveFocusedOwnership(): FocusedOwnership {
     const activeEl = this.deepActiveElement();
     if (activeEl) {
-      if (this.findClosestElement(activeEl, MODAL_SELECTOR)) {
+      if (findClosestElement(activeEl, MODAL_SELECTOR)) {
         return {
           notePath: null,
           paneId: null,
@@ -6381,7 +6514,7 @@ export class UiControlService {
       const leaf = this.findWorkspaceLeafForElement(activeEl);
       const containerEl =
         (leaf ? this.leafContainer(leaf) : null) ??
-        this.findClosestElement(activeEl, ".workspace-leaf");
+        findClosestElement(activeEl, ".workspace-leaf");
       const cm =
         this.extractCodeMirrorView(leaf?.view?.editor?.cm) ??
         this.findFocusedCodeMirrorView(activeEl) ??
@@ -6407,8 +6540,7 @@ export class UiControlService {
         };
       }
     }
-    const ws = this.workspaceLike();
-    const activeLeaf = ws?.activeLeaf ?? null;
+    const activeLeaf = this.mostRecentLeaf();
     if (activeLeaf) {
       const container = this.leafContainer(activeLeaf);
       return {
@@ -6489,18 +6621,4 @@ export class UiControlService {
     }
     return { x, y, element, isSelector };
   }
-}
-
-interface WorkspaceLeafLike {
-  id?: string;
-  containerEl?: Element;
-  getRoot?: () => unknown;
-  view?: {
-    containerEl?: Element;
-    getViewType?: () => string;
-    getViewData?: () => string;
-    data?: string;
-    file?: { path?: string } | null;
-    editor?: { cm?: unknown };
-  };
 }

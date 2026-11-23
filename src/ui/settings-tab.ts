@@ -4,7 +4,10 @@ import {
   PluginSettingTab,
   type SettingDefinitionItem,
 } from "obsidian";
-import type { HerdrPluginSettings } from "../domain/types";
+import {
+  SUPPORTED_AGENT_RUNTIMES,
+  type HerdrPluginSettings,
+} from "../domain/types";
 import { EditProfileModal } from "./modals";
 
 export interface HerdrSettingsHost {
@@ -36,15 +39,47 @@ export class HerdrSettingTab extends PluginSettingTab {
   }
 
   override async setControlValue(key: string, value: unknown): Promise<void> {
-    await this.host.saveAndApplySettings({
+    const patch: Partial<HerdrPluginSettings> = {
       [key]: value,
-    });
+    };
+    let needsFullUpdate = false;
+
+    if (key === "vaultPermissionMode") {
+      patch.vaultBridgeEnabled = value !== "off";
+      needsFullUpdate = true;
+    } else if (key === "vaultBridgeEnabled") {
+      if (value === true && this.host.settings.vaultPermissionMode === "off") {
+        patch.vaultPermissionMode = "read-write";
+        needsFullUpdate = true;
+      } else if (value === false && this.host.settings.vaultPermissionMode !== "off") {
+        patch.vaultPermissionMode = "off";
+        needsFullUpdate = true;
+      }
+    }
+
+    await this.host.saveAndApplySettings(patch);
+
+    if (needsFullUpdate) {
+      this.update();
+    } else if (key === "allowUiControl") {
+      const refreshable = this as unknown as { refreshDomState?: () => void };
+      if (typeof refreshable.refreshDomState === "function") {
+        refreshable.refreshDomState();
+      } else {
+        this.update();
+      }
+    }
   }
 
   override getSettingDefinitions(): SettingDefinitionItem[] {
     const profileOptions: Record<string, string> = {};
     for (const profile of this.host.settings.profiles) {
       profileOptions[profile.id] = profile.name;
+    }
+
+    const agentRuntimeOptions: Record<string, string> = {};
+    for (const runtime of SUPPORTED_AGENT_RUNTIMES) {
+      agentRuntimeOptions[runtime.id] = runtime.label;
     }
 
     return [
@@ -124,17 +159,7 @@ export class HerdrSettingTab extends PluginSettingTab {
             control: {
               type: "dropdown",
               key: "defaultAgentKind",
-              options: {
-                claude: "Claude Code",
-                codex: "Codex",
-                agy: "Antigravity",
-                gemini: "Gemini",
-                opencode: "OpenCode",
-                cursor: "Cursor CLI",
-                copilot: "GitHub Copilot CLI",
-                grok: "Grok",
-                pi: "Pi",
-              },
+              options: agentRuntimeOptions,
             },
           },
           {
@@ -223,7 +248,7 @@ export class HerdrSettingTab extends PluginSettingTab {
               this.update();
             });
         },
-        items: this.host.settings.profiles.map((profile, idx) => ({
+        items: this.host.settings.profiles.map((profile) => ({
           name: profile.name,
           desc: `Mode: ${profile.kind} (${profile.cwdMode})`,
           render: (setting) => {
@@ -232,9 +257,13 @@ export class HerdrSettingTab extends PluginSettingTab {
               .setDesc(`Mode: ${profile.kind} (${profile.cwdMode})`)
               .addButton((btn) =>
                 btn.setButtonText("Edit").onClick(() => {
-                  new EditProfileModal(this.app, profile, (updated) => {
-                    const next = [...this.host.settings.profiles];
-                    next[idx] = updated;
+                  const current =
+                    this.host.settings.profiles.find((p) => p.id === profile.id) ??
+                    profile;
+                  new EditProfileModal(this.app, current, (updated) => {
+                    const next = this.host.settings.profiles.map((p) =>
+                      p.id === profile.id ? updated : p
+                    );
                     void this.host
                       .saveAndApplySettings({ profiles: next })
                       .then(() => {
@@ -282,7 +311,7 @@ export class HerdrSettingTab extends PluginSettingTab {
           },
           {
             name: "Let agents see and operate Obsidian",
-            desc: "Agents can take screenshots of this window and inspect it. With Full permission they can also click, type, press keys, scroll, and drag. Screenshots can show any open note.",
+            desc: "Agents can take screenshots of this window and inspect it. With Full control they can also click, type, press keys, scroll, and drag. Screenshots can show any open note; Herdr terminals, Mission Control and the Settings window are blanked out.",
             control: {
               type: "toggle",
               key: "allowUiControl",
@@ -290,7 +319,8 @@ export class HerdrSettingTab extends PluginSettingTab {
           },
           {
             name: "Allow UI actions in protected areas",
-            desc: "Permit agent clicks, typing, keys, scrolling, and dragging inside Herdr terminal views, the Settings modal, and community plugin toggles.",
+            desc: "Permit agent clicks, typing, keys, scrolling, and dragging inside Herdr terminals, Mission Control, Herdr code block widgets, Bases boards, the Settings window and community plugin toggles, and show these areas in screenshots.",
+            visible: () => this.host.settings.allowUiControl,
             control: {
               type: "toggle",
               key: "allowUiInProtectedAreas",
@@ -299,6 +329,7 @@ export class HerdrSettingTab extends PluginSettingTab {
           {
             name: "UI typing speed",
             desc: "Visible animates agent typing word by word; Fast inserts text immediately with minimal action delays.",
+            visible: () => this.host.settings.allowUiControl,
             control: {
               type: "dropdown",
               key: "uiTypingSpeed",

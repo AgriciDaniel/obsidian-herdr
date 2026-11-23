@@ -1,28 +1,22 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type App, MarkdownView, Notice, TFile } from "obsidian";
+import { MarkdownView, Notice, TFile, type App } from "obsidian";
 import {
   buildBridgeEnvForPanes,
   computeRuntimePaths,
   provisionRuntimeKit,
+  pruneOldScreenshots,
   pruneStaleRuntimeKits,
+  legacyWindowsConnectionFilePath,
   readExistingBridgeToken,
   type ProvisionedRuntimeKit,
 } from "../bridge/runtime-kit";
 import { VaultBridgeServer } from "../bridge/vault-bridge-server";
-import { BridgeRpcError, VaultOpsService, type VaultTextChange } from "../bridge/vault-ops";
+import { VaultOpsService } from "../bridge/vault-ops";
 import { AgentCursorOverlay } from "../control/agent-cursor";
 import { getObsidianWebContents } from "../control/electron-host";
-import { resolveTopLevelElement } from "../control/nested-editors";
-import {
-  UiControlService,
-  type CodeMirrorViewLike,
-  type ElementLeafContext,
-  type NoteLeafContext,
-  type UiMutationContext,
-} from "../control/ui-control";
-import { buildOfflinePreviewSnapshot } from "../domain/demo-fixture";
+import { UiControlService } from "../control/ui-control";
 import { deriveVaultSessionSlug } from "../domain/shell-quote";
 import type {
   AgentInfo,
@@ -40,7 +34,8 @@ import type {
 } from "../domain/types";
 import { HerdrCliClient } from "../herdr/cli-client";
 import { evaluateHerdrProtocol, HerdrSocketClient } from "../herdr/socket-client";
-import { deliverToTerminal, resolveDefaultShell } from "../terminal/pty-host";
+import { resolveDefaultShell } from "../terminal/pty-host";
+import { ObsidianUiAdapter } from "./obsidian-ui-adapter";
 
 export function formatSpawnAbortNotice(agentName: string, err: unknown): string {
   if (err instanceof Error && err.message.trim()) {
@@ -92,6 +87,8 @@ export class HerdrCoordinator {
   private bridgeLastError: string | null = null;
   private lastError: string | null = null;
   private lastUpdated = 0;
+  private lastStatusProbeAt = 0;
+  private consecutiveSnapshotFailures = 0;
   private prunedStaleKits = false;
   private pruneStaleKitsFn: typeof pruneStaleRuntimeKits = pruneStaleRuntimeKits;
   private refreshInFlight: Promise<void> | null = null;
@@ -99,6 +96,8 @@ export class HerdrCoordinator {
   private bridgeStartInFlight: Promise<void> | null = null;
   private bridgeHealInFlight: Promise<void> | null = null;
   private lastKnownBridgeToken: string | undefined;
+  /** allowUiControl as last written to connection.json, to skip needless kit rewrites. */
+  private provisionedUiControl: boolean | undefined;
   private debounceTimer: number | null = null;
   private readonly listeners = new Set<() => void>();
   private readonly previousAgentStates = new Map<string, AgentStatus>();
@@ -106,9 +105,8 @@ export class HerdrCoordinator {
   private unsubSocketConn: (() => void) | null = null;
   private readonly pluginVersion: string | undefined;
   private readonly cursorOverlay: AgentCursorOverlay;
+  private readonly uiAdapter: ObsidianUiAdapter;
   private readonly uiControl: UiControlService;
-  private readonly notePaneIds = new WeakMap<MarkdownView, string>();
-  private notePaneSeq = 0;
   private disposed = false;
   private promptSettleTimeoutMs = 45000;
   private promptSettlePollMs = 400;
@@ -129,17 +127,26 @@ export class HerdrCoordinator {
       enabled: this.getSettings().showAgentCursors,
     });
 
+    this.uiAdapter = new ObsidianUiAdapter({
+      app: this.app,
+      getVaultOps: () => this.vaultOps,
+      cursorOverlay: this.cursorOverlay,
+      getShowAgentCursors: () => this.getSettings().showAgentCursors,
+      resolveCallerLabel: (caller) => this.resolveCallerLabel(caller),
+    });
+
     this.uiControl = new UiControlService({
       win: window,
+      getApp: () => this.app,
       getWebContents: getObsidianWebContents,
       getUiTypingSpeed: () => this.getSettings().uiTypingSpeed,
       getAllowUiInProtectedAreas: () => this.getSettings().allowUiInProtectedAreas,
       cursorOverlay: this.cursorOverlay,
       resolveAgentLabel: (caller) => this.resolveCallerLabel(caller),
-      resolveElementContext: (el) => this.resolveEditorContext(el),
-      resolveNoteLeaf: (notePath) => this.resolveOpenNoteLeaf(notePath),
-      beforeMutation: (context) => this.captureUiMutation(context),
-      deliverToTerminal: (element, data) => this.deliverCapturedTerminalInput(element, data),
+      resolveElementContext: (el) => this.uiAdapter.resolveEditorContext(el),
+      resolveNoteLeaf: (notePath) => this.uiAdapter.resolveOpenNoteLeaf(notePath),
+      beforeMutation: (context) => this.uiAdapter.captureUiMutation(context),
+      deliverToTerminal: (element, data) => this.uiAdapter.deliverCapturedTerminalInput(element, data),
     });
 
     this.vaultOps = new VaultOpsService({
@@ -153,7 +160,7 @@ export class HerdrCoordinator {
       getAllowUiControl: () => this.getSettings().allowUiControl,
       getAllowUiInProtectedAreas: () => this.getSettings().allowUiInProtectedAreas,
       onAgentActivity: (caller, targetPath, action, change) =>
-        this.notifyVaultCursorActivity(caller, targetPath, action, change),
+        this.uiAdapter.notifyVaultCursorActivity(caller, targetPath, action, change),
     });
 
     const vaultKey =
@@ -165,7 +172,11 @@ export class HerdrCoordinator {
     const initialSocket = this.resolveTargetSocketPath();
     this.socket = new HerdrSocketClient(initialSocket);
 
-    this.unsubSocketEvent = this.socket.onEvent(() => {
+    this.unsubSocketEvent = this.socket.onEvent((event) => {
+      const eventName = typeof event?.event === "string" ? event.event : "";
+      if (eventName.startsWith("worktree.")) {
+        this.pendingDeepRefresh = true;
+      }
       this.scheduleDebouncedRefresh(120);
     });
     this.unsubSocketConn = this.socket.onConnectionState(() => {
@@ -250,6 +261,22 @@ export class HerdrCoordinator {
     if (settings.vaultBridgeEnabled && settings.vaultPermissionMode !== "off") {
       if (!this.bridgeServer?.isRunning()) {
         await this.startVaultBridge();
+      } else if (settings.allowUiControl !== this.provisionedUiControl) {
+        // Keep connection.json metadata (uiControlEnabled) in sync, but only when it
+        // changed: most settings edits (fonts, paths) must not rewrite the kit.
+        try {
+          provisionRuntimeKit({
+            kit: this.runtimeKit,
+            token: this.bridgeServer.getAuthToken(),
+            vaultName: this.app.vault.getName(),
+            vaultPath: this.vaultOps.getVaultBasePath(),
+            pluginVersion: this.pluginVersion,
+            uiControlEnabled: settings.allowUiControl,
+          });
+          this.provisionedUiControl = settings.allowUiControl;
+        } catch (err) {
+          console.warn("[herdr-obs] Could not update the runtime kit:", err);
+        }
       }
     } else if (this.bridgeServer?.isRunning()) {
       await this.stopVaultBridge();
@@ -271,21 +298,26 @@ export class HerdrCoordinator {
     return this.bridgeStartInFlight;
   }
 
-  private isRuntimeKitIntact(): boolean {
+  private isRuntimeKitFilesIntact(): boolean {
     const coreMjs = path.join(this.runtimeKit.binDir, "obs-herdr-core.mjs");
     const corePy = path.join(this.runtimeKit.binDir, "obs-herdr-core.py");
-    if (
-      !fs.existsSync(this.runtimeKit.cliScriptPath) ||
-      !fs.existsSync(this.runtimeKit.connectionFilePath) ||
-      !fs.existsSync(coreMjs) ||
-      !fs.existsSync(corePy)
-    ) {
-      return false;
-    }
+    return (
+      fs.existsSync(this.runtimeKit.cliScriptPath) &&
+      fs.existsSync(this.runtimeKit.connectionFilePath) &&
+      fs.existsSync(coreMjs) &&
+      fs.existsSync(corePy)
+    );
+  }
+
+  private isRuntimeKitSocketIntact(): boolean {
     if (process.platform === "win32") {
       return true;
     }
     return fs.existsSync(this.runtimeKit.socketPath);
+  }
+
+  private isRuntimeKitIntact(): boolean {
+    return this.isRuntimeKitFilesIntact() && this.isRuntimeKitSocketIntact();
   }
 
   private async healBridgeIfNeeded(): Promise<void> {
@@ -303,10 +335,36 @@ export class HerdrCoordinator {
     if (!settings.vaultBridgeEnabled || settings.vaultPermissionMode === "off") {
       return;
     }
-    if (!this.bridgeServer?.isRunning() || this.isRuntimeKitIntact()) {
+    if (!this.bridgeServer?.isRunning()) {
+      // A start or an earlier repair failed (bridgeLastError is set): try again on this
+      // refresh instead of leaving the bridge down until a terminal starts.
+      if (this.bridgeLastError && !this.disposed) {
+        await this.startVaultBridge(this.lastKnownBridgeToken);
+      }
+      return;
+    }
+    const filesOk = this.isRuntimeKitFilesIntact();
+    const socketOk = this.isRuntimeKitSocketIntact();
+    if (filesOk && socketOk) {
       return;
     }
     const preservedToken = this.bridgeServer.getAuthToken() || this.lastKnownBridgeToken;
+    // If only helper files were deleted while the socket is still live, re-provision in place
+    // without dropping active client connections.
+    if (socketOk && !filesOk && preservedToken) {
+      provisionRuntimeKit({
+        kit: this.runtimeKit,
+        token: preservedToken,
+        vaultName: this.app.vault.getName(),
+        vaultPath: this.vaultOps.getVaultBasePath(),
+        pluginVersion: this.pluginVersion,
+        uiControlEnabled: settings.allowUiControl,
+      });
+      this.provisionedUiControl = settings.allowUiControl;
+      this.bridgeLastError = null;
+      this.cli.setCustomEnv(this.getBridgeEnv());
+      return;
+    }
     await this.stopVaultBridge();
     await this.startVaultBridge(preservedToken);
   }
@@ -338,28 +396,36 @@ export class HerdrCoordinator {
       this.bridgeServer = null;
       await staleSrv.stop().catch(() => undefined);
     }
+    const legacyConnection = legacyWindowsConnectionFilePath(this.runtimeKit);
     const existingToken =
       preferredToken ||
       this.lastKnownBridgeToken ||
-      readExistingBridgeToken(this.runtimeKit.connectionFilePath);
+      readExistingBridgeToken(this.runtimeKit.connectionFilePath) ||
+      (legacyConnection ? readExistingBridgeToken(legacyConnection) : undefined);
     const srv = new VaultBridgeServer({
       socketPath: this.runtimeKit.socketPath,
       kitDir: this.runtimeKit.runtimeDir,
       authToken: existingToken,
-      dispatcher: (method, params, caller) => this.vaultOps.dispatch(method, params, caller),
+      dispatcher: (method, params, caller, isAbandoned) =>
+        this.vaultOps.dispatch(method, params, caller, isAbandoned),
     });
-    await srv.start();
-    this.bridgeServer = srv;
-    this.lastKnownBridgeToken = srv.getAuthToken();
-    this.bridgeLastError = null;
-
+    const allowUiControl =
+      typeof this.getSettings === "function" ? this.getSettings().allowUiControl : undefined;
+    // Provision runtime kit atomically BEFORE binding the socket so clients never observe a
+    // bound socket with a missing or stale connection.json token.
     provisionRuntimeKit({
       kit: this.runtimeKit,
       token: srv.getAuthToken(),
       vaultName: this.app.vault.getName(),
       vaultPath: this.vaultOps.getVaultBasePath(),
       pluginVersion: this.pluginVersion,
+      uiControlEnabled: allowUiControl,
     });
+    this.provisionedUiControl = allowUiControl;
+    await srv.start();
+    this.bridgeServer = srv;
+    this.lastKnownBridgeToken = srv.getAuthToken();
+    this.bridgeLastError = null;
 
     this.cli.setCustomEnv(this.getBridgeEnv());
     this.emitChange();
@@ -378,6 +444,7 @@ export class HerdrCoordinator {
         .catch((err: unknown) => {
           console.warn("[herdr-obs] Stale runtime kit cleanup failed:", err);
         });
+      void pruneOldScreenshots(this.runtimeKit.runtimeDir).catch(() => undefined);
     }
   }
 
@@ -398,11 +465,8 @@ export class HerdrCoordinator {
     );
     const usingOfflinePreview =
       !serverRunning && Boolean(settings.showOfflinePreviewWhenStopped);
-    const effectiveSnapshot = serverRunning
-      ? this.snapshot
-      : usingOfflinePreview
-        ? buildOfflinePreviewSnapshot(this.app.vault.getName())
-        : null;
+    // Never leak fake offline preview agents into live snapshot consumers (modals, Bases, widgets).
+    const effectiveSnapshot = serverRunning ? this.snapshot : null;
 
     return {
       binaryPath: this.cli.getBinaryPath(),
@@ -440,38 +504,71 @@ export class HerdrCoordinator {
     }, delayMs);
   }
 
+  private pendingDeepRefresh = false;
+
   async refreshAll(includeDiagnostics = false): Promise<void> {
     if (this.disposed) {
       return;
     }
+    const wantDeep = includeDiagnostics || this.pendingDeepRefresh;
     if (this.refreshInFlight) {
-      return this.refreshInFlight;
+      if (wantDeep) {
+        this.pendingDeepRefresh = true;
+      }
+      await this.refreshInFlight;
+      if (this.pendingDeepRefresh && !this.disposed) {
+        return this.refreshAll(true);
+      }
+      return;
     }
+    this.pendingDeepRefresh = false;
 
-    this.refreshInFlight = this.doRefresh(includeDiagnostics).finally(() => {
+    this.refreshInFlight = this.doRefresh(wantDeep).finally(() => {
       this.refreshInFlight = null;
     });
-    return this.refreshInFlight;
+    await this.refreshInFlight;
+    if (this.pendingDeepRefresh && !this.disposed) {
+      await this.refreshAll(true);
+    }
   }
 
   private async doRefresh(includeDiagnostics: boolean): Promise<void> {
     try {
       await this.healBridgeIfNeeded().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
-        this.bridgeLastError = `Vault Control Bridge self-heal failed: ${msg}`;
-        console.warn("[herdr-obs] Bridge self-heal failed:", err);
+        const nextError = `Vault Control Bridge self-heal failed: ${msg}`;
+        // Refresh runs every 8 s; log a failure once, not on every retry.
+        // Mission Control keeps showing it through bridgeLastError.
+        if (this.bridgeLastError !== nextError) {
+          console.warn("[herdr-obs] Bridge self-heal failed:", err);
+        }
+        this.bridgeLastError = nextError;
       });
 
       const settings = this.getSettings();
-      const sessionName = this.getActiveSessionName();
-      let status = await this.cli.getStatus(sessionName);
-      if (!status?.server?.running && !settings.defaultSessionName.trim()) {
-        const defaultStatus = await this.cli.getStatus();
-        if (defaultStatus?.server?.running) {
-          status = defaultStatus;
-        }
+      if (includeDiagnostics) {
+        this.cli.invalidateBinaryCache();
       }
-      this.statusPayload = status;
+      const sessionName = this.getActiveSessionName();
+      const canSkipCliStatus =
+        !includeDiagnostics &&
+        this.socket.isSubscribed() &&
+        this.socketReachable &&
+        this.statusPayload?.server?.running &&
+        Date.now() - this.lastStatusProbeAt < 60_000;
+
+      let status = this.statusPayload;
+      if (!canSkipCliStatus) {
+        status = await this.cli.getStatus(sessionName);
+        if (!status?.server?.running && !settings.defaultSessionName.trim()) {
+          const defaultStatus = await this.cli.getStatus();
+          if (defaultStatus?.server?.running) {
+            status = defaultStatus;
+          }
+        }
+        this.statusPayload = status;
+        this.lastStatusProbeAt = Date.now();
+      }
 
       const resolvedSocket = settings.customSocketPath.trim()
         ? settings.customSocketPath.trim()
@@ -490,6 +587,7 @@ export class HerdrCoordinator {
 
       if (status?.server?.running || this.socket.isSocketPresent()) {
         const snap = await this.socket.getSnapshot();
+        this.consecutiveSnapshotFailures = 0;
         this.updateProtocolWarning(status, snap);
         this.detectAgentStateTransitions(snap.agents);
         const openPanes = new Set(snap.panes.map((pane) => pane.pane_id));
@@ -536,14 +634,22 @@ export class HerdrCoordinator {
         this.updateProtocolWarning(status, null);
         this.snapshot = null;
         this.socketReachable = false;
+        this.consecutiveSnapshotFailures = 0;
         this.socket.stopSubscription();
         if (status?.server?.running === false) {
           this.cursorOverlay.reconcileLiveCallers([]);
         }
       }
     } catch (err) {
-      this.snapshot = null;
-      this.socketReachable = false;
+      this.consecutiveSnapshotFailures += 1;
+      const keepSnapshotOnTransientError =
+        this.snapshot !== null &&
+        this.socket.isSubscribed() &&
+        this.consecutiveSnapshotFailures < 2;
+      if (!keepSnapshotOnTransientError) {
+        this.snapshot = null;
+        this.socketReachable = false;
+      }
       this.lastError = err instanceof Error ? err.message : String(err);
     } finally {
       this.lastUpdated = Date.now();
@@ -684,19 +790,19 @@ export class HerdrCoordinator {
     return [];
   }
 
-  private async waitForPaneShellReady(paneId: string): Promise<void> {
+  private async waitForPaneShellReady(paneId: string, signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + 2500;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !this.disposed && !signal?.aborted) {
       try {
         const text = await this.socket.readPane(paneId, "recent_unwrapped", 20);
         if (text.trim().length > 0) {
-          await new Promise((r) => window.setTimeout(r, 120));
+          await this.waitPollDelay(120, signal);
           return;
         }
       } catch {
         // Ignore transient read error while pane initializes
       }
-      await new Promise((r) => window.setTimeout(r, 120));
+      await this.waitPollDelay(120, signal);
     }
   }
 
@@ -722,8 +828,11 @@ export class HerdrCoordinator {
     const bound = this.sessionBinding();
     const cwd = this.vaultOps.getVaultBasePath() || os.homedir();
     let pane: PaneInfo;
-    const currentSnap = this.snapshot ?? (await this.socket.getSnapshot());
-    if (currentSnap.workspaces.length === 0 || currentSnap.panes.length === 0) {
+    const currentSnap =
+      typeof this.socket.getSnapshot === "function"
+        ? await this.socket.getSnapshot().catch(() => this.snapshot)
+        : this.snapshot;
+    if (!currentSnap || currentSnap.workspaces.length === 0 || currentSnap.panes.length === 0) {
       const created = await this.socket.createWorkspace({
         label: this.app.vault.getName(),
         cwd,
@@ -741,7 +850,7 @@ export class HerdrCoordinator {
       });
     }
 
-    await this.waitForPaneShellReady(pane.pane_id);
+    await this.waitForPaneShellReady(pane.pane_id, options.signal);
 
     const spawnArgs = [
       ...this.buildAgentSpawnArgs(options.agentKind, options.attachVaultMcp !== false, pane.pane_id),
@@ -1325,234 +1434,6 @@ export class HerdrCoordinator {
     const pane = this.snapshot?.panes.find((candidate) => candidate.pane_id === identity);
     const label = pane?.label || pane?.display_agent || pane?.agent;
     return label ? `${label} (${pane.pane_id})` : identity || caller;
-  }
-
-  private getNotePaneId(view: MarkdownView, leafId?: string): string {
-    if (leafId) {
-      return leafId;
-    }
-    let paneId = this.notePaneIds.get(view);
-    if (!paneId) {
-      paneId = `markdown-pane-${++this.notePaneSeq}`;
-      this.notePaneIds.set(view, paneId);
-    }
-    return paneId;
-  }
-
-  private resolveEditorContext(el: Element): ElementLeafContext | null {
-    const hostElement = resolveTopLevelElement(el) ?? el;
-    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    let context: ElementLeafContext | null = null;
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      const view = leaf.view;
-      if (view.containerEl.contains(hostElement)) {
-        const file = (view as unknown as { file?: TFile | null }).file;
-        if (!file) return;
-        context = {
-          notePath: file.path,
-          pane: view instanceof MarkdownView ? this.getNotePaneId(view, (leaf as unknown as { id?: string }).id)
-            : (leaf as unknown as { id?: string }).id,
-          activePane: view === activeView,
-        };
-      }
-    });
-    return context;
-  }
-
-  private deliverCapturedTerminalInput(element: Element, data: string): boolean {
-    const leaves: Array<{ view: unknown }> = [];
-    this.app.workspace.iterateAllLeaves((leaf) => { leaves.push(leaf); });
-    return deliverToTerminal(element, data, leaves);
-  }
-
-  private resolveBasesRowPath(element: Element | null, targetView: unknown): string | undefined {
-    if (!element) return undefined;
-    const view = targetView as {
-      file?: TFile | null;
-      controller?: { view?: { getCellFromDom?: (element: Element) => unknown } };
-    } | null;
-    const table = view?.controller?.view;
-    const cellElement = element.closest(".bases-td");
-    if (table?.getCellFromDom && cellElement) {
-      const cell = table.getCellFromDom(element) as {
-        el?: Element; renderer?: { entry?: { file?: TFile } };
-      } | null;
-      const file = cell?.renderer?.entry?.file;
-      // The live cell lookup also works when the filename column is virtualized away.
-      if (cell?.el === cellElement && file instanceof TFile && file.extension === "md" &&
-        this.app.vault.getAbstractFileByPath(file.path) === file) return file.path;
-      return undefined;
-    }
-    let row = element.closest(".bases-tr, .bases-table-row, [role='row']");
-    for (let current: Element | null = element, depth = 0; !row && current && depth < 20; current = current.parentElement, depth++) {
-      if (current.parentElement?.classList?.contains("bases-tbody")) row = current;
-    }
-    if (!row) return undefined;
-    const nameCell = row.querySelector?.('.bases-td[data-property="file.name"]') ?? row.querySelector?.(".bases-td");
-    const paths = new Set<string>();
-    const nodes = [row, ...Array.from(nameCell?.querySelectorAll("[data-href], a.internal-link") ?? []),
-      ...Array.from(row.querySelectorAll("[data-path], [data-file], [data-file-path]"))];
-    for (const node of nodes) {
-      for (const attribute of ["data-path", "data-file", "data-file-path", "data-href"]) {
-        const path = node.getAttribute(attribute);
-        if (!path) continue;
-        const file = this.app.vault.getAbstractFileByPath(path) ?? (attribute === "data-href"
-          ? this.app.metadataCache.getFirstLinkpathDest(path, view?.file?.path ?? "") : null);
-        if (file instanceof TFile && file.extension === "md") paths.add(file.path);
-      }
-    }
-    return paths.size === 1 ? [...paths][0] : undefined;
-  }
-
-  private captureUiMutation(context: UiMutationContext): ReturnType<VaultOpsService["captureUiMutation"]> {
-    const element = context.targetElement;
-    const hostElement = resolveTopLevelElement(element);
-    if (!context.notePath && !element && !context.targetView) return this.vaultOps.captureUiMutation(context);
-    let targetView: unknown = context.targetView;
-    const suppliedFile = (targetView as { file?: TFile | null } | null)?.file;
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      const view = leaf.view;
-      const file = (view as unknown as { file?: TFile | null }).file;
-      // Card editors can be temporary MarkdownViews with no owning file.
-      if (hostElement && file?.extension === "canvas" &&
-        (file.path === context.notePath || (!context.notePath && !suppliedFile)) && view.containerEl?.contains(hostElement)) {
-        targetView = view;
-        return;
-      }
-      if (targetView) return;
-      if (hostElement && view.containerEl?.contains(hostElement)) targetView = view;
-      else if (!element && view instanceof MarkdownView && view.file?.path === context.notePath &&
-        (!context.paneId || this.getNotePaneId(view, (leaf as unknown as { id?: string }).id) === context.paneId)) {
-        targetView = view;
-      }
-    });
-    const fileView = targetView as { file?: TFile | null; getViewType?: () => string } | undefined;
-    const bound = { ...context, ...(targetView ? { targetView } : {}) };
-    const isBases = fileView?.file?.extension === "base" || fileView?.getViewType?.() === "bases";
-    const rowPath = isBases ? this.resolveBasesRowPath(element ?? null, targetView) : undefined;
-    if (rowPath && bound.targetFilePath && rowPath !== bound.targetFilePath) {
-      throw new BridgeRpcError("ui_snapshot_unavailable", "The Bases cell no longer belongs to the requested row note.");
-    }
-    if (fileView?.file) {
-      bound.notePath ??= fileView.file.path;
-      if (isBases && !bound.targetFilePath) bound.targetFilePath = rowPath;
-    }
-    // Only a Delete confirmation inside a modal establishes an expected deletion.
-    const button = element?.closest("button, [role='button']");
-    const modal = button?.closest(".modal");
-    if (!bound.expectedFileOperation && modal && /^(delete|move to trash)$/i.test(button?.textContent?.trim() ?? "")) {
-      const text = modal.textContent ?? "";
-      const names = [...text.matchAll(/["“]([^"”]+)["”]/g)].map((match) => match[1]);
-      const files = this.app.vault.getFiles().filter((file) => names.includes(file.path) || names.includes(file.name));
-      if (files.length !== 1) {
-        throw new BridgeRpcError("ui_snapshot_unavailable", "Cannot uniquely verify the file named by this Delete confirmation.");
-      }
-      bound.expectedFileOperation = { kind: "trash", path: files[0].path };
-    }
-    const captured = this.vaultOps.captureUiMutation(bound, targetView);
-    if (!rowPath) return captured;
-    return Promise.resolve(captured).then(async (complete) => {
-      if (this.resolveBasesRowPath(element ?? null, targetView) !== rowPath) {
-        await complete({ ok: false, errorCode: "ui_snapshot_unavailable" });
-        throw new BridgeRpcError("ui_snapshot_unavailable", "The Bases row changed while its preimage was being captured.");
-      }
-      return complete;
-    });
-  }
-
-  private resolveOpenNoteLeaf(notePath: string): (NoteLeafContext & { view: MarkdownView }) | null {
-    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    let resolved: (NoteLeafContext & { view: MarkdownView }) | null = null;
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      const view = leaf.view;
-      if (!(view instanceof MarkdownView) || view.file?.path !== notePath || view.getMode() !== "source") {
-        return;
-      }
-      // This input host operates the main window, never a pop-out's coordinates.
-      if (view.containerEl.ownerDocument !== window.document) {
-        return;
-      }
-      const rect = view.containerEl.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0 || (resolved && view !== activeView)) {
-        return;
-      }
-      resolved = {
-        view,
-        path: notePath,
-        pane: this.getNotePaneId(view, (leaf as unknown as { id?: string }).id),
-        activePane: view === activeView,
-        containerEl: view.containerEl,
-        cm: (view.editor as unknown as { cm?: CodeMirrorViewLike }).cm ?? null,
-        contentText: view.editor.getValue(),
-      };
-    });
-    return resolved;
-  }
-
-  private notifyVaultCursorActivity(
-    caller: string,
-    targetPath: string | undefined,
-    _action: string,
-    change?: VaultTextChange
-  ): void {
-    if (!this.getSettings().showAgentCursors) {
-      return;
-    }
-    // Remove any old document marker before attempting to attribute a new edit.
-    this.cursorOverlay.clearAgent(caller);
-    if (!targetPath || !change) {
-      return;
-    }
-    const leaf = this.resolveOpenNoteLeaf(targetPath);
-    const cm = leaf?.cm;
-    // Vault writes can precede the editor update. Never invent coordinates from stale text.
-    if (!leaf || !cm?.coordsAtPos || cm.state?.doc?.toString() !== change.after) {
-      return;
-    }
-    this.cursorOverlay.notifyNoteUpdated(targetPath);
-    let pos = change.from + change.insertLength;
-    if (!Number.isInteger(pos) || pos < 0 || pos > change.after.length) {
-      return;
-    }
-    // Show the last written text rather than the blank line after an appended newline.
-    while (pos > change.from && /[\r\n]/.test(change.after[pos - 1] ?? "")) {
-      pos--;
-    }
-    const caret = cm.coordsAtPos(pos);
-    if (!caret || !Number.isFinite(caret.left) || !Number.isFinite(caret.top) || !Number.isFinite(caret.bottom)) {
-      return;
-    }
-    const bounds = (cm.scrollDOM ?? leaf.containerEl).getBoundingClientRect();
-    const containerBounds = leaf.containerEl.getBoundingClientRect();
-    const left = Math.max(0, bounds.left, containerBounds.left);
-    const right = Math.min(window.innerWidth, bounds.right, containerBounds.right);
-    const top = Math.max(0, bounds.top, containerBounds.top);
-    const bottom = Math.min(window.innerHeight, bounds.bottom, containerBounds.bottom);
-    const caretRight = caret.right ?? caret.left;
-    const caretBottom = caret.bottom ?? caret.top;
-    if (caret.left < left || caretRight > right || caret.top < top || caretBottom > bottom) {
-      return;
-    }
-    const statusBar = window.document.querySelector<HTMLElement>(".status-bar")?.getBoundingClientRect();
-    if (
-      statusBar && statusBar.width > 0 && statusBar.height > 0 &&
-      caretRight >= statusBar.left && caret.left <= statusBar.right &&
-      caretBottom > statusBar.top && caret.top < statusBar.bottom
-    ) {
-      return;
-    }
-    const context = {
-      notePath: targetPath,
-      pane: leaf.pane,
-      leafId: leaf.pane,
-      pos,
-      cm,
-      containerEl: leaf.view.containerEl,
-      view: leaf.view,
-      getLeafNotePath: () => leaf.view.file?.path ?? null,
-    };
-    this.cursorOverlay.moveTo(caller, this.resolveCallerLabel(caller), caret.left, (caret.top + caretBottom) / 2, "note_update", context);
-    this.cursorOverlay.parkAgent(caller, context);
   }
 
   private detectAgentStateTransitions(agents: AgentInfo[]): void {

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
-import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
@@ -10,12 +9,16 @@ import type { App, TFile } from "obsidian";
 import * as runtimeKit from "../src/bridge/runtime-kit";
 import { BridgeRpcError, VaultOpsService } from "../src/bridge/vault-ops";
 import { UiControlService, type InspectedElement } from "../src/control/ui-control";
-import { createMockObsidianApp } from "./obsidian-mock";
+import { confirmAction } from "../src/ui/modals";
+import { findAllNodes } from "./helpers/fake-dom";
+import { IS_WINDOWS, makeShortTmpDir, PYTHON, testSocketPath } from "./helpers/portable";
+import { __mockModals, createMockObsidianApp, resetObsidianUiMocks } from "./obsidian-mock";
 
 const execFileAsync = promisify(execFile);
 
+// Short base: several tests listen on Unix sockets under these dirs (macOS caps paths at 104 bytes).
 function makeTempDir(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return makeShortTmpDir(prefix);
 }
 
 function makeFakeElement(opts: {
@@ -269,25 +272,25 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
 
       for (const [label, bin, args] of [
         ["node", process.execPath, [coreMjs]],
-        ["python", "python3", [corePy]],
+        ["python", PYTHON, [corePy]],
       ] as Array<[string, string, string[]]>) {
         // Timeout -> non-zero exit + clear error
         await assert.rejects(
-          () => execFileAsync(bin, [...args, "rpc", "test.hang", "{}"], { env: baseEnv, timeout: 4000 }),
+          () => execFileAsync(bin, [...args, "rpc", "test.hang", "{}"], { env: baseEnv, timeout: 10000 }),
           (err: { code?: number; stderr?: string }) =>
             err.code !== 0 && /timed out/i.test(String(err.stderr ?? ""))
         );
 
         // Early close -> non-zero exit + clear error
         await assert.rejects(
-          () => execFileAsync(bin, [...args, "rpc", "test.early_close", "{}"], { env: baseEnv, timeout: 4000 }),
+          () => execFileAsync(bin, [...args, "rpc", "test.early_close", "{}"], { env: baseEnv, timeout: 10000 }),
           (err: { code?: number; stderr?: string }) =>
             err.code !== 0 && /closed|incomplete/i.test(String(err.stderr ?? ""))
         );
 
         // Invalid JSON -> non-zero exit + clear error
         await assert.rejects(
-          () => execFileAsync(bin, [...args, "rpc", "test.bad_json", "{}"], { env: baseEnv, timeout: 4000 }),
+          () => execFileAsync(bin, [...args, "rpc", "test.bad_json", "{}"], { env: baseEnv, timeout: 10000 }),
           (err: { code?: number; stderr?: string }) =>
             err.code !== 0 && /json/i.test(String(err.stderr ?? ""))
         );
@@ -537,20 +540,27 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
         JSON.stringify({ vaultPath: validVault })
       );
 
-      // 6. Missing vaultPath BUT live b.sock listening -> must keep
+      // 6. Missing vaultPath BUT live b.sock listening -> must keep.
+      // Windows has no socket files: the bridge listens on a named pipe that connection.json names.
       const liveKit = path.join(tmpBase, "ffffffffffff");
       fs.mkdirSync(liveKit);
+      const liveSockPath = testSocketPath(liveKit, "b.sock");
       fs.writeFileSync(
         path.join(liveKit, "connection.json"),
-        JSON.stringify({ vaultPath: path.join(tmpBase, "gone-but-live") })
+        JSON.stringify({
+          vaultPath: path.join(tmpBase, "gone-but-live"),
+          ...(IS_WINDOWS ? { socketPath: liveSockPath } : {}),
+        })
       );
-      const liveSockPath = path.join(liveKit, "b.sock");
       liveServer = net.createServer();
       await new Promise<void>((resolve) => liveServer!.listen(liveSockPath, resolve));
 
-      // 7. Symlinked directory -> must NEVER follow or delete
+      // 7. Symlinked directory -> must NEVER follow or delete.
+      // Creating symlinks on Windows needs admin or Developer Mode, so this case is POSIX only.
       const linkDir = path.join(tmpBase, "111111111111");
-      fs.symlinkSync(symlinkTarget, linkDir);
+      if (!IS_WINDOWS) {
+        fs.symlinkSync(symlinkTarget, linkDir);
+      }
 
       const pruneFn = (
         runtimeKit as unknown as {
@@ -572,7 +582,9 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
       assert.equal(fs.existsSync(recentEmpty), true);
       assert.equal(fs.existsSync(validKit), true);
       assert.equal(fs.existsSync(liveKit), true);
-      assert.equal(fs.lstatSync(linkDir).isSymbolicLink(), true);
+      if (!IS_WINDOWS) {
+        assert.equal(fs.lstatSync(linkDir).isSymbolicLink(), true);
+      }
       assert.equal(fs.existsSync(symlinkTarget), true);
     } finally {
       if (liveServer) {
@@ -828,7 +840,7 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
 
       for (const [label, bin, args] of [
         ["node", process.execPath, [coreMjs]],
-        ["python", "python3", [corePy]],
+        ["python", PYTHON, [corePy]],
       ] as Array<[string, string, string[]]>) {
         const help = await execFileAsync(bin, [...args, "ui", "select", "--help"], { env: baseEnv });
         assert.ok(help.stdout.includes("obs-herdr ui select"), `${label} ui select --help`);
@@ -1171,7 +1183,7 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
     let liveSrv: net.Server | null = null;
     try {
       // R3-B4: live socket referenced via connection.json socketPath (not b.sock) keeps kit alive
-      const customSockPath = path.join(tmpBase, "alt-live.sock");
+      const customSockPath = testSocketPath(tmpBase, "alt-live.sock");
       liveSrv = net.createServer();
       await new Promise<void>((resolve) => liveSrv!.listen(customSockPath, resolve));
 
@@ -1213,10 +1225,10 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
         const env = { ...process.env, OBSIDIAN_HERDR_CONNECTION_FILE: kit.connectionFilePath, OBS_HERDR_TIMEOUT_MS: "50" };
         for (const [bin, args] of [
           [process.execPath, [coreMjs]],
-          ["python3", [corePy]],
+          [PYTHON, [corePy]],
         ] as Array<[string, string[]]>) {
           await assert.rejects(
-            () => execFileAsync(bin, [...args, "rpc", "test.hang", "{}"], { env, timeout: 4000 }),
+            () => execFileAsync(bin, [...args, "rpc", "test.hang", "{}"], { env, timeout: 10000 }),
             (err: { stderr?: string }) => /1000 ms/.test(String(err.stderr ?? ""))
           );
         }
@@ -1289,101 +1301,42 @@ describe("Fix round 2026-11-20 (fix-vault: B1-B8)", () => {
   });
 
   it("MC redesign: confirmAction resolves true on confirm (with danger warning), false on cancel, and false on Escape/close", async () => {
-    const tmpDir = makeTempDir("fix-mc-confirm-");
-    try {
-      const stubPath = path.join(tmpDir, "obsidian-modal-stub.js");
-      fs.writeFileSync(
-        stubPath,
-        [
-          "const instances = (globalThis.__mcModalInstances = globalThis.__mcModalInstances || []);",
-          "exports.__instances = instances;",
-          "class FakeEl {",
-          "  constructor() { this.classes = []; this.children = []; this.text = ''; }",
-          "  empty() { this.children = []; }",
-          "  addClass(...cls) { this.classes.push(...cls); }",
-          "  createEl(tag, opts) { const el = { tag, ...(opts || {}) }; this.children.push(el); return el; }",
-          "}",
-          "class Modal {",
-          "  constructor(app) {",
-          "    this.app = app;",
-          "    this.contentEl = new FakeEl();",
-          "    this.scopeHandlers = {};",
-          "    this.scope = { register: (_mods, key, cb) => { this.scopeHandlers[key] = cb; } };",
-          "    instances.push(this);",
-          "  }",
-          "  open() { this.onOpen(); }",
-          "  close() { this.onClose(); }",
-          "  onOpen() {}",
-          "  onClose() {}",
-          "}",
-          "class Setting {",
-          "  constructor(containerEl) { this.containerEl = containerEl; this.buttons = []; containerEl.children.push(this); }",
-          "  setName(n) { this.name = n; return this; }",
-          "  setDesc(d) { this.desc = d; return this; }",
-          "  setHeading() { this.heading = true; return this; }",
-          "  addButton(cb) {",
-          "    const btn = {",
-          "      text: '', classes: [], cta: false, handler: null,",
-          "      setButtonText(t) { this.text = t; return this; },",
-          "      setClass(c) { this.classes.push(c); return this; },",
-          "      setCta() { this.cta = true; return this; },",
-          "      onClick(fn) { this.handler = fn; return this; },",
-          "    };",
-          "    cb(btn);",
-          "    this.buttons.push(btn);",
-          "    return this;",
-          "  }",
-          "}",
-          "exports.Modal = Modal;",
-          "exports.Setting = Setting;",
-          "exports.Notice = class Notice { constructor(m) { this.message = m; } };",
-        ].join("\n"),
-        "utf8"
-      );
-      const outPath = path.join(tmpDir, "modals.cjs");
-      const runnerScript = [
-        'const esbuild = require("esbuild");',
-        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/ui/modals.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(outPath)}, alias: { obsidian: ${JSON.stringify(stubPath)} } });`,
-        `const stub = require(${JSON.stringify(stubPath)});`,
-        `const { confirmAction } = require(${JSON.stringify(outPath)});`,
-        "(async () => {",
-        "  // 1. Confirm with danger: true",
-        '  const p1 = confirmAction({}, { title: "Stop session?", body: "All agents stop.", confirmText: "Stop session", danger: true });',
-        "  const m1 = stub.__instances[0];",
-        "  const btnSetting1 = m1.contentEl.children.find((c) => Array.isArray(c.buttons) && c.buttons.length > 0);",
-        '  const confirmBtn1 = btnSetting1.buttons.find((b) => b.text === "Stop session");',
-        "  const dangerFlag = confirmBtn1.classes.includes('mod-warning');",
-        "  confirmBtn1.handler();",
-        "  const r1 = await p1;",
-        "  // 2. Cancel button",
-        '  const p2 = confirmAction({}, { title: "Confirm", body: "Proceed?", confirmText: "OK" });',
-        "  const m2 = stub.__instances[1];",
-        "  const btnSetting2 = m2.contentEl.children.find((c) => Array.isArray(c.buttons) && c.buttons.length > 0);",
-        '  const cancelBtn2 = btnSetting2.buttons.find((b) => b.text === "Cancel");',
-        "  cancelBtn2.handler();",
-        "  const r2 = await p2;",
-        "  // 3. Escape key",
-        '  const p3 = confirmAction({}, { title: "Escape test", body: "Close with Esc", confirmText: "Yes" });',
-        "  const m3 = stub.__instances[2];",
-        '  m3.scopeHandlers["Escape"]();',
-        "  const r3 = await p3;",
-        "  process.stdout.write(JSON.stringify({ r1, dangerFlag, r2, r3 }));",
-        "})();",
-      ].join("\n");
-      const out = await execFileAsync(process.execPath, ["-e", runnerScript], { cwd: process.cwd() });
-      const parsed = JSON.parse(out.stdout) as {
-        r1: boolean;
-        dangerFlag: boolean;
-        r2: boolean;
-        r3: boolean;
-      };
-      assert.equal(parsed.r1, true, "confirm button must resolve true");
-      assert.equal(parsed.dangerFlag, true, "danger: true must apply warning style (mod-warning)");
-      assert.equal(parsed.r2, false, "cancel button must resolve false");
-      assert.equal(parsed.r3, false, "Escape key must resolve false");
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
+    resetObsidianUiMocks();
+    const p1 = confirmAction({} as App, {
+      title: "Stop session?",
+      body: "All agents stop.",
+      confirmText: "Stop session",
+      danger: true,
+    });
+    const m1 = __mockModals[0];
+    const confirmBtn1 = findAllNodes(m1.contentEl, (n) => n.tagName === "BUTTON" && n.textContent === "Stop session")[0];
+    const dangerFlag = confirmBtn1.classList.contains("mod-warning");
+    confirmBtn1.click();
+    const r1 = await p1;
+
+    const p2 = confirmAction({} as App, {
+      title: "Confirm",
+      body: "Proceed?",
+      confirmText: "OK",
+    });
+    const m2 = __mockModals[1];
+    const cancelBtn2 = findAllNodes(m2.contentEl, (n) => n.tagName === "BUTTON" && n.textContent === "Cancel")[0];
+    cancelBtn2.click();
+    const r2 = await p2;
+
+    const p3 = confirmAction({} as App, {
+      title: "Escape test",
+      body: "Close with Esc",
+      confirmText: "Yes",
+    });
+    const m3 = __mockModals[2];
+    m3.scopeHandlers["Escape"]();
+    const r3 = await p3;
+
+    assert.equal(r1, true, "confirm button must resolve true");
+    assert.equal(dangerFlag, true, "danger: true must apply warning style (mod-warning)");
+    assert.equal(r2, false, "cancel button must resolve false");
+    assert.equal(r3, false, "Escape key must resolve false");
   });
 
   it("Polish 3: press_key Escape closes an open Obsidian .menu even when Electron sendInputEvent alone does not dismiss it", async () => {

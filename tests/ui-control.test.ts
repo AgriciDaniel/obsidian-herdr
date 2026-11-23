@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
@@ -24,6 +23,7 @@ import {
   type WebContentsLike,
 } from "../src/control/ui-control";
 import type { VaultPermissionMode } from "../src/domain/types";
+import { cliInvocation, makeShortTmpDir, PYTHON } from "./helpers/portable";
 import { createMockObsidianApp } from "./obsidian-mock";
 
 const execFileAsync = promisify(execFile);
@@ -208,7 +208,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
   });
 
   it("gates UI methods by setting and tier, audits input, and serves images over CLI and MCP", async () => {
-    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-ui-test-"));
+    const tmpBase = makeShortTmpDir("oh-ui-");
     const vaultDir = path.join(tmpBase, "vault");
     fs.mkdirSync(vaultDir, { recursive: true });
     fs.writeFileSync(path.join(vaultDir, "Index.md"), "# Home\n", "utf8");
@@ -276,7 +276,8 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       };
 
       // CLI saves screenshots privately next to the connection file by default.
-      const shotOut = await execFileAsync(kit.cliScriptPath, ["ui", "screenshot"], { env });
+      const [cliCmd, cliBase] = cliInvocation(kit);
+      const shotOut = await execFileAsync(cliCmd, [...cliBase, "ui", "screenshot"], { env });
       const shotJson = JSON.parse(shotOut.stdout) as { path: string; width: number };
       assert.ok(shotJson.path.startsWith(path.join(kit.runtimeDir, "screenshots")));
       assert.deepEqual(fs.readFileSync(shotJson.path), PNG_BYTES);
@@ -285,17 +286,17 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       }
 
       events.length = 0;
-      await execFileAsync(kit.cliScriptPath, ["ui", "key", "Mod+Shift+P"], { env });
+      await execFileAsync(cliCmd, [...cliBase, "ui", "key", "Mod+Shift+P"], { env });
       assert.equal(events[0].keyCode, "P");
 
       const corePyPath = path.join(kit.binDir, "obs-herdr-core.py");
       const pyOut = path.join(tmpBase, "py-shot.png");
-      await execFileAsync("python3", [corePyPath, "ui", "screenshot", "--out", pyOut], { env });
+      await execFileAsync(PYTHON, [corePyPath, "ui", "screenshot", "--out", pyOut], { env });
       assert.deepEqual(fs.readFileSync(pyOut), PNG_BYTES);
 
       for (const [cmd, args] of [
-        [kit.cliScriptPath, ["mcp"]],
-        ["python3", [corePyPath, "mcp"]],
+        cliInvocation(kit, ["mcp"]),
+        [PYTHON, [corePyPath, "mcp"]],
       ] as Array<[string, string[]]>) {
         const child = spawn(cmd, args, { env, stdio: ["pipe", "pipe", "pipe"] });
         const responses: Array<Record<string, unknown>> = [];
@@ -322,7 +323,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
           }) + "\n"
         );
         child.stdin.end();
-        const until = Date.now() + 5000;
+        const until = Date.now() + 15000;
         while (responses.length < 2 && Date.now() < until) {
           await new Promise((r) => setTimeout(r, 40));
         }
@@ -1150,7 +1151,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       document: doc,
       app: {
         workspace: {
-          activeLeaf: leftLeaf,
+          getMostRecentLeaf: () => leftLeaf,
           getLeavesOfType: (t: string) => (t === "markdown" ? [leftLeaf, rightLeaf] : []),
         },
       },
@@ -1176,6 +1177,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => wc,
       sleep: async () => undefined,
       cursorOverlay: fakeCursor,
@@ -1280,6 +1282,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     // 6) resolveNoteLeaf returning null is authoritative even when app.workspace has leaves.
     const guardedUi = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => wc,
       resolveNoteLeaf: () => null,
       sleep: async () => undefined,
@@ -1687,6 +1690,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => wc,
       sleep: async () => undefined,
       resolveElementContext: (el) => {
@@ -1996,6 +2000,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     const emittedTypeY: number[] = [];
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1200, 540)),
         sendInputEvent: () => undefined,
@@ -2319,6 +2324,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       cursorOverlay: overlay,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1200, 800)),
@@ -2707,6 +2713,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     const overlay = new AgentCursorOverlay({ win, enabled: true, idleAfterMs: 1500, hideAfterMs: 60000 });
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       cursorOverlay: overlay,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1200, 500)),
@@ -2996,10 +3003,10 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
       document: doc,
       app: {
         workspace: {
-          activeLeaf: {
+          getMostRecentLeaf: () => ({
             containerEl: leafEl,
             view: { file: { path: "Notes/Opened.md" }, editor: { cm: cmView } },
-          },
+          }),
         },
       },
       performance: { now: () => Date.now() },
@@ -3025,6 +3032,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     const overlay = new AgentCursorOverlay({ win, enabled: true, idleAfterMs: 1500, hideAfterMs: 60000 });
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       cursorOverlay: overlay,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1200, 800)),
@@ -3305,6 +3313,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1200, 800)),
         sendInputEvent: (ev) => {
@@ -3412,6 +3421,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
         sendInputEvent: () => undefined,
@@ -3547,6 +3557,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getCodeMirrorView: () => cmView,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
@@ -3641,6 +3652,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getCodeMirrorView: () => cmView,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
@@ -3744,6 +3756,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getCodeMirrorView: () => cmView,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
@@ -3875,6 +3888,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
         sendInputEvent: (ev) => {
@@ -4216,6 +4230,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     const typed: string[] = [];
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => fakeWebContents(events, typed),
       resolveNoteLeaf: () => leafCtx,
       resolveElementContext: (el) => (el === leafEl ? { notePath: "Shared.md", pane: "main", activePane: true } : null),
@@ -4264,6 +4279,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     overlayAtPoint = (x) => (dynamicProtected && x >= 240 ? settingsModal : bodyEl);
     const dynamicUi = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(2000, 1200)),
         sendInputEvent: (ev) => {
@@ -4409,6 +4425,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let locateResult: unknown = null;
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
         sendInputEvent: () => undefined,
@@ -4551,7 +4568,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
         setTimeout,
         app: {
           workspace: {
-            activeLeaf: wsLeaf,
+            getMostRecentLeaf: () => wsLeaf,
             iterateAllLeaves: (cb: (l: unknown) => void) => cb(wsLeaf),
             getLeavesOfType: () => [wsLeaf],
           },
@@ -4577,6 +4594,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
         ) =>
           new UiControlService({
             win,
+            getApp: () => (win as unknown as { app?: unknown }).app,
             getUiTypingSpeed: () => speed,
             getWebContents: () => ({
               capturePage: () => Promise.resolve(fakeImage(800, 600)),
@@ -4792,6 +4810,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let preferSplit: "A" | "B" = "A";
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "fast",
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1000, 600)),
@@ -4869,6 +4888,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     };
     const closingUi = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "fast",
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1000, 600)),
@@ -5035,6 +5055,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "visible",
       getWebContents: () => fakeWebContents(webInputEvents, webTyped),
       resolveNoteLeaf: () => leafCtx,
@@ -5277,6 +5298,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let sleepCount = 0;
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "visible",
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(900, 600)),
@@ -5344,6 +5366,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let keyBatchSleeps = 0;
     const uiKey = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(900, 600)),
         sendInputEvent: (ev) => {
@@ -6011,6 +6034,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     const webEvents: Array<Record<string, unknown>> = [];
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "fast",
       resolveElementContext: (el) =>
         el === leafEl || el === cmContent ? { notePath: "SelectorNote.md", pane: "main", activePane: true } : null,
@@ -6038,6 +6062,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let checkedExpiry = false;
     const uiTimeout = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "visible",
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1000, 600)),
@@ -6168,6 +6193,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     } as unknown as Window;
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => fakeWebContents(events, []),
       platform: "linux",
       sleep: noSleep,
@@ -6430,6 +6456,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     } as unknown as Window;
     const uiP1 = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       platform: "linux",
       getUiTypingSpeed: () => "visible",
       resolveNoteLeaf: () => cmLeaf,
@@ -6475,6 +6502,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let triggerModalKeys = false;
     const uiP12 = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       platform: "linux",
       getUiTypingSpeed: () => "visible",
       resolveNoteLeaf: () => cmLeaf,
@@ -6512,6 +6540,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let triggerExtend = true;
     const uiExtend = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       platform: "linux",
       getUiTypingSpeed: () => "visible",
       resolveNoteLeaf: () => cmLeaf,
@@ -6572,6 +6601,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let triggerNative = true;
     const uiNative = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       platform: "linux",
       getUiTypingSpeed: () => "visible",
       getWebContents: () => ({
@@ -6605,6 +6635,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let triggerEmojiCm = true;
     const uiEmojiCm = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       platform: "linux",
       getUiTypingSpeed: () => "visible",
       resolveNoteLeaf: () => cmLeaf,
@@ -6638,6 +6669,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let triggerEmojiInput = true;
     const uiEmojiInput = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       platform: "linux",
       getUiTypingSpeed: () => "visible",
       getWebContents: () => ({
@@ -7214,6 +7246,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "fast",
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
@@ -7237,6 +7270,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
     let rejectHang = false;
     const uiHang = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getUiTypingSpeed: () => "fast",
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(800, 600)),
@@ -7528,6 +7562,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
       const ui = new UiControlService({
         win,
+        getApp: () => (win as unknown as { app?: unknown }).app,
         platform,
         getWebContents: () => ({
           capturePage: () => Promise.resolve(fakeImage(1200, 800)),
@@ -7888,6 +7923,7 @@ describe("UI control: keys, Electron input, permission gating, CLI, and MCP imag
 
     const ui = new UiControlService({
       win,
+      getApp: () => (win as unknown as { app?: unknown }).app,
       getWebContents: () => ({
         capturePage: () => Promise.resolve(fakeImage(1200, 800)),
         sendInputEvent: (ev) => {

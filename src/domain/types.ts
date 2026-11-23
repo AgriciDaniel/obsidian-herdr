@@ -164,6 +164,31 @@ export interface HerdrNamedSession {
   socket: string;
 }
 
+export const SUPPORTED_AGENT_RUNTIMES: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "claude", label: "Claude Code" },
+  { id: "codex", label: "Codex" },
+  { id: "agy", label: "Antigravity" },
+  { id: "gemini", label: "Gemini" },
+  { id: "opencode", label: "OpenCode" },
+  { id: "cursor", label: "Cursor CLI" },
+  { id: "copilot", label: "GitHub Copilot CLI" },
+  { id: "grok", label: "Grok" },
+  { id: "hermes", label: "Hermes Agent" },
+  { id: "amp", label: "Amp" },
+  { id: "droid", label: "Factory Droid" },
+  { id: "kimi", label: "Kimi CLI" },
+  { id: "kiro", label: "Kiro CLI" },
+  { id: "qwen", label: "Qwen Code" },
+  { id: "devin", label: "Devin" },
+  { id: "cline", label: "Cline" },
+  { id: "kilo", label: "Kilo Code" },
+  { id: "mastracode", label: "Mastra Code" },
+  { id: "qodercli", label: "Qoder CLI" },
+  { id: "pi", label: "Pi" },
+  { id: "omp", label: "Oh My Pi" },
+  { id: "maki", label: "Maki" },
+];
+
 export interface HerdrStatusPayload {
   client: {
     version: string | null;
@@ -180,6 +205,8 @@ export interface HerdrStatusPayload {
     socket: string | null;
     session: string | null;
     restart_needed: boolean;
+    compatible?: boolean;
+    capabilities?: Record<string, boolean>;
   };
 }
 

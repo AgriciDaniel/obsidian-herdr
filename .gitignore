@@ -2,6 +2,8 @@ node_modules/
 main.js
 main.js.map
 *.tsbuildinfo
+__pycache__/
+*.pyc
 .env
 .env.*
 .directory
@@ -25,4 +27,30 @@ docs/CHANGE_REQUEST.md
 /.agent/
 /Crew Test/
 /Images/
+/Live Demo/
 /Untitled.base
+
+# This repo is also a live Obsidian vault used for demos and testing. Only the project
+# folders and files below are part of the plugin; any other note, canvas, drawing or
+# folder created at the root while using the vault stays local.
+/*/
+!/.github/
+!/assets/
+!/demo-vault/
+!/docs/
+!/scripts/
+!/src/
+!/tests/
+/*.md
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/README.md
+!/THIRD_PARTY_NOTICES.md
+/*.canvas
+/*.base
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.pdf

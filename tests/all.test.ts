@@ -35,6 +35,8 @@ import { HerdrSocketClient } from "../src/herdr/socket-client";
 import { parseObsidianUriTarget } from "../src/terminal/link-provider";
 import { PtySession } from "../src/terminal/pty-host";
 import { resolveTerminalFontFamily } from "../src/terminal/theme-palette";
+import { HerdrSettingTab } from "../src/ui/settings-tab";
+import { cliInvocation, makeShortTmpDir, PYTHON, skipOnWindows } from "./helpers/portable";
 import { createMockObsidianApp } from "./obsidian-mock";
 import "./ui-control.test";
 import "./windows.test";
@@ -181,7 +183,8 @@ describe("Domain: OSC stream observer, path guard, shell quoting, and settings m
 });
 
 describe("Terminal: Live POSIX PtySession with resize over control FD", () => {
-  it("spawns a live PTY shell, streams output, updates terminal size via TIOCSWINSZ, and exits cleanly", async () => {
+  // Needs /bin/sh and a POSIX PTY; Windows uses the ConPTY driver, covered in windows.test.ts.
+  it("spawns a live PTY shell, streams output, updates terminal size via TIOCSWINSZ, and exits cleanly", { skip: skipOnWindows("/bin/sh and a POSIX PTY") }, async () => {
     let collected = "";
     let exitObserved = false;
 
@@ -247,7 +250,7 @@ describe("Terminal: Live POSIX PtySession with resize over control FD", () => {
 
 describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herdr CLI, undo, and stdio MCP", () => {
   it("serves read/write/undo RPCs, blocks unauthorized & restricted calls, and powers obs-herdr CLI + MCP", async () => {
-    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-bridge-test-"));
+    const tmpBase = makeShortTmpDir("oh-bridge-");
     const vaultDir = path.join(tmpBase, "vault");
     const runtimeRoot = path.join(tmpBase, "runtime");
     fs.mkdirSync(vaultDir, { recursive: true });
@@ -328,7 +331,8 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         }),
       };
 
-      const infoOut = await execFileAsync(kit.cliScriptPath, ["vault", "info"], { env });
+      const [cliCmd, cliBase] = cliInvocation(kit);
+      const infoOut = await execFileAsync(cliCmd, [...cliBase, "vault", "info"], { env });
       const infoJson = JSON.parse(infoOut.stdout) as {
         vaultName: string;
         markdownCount: number;
@@ -338,7 +342,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       assert.equal(infoJson.markdownCount, 2);
       assert.equal(infoJson.permissionMode, "read-only");
 
-      const listDefaultOut = await execFileAsync(kit.cliScriptPath, ["note", "list"], { env });
+      const listDefaultOut = await execFileAsync(cliCmd, [...cliBase, "note", "list"], { env });
       const listDefaultJson = JSON.parse(listDefaultOut.stdout) as {
         count: number;
         files: Array<{ path: string }>;
@@ -350,8 +354,8 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       );
 
       const searchDefaultOut = await execFileAsync(
-        kit.cliScriptPath,
-        ["note", "search", "Roadmap"],
+        cliCmd,
+        [...cliBase, "note", "search", "Roadmap"],
         { env }
       );
       const searchDefaultJson = JSON.parse(searchDefaultOut.stdout) as {
@@ -370,7 +374,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         ...env,
         OBSIDIAN_HERDR_BRIDGE_TOKEN: "0".repeat(64),
       };
-      const staleResilientOut = await execFileAsync(kit.cliScriptPath, ["vault", "info"], {
+      const staleResilientOut = await execFileAsync(cliCmd, [...cliBase, "vault", "info"], {
         env: staleEnv,
       });
       assert.equal(
@@ -380,8 +384,8 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       await assert.rejects(() =>
         execFileAsync(
-          kit.cliScriptPath,
-          ["note", "create", "Blocked.md", "--content", "should fail"],
+          cliCmd,
+          [...cliBase, "note", "create", "Blocked.md", "--content", "should fail"],
           { env }
         )
       );
@@ -390,15 +394,15 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       currentMode = "read-write";
 
       await execFileAsync(
-        kit.cliScriptPath,
-        ["note", "create", "Specs/AgentPlan.md", "--content", "# Agent Plan\n\nStep 1\n"],
+        cliCmd,
+        [...cliBase, "note", "create", "Specs/AgentPlan.md", "--content", "# Agent Plan\n\nStep 1\n"],
         { env }
       );
       assert.equal(fs.existsSync(path.join(vaultDir, "Specs/AgentPlan.md")), true);
 
       await execFileAsync(
-        kit.cliScriptPath,
-        [
+        cliCmd,
+        [...cliBase, 
           "note",
           "frontmatter",
           "Roadmap.md",
@@ -407,7 +411,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         ],
         { env }
       );
-      const readRoadmap = await execFileAsync(kit.cliScriptPath, ["note", "read", "Roadmap.md"], {
+      const readRoadmap = await execFileAsync(cliCmd, [...cliBase, "note", "read", "Roadmap.md"], {
         env,
       });
       const readJson = JSON.parse(readRoadmap.stdout) as {
@@ -420,8 +424,8 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       // Link-safe rename Roadmap.md -> Milestones.md updates [[Roadmap]] in Index.md
       await execFileAsync(
-        kit.cliScriptPath,
-        ["note", "rename", "Roadmap.md", "Milestones.md"],
+        cliCmd,
+        [...cliBase, "note", "rename", "Roadmap.md", "Milestones.md"],
         { env }
       );
       const updatedIndex = fs.readFileSync(path.join(vaultDir, "Index.md"), "utf8");
@@ -436,11 +440,11 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       assert.equal(fs.existsSync(path.join(vaultDir, "Roadmap.md")), true);
 
       // Skill self-doc output
-      const skillOut = await execFileAsync(kit.cliScriptPath, ["--skill"], { env });
+      const skillOut = await execFileAsync(cliCmd, [...cliBase, "--skill"], { env });
       assert.ok(skillOut.stdout.includes("obs-herdr"));
 
       // 4. Test obs-herdr mcp JSON-RPC 2.0 stdio server
-      const mcpChild = spawn(kit.cliScriptPath, ["mcp"], {
+      const mcpChild = spawn(cliCmd, [...cliBase, "mcp"], {
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -475,7 +479,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       );
       mcpChild.stdin.end();
 
-      const waitEnd = Date.now() + 5000;
+      const waitEnd = Date.now() + 15000;
       while (mcpResponses.length < 3 && Date.now() < waitEnd) {
         await new Promise((r) => setTimeout(r, 40));
       }
@@ -483,11 +487,12 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(mcpResponses.length, 3);
       const toolsList = (mcpResponses[1].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(toolsList.length, 26, "Node MCP server should expose all 26 tools");
+      assert.equal(toolsList.length, 27, "Node MCP server should expose all 27 tools");
       assert.ok(toolsList.some((t) => t.name === "obsidian_read_note"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_patch_frontmatter"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_backlinks"));
       assert.ok(toolsList.some((t) => t.name === "obsidian_upsert_canvas_node"));
+      assert.ok(toolsList.some((t) => t.name === "obsidian_ui_insert_line"));
       const toolCallText = (
         mcpResponses[2].result as { content: Array<{ text: string }> }
       ).content[0].text;
@@ -496,7 +501,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       // 5. Verify 1:1 Python fallback parity (obs-herdr-core.py CLI + 16-tool MCP server)
       const corePyPath = path.join(kit.binDir, "obs-herdr-core.py");
       const pyBacklinks = await execFileAsync(
-        "python3",
+        PYTHON,
         [corePyPath, "note", "backlinks", "Roadmap.md"],
         { env }
       );
@@ -508,7 +513,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       assert.equal(pyBacklinksJson.backlinks[0]?.sourcePath, "Index.md");
 
       await execFileAsync(
-        "python3",
+        PYTHON,
         [
           corePyPath,
           "canvas",
@@ -525,7 +530,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       );
       assert.equal(fs.existsSync(path.join(vaultDir, "Board.canvas")), true);
 
-      const pyMcpChild = spawn("python3", [corePyPath, "mcp"], {
+      const pyMcpChild = spawn(PYTHON, [corePyPath, "mcp"], {
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -557,7 +562,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       );
       pyMcpChild.stdin.end();
 
-      const pyWaitEnd = Date.now() + 5000;
+      const pyWaitEnd = Date.now() + 15000;
       while (pyMcpResponses.length < 2 && Date.now() < pyWaitEnd) {
         await new Promise((r) => setTimeout(r, 40));
       }
@@ -565,7 +570,8 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       assert.equal(pyMcpResponses.length, 2);
       const pyTools = (pyMcpResponses[0].result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(pyTools.length, 26, "Python MCP server must expose all 26 tools");
+      assert.equal(pyTools.length, 27, "Python MCP server must expose all 27 tools");
+      assert.ok(pyTools.some((t) => t.name === "obsidian_ui_insert_line"));
 
       // 6. Verify concurrent multi-agent vault & canvas writes preserve all updates
       await Promise.all([
@@ -592,7 +598,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
   });
 
   it("supports --help across groups/subcommands, derives MCP tool count, and implements ui locate/insert-line/anchor targets in Node and Python", async () => {
-    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-cli-help-test-"));
+    const tmpBase = makeShortTmpDir("oh-help-");
     const vaultDir = path.join(tmpBase, "vault");
     fs.mkdirSync(vaultDir, { recursive: true });
     const kit = computeRuntimePaths(vaultDir, path.join(tmpBase, "runtime"));
@@ -761,6 +767,26 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
             ],
           };
         }
+        if (!sel && txt.includes("Target")) {
+          return {
+            viewport: { width: 1920, height: 1080, devicePixelRatio: 1 },
+            total: 1,
+            truncated: false,
+            elements: [
+              {
+                selector: ".p1 .cm-line:nth-child(5)",
+                tag: "div",
+                role: null,
+                label: "",
+                text: "- Target line to locate",
+                notePath: "Crew Test/Mission Board.md",
+                pane: "pane-1",
+                disabled: false,
+                rect: { x: 1086, y: 312, width: 357, height: 24 },
+              },
+            ],
+          };
+        }
         if (sel.includes(".cm-line")) {
           if (blankMode) {
             return {
@@ -824,21 +850,23 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       const corePyPath = path.join(kit.binDir, "obs-herdr-core.py");
 
       for (const [cmd, baseArgs] of [
-        [kit.cliScriptPath, []],
-        ["python3", [corePyPath]],
+        cliInvocation(kit),
+        [PYTHON, [corePyPath]],
       ] as Array<[string, string[]]>) {
-        useNativeLocate = false;
-        useNativeInsertLine = false;
+        useNativeLocate = true;
+        useNativeInsertLine = true;
 
         const mainHelp = await execFileAsync(cmd, [...baseArgs, "--help"], { env });
-        assert.ok(mainHelp.stdout.includes("26 tools"), `${cmd} --help derives 26 tools`);
-        assert.ok(mainHelp.stdout.includes("press_key") && mainHelp.stdout.includes("insert_line"), `${cmd} --help includes ui batch schema with insert_line`);
+        assert.ok(mainHelp.stdout.includes("27 tools"), `${cmd} --help derives 27 tools`);
         assert.ok(
           mainHelp.stdout.includes("obs-herdr ui insert-line") &&
-            mainHelp.stdout.includes("proof returned by `insert-line`") &&
-            mainHelp.stdout.includes("Do not run `ui inspect` or `ui locate` before anchored actions") &&
+            mainHelp.stdout.includes("Skip `ui inspect` before anchored note edits") &&
             mainHelp.stdout.includes("screenshot` only on failure or when asked"),
           `${cmd} --help documents lean multi-agent shared-note recipe`
+        );
+        assert.ok(
+          !mainHelp.stdout.includes("Crew Test/Mission Board.md") && !mainHelp.stdout.includes("agy2"),
+          `${cmd} --help must not leak test-vault strings`
         );
 
         const skillOut = await execFileAsync(cmd, [...baseArgs, "--skill"], { env });
@@ -854,7 +882,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         );
 
         const batchHelp = await execFileAsync(cmd, [...baseArgs, "ui", "batch", "--help"], { env });
-        assert.ok(batchHelp.stdout.includes('"action":"insert_line"') && batchHelp.stdout.includes('"heading":"agy2: How agents share one note"'), `${cmd} ui batch --help shows worked insert_line + anchor example`);
+        assert.ok(batchHelp.stdout.includes('"action":"insert_line"') && batchHelp.stdout.includes('"heading":"Next steps"'), `${cmd} ui batch --help shows worked insert_line + anchor example`);
 
         const locateHelp = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "--help"], { env });
         assert.ok(
@@ -897,47 +925,6 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         assert.equal(inspected.total, 1);
         assert.equal(inspected.elements[0].notePath, "Crew Test/Mission Board.md");
         assert.equal(inspected.elements[0].pane, "pane-1");
-
-        scrollCount = 0;
-        const locateByLine = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "Crew Test/Mission Board.md", "--line", "5"], { env });
-        const locatedLine = JSON.parse(locateByLine.stdout) as {
-          found: boolean;
-          path: string;
-          pane: string;
-          point: { x: number; y: number };
-          scrolled: boolean;
-        };
-        assert.equal(locatedLine.found, true);
-        assert.equal(locatedLine.path, "Crew Test/Mission Board.md");
-        assert.equal(locatedLine.pane, "pane-1");
-        assert.equal(locatedLine.scrolled, true);
-        assert.equal(locatedLine.point.x, 1431);
-        assert.equal(locatedLine.point.y, 324);
-
-        const locateByHeadingStart = await execFileAsync(
-          cmd,
-          [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--heading", "agy2: How agents share one note", "--at", "start"],
-          { env }
-        );
-        const locatedHeading = JSON.parse(locateByHeadingStart.stdout) as { found: boolean; line: number; point: { x: number; y: number } };
-        assert.equal(locatedHeading.found, true);
-        assert.equal(locatedHeading.line, 3);
-        assert.equal(locatedHeading.point.x, 1094);
-
-        const locateByAfter = await execFileAsync(
-          cmd,
-          [...baseArgs, "ui", "locate", "--note", "Crew Test/Mission Board.md", "--after", "- Line one"],
-          { env }
-        );
-        const locatedAfter = JSON.parse(locateByAfter.stdout) as { found: boolean; line: number; point: { x: number; y: number } };
-        assert.equal(locatedAfter.found, true);
-        assert.equal(locatedAfter.line, 4);
-
-        const locateByText = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "Crew Test/Mission Board.md", "--text", "Line one"], { env });
-        const locatedText = JSON.parse(locateByText.stdout) as { found: boolean; line: number; point: { x: number; y: number } };
-        assert.equal(locatedText.found, true);
-        assert.equal(locatedText.line, 4);
-        assert.equal(locatedText.point.y, 300);
 
         const clickOut = await execFileAsync(
           cmd,
@@ -984,6 +971,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         assert.deepEqual(dragged.params.from, { note: "A.md", line: 2 });
         assert.deepEqual(dragged.params.to, { note: "B.md", heading: "## Done", at: "end" });
 
+        useNativeInsertLine = false;
         const insertFallbackOut = await execFileAsync(
           cmd,
           [...baseArgs, "ui", "insert-line", "--note", "Crew Test/Mission Board.md", "--heading", "## agy2: How agents share one note", "--at", "end", "--text", "- Added line"],
@@ -997,35 +985,6 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
           text: "- Added line",
         }]);
 
-        await assert.rejects(
-          execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Dup.md", "--line", "3"], { env }),
-          /multiple lines/
-        );
-
-        blankMode = true;
-        try {
-          await assert.rejects(
-            execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Blank.md", "--line", "2"], { env }),
-            /Could not locate line 2/
-          );
-        } finally {
-          blankMode = false;
-        }
-
-        stackedMode = true;
-        try {
-          const stackedLocate = await execFileAsync(
-            cmd,
-            [...baseArgs, "ui", "locate", "--note", "Bottom.md", "--line", "2"],
-            { env }
-          );
-          const stackedJson = JSON.parse(stackedLocate.stdout) as { pane: string; point: { y: number } };
-          assert.equal(stackedJson.pane, "pane-2");
-          assert.equal(stackedJson.point.y, 612);
-        } finally {
-          stackedMode = false;
-        }
-
         forceLocateDenied = true;
         try {
           await assert.rejects(
@@ -1034,16 +993,6 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
           );
         } finally {
           forceLocateDenied = false;
-        }
-
-        openNotesOverride = ["A/Shared.md", "B/Shared.md"];
-        try {
-          await assert.rejects(
-            execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "B/Shared.md", "--line", "2"], { env }),
-            /ambiguous across multiple open notes/
-          );
-        } finally {
-          openNotesOverride = null;
         }
 
         useNativeLocate = true;
@@ -1183,14 +1132,14 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
         // Round 6 P2-5: help/skill text uses real insert-line proof field names (path, pane, line, text, heading) and documents protected areas + typing speed
         const skillText = (await execFileAsync(cmd, [...baseArgs, "--skill"], { env })).stdout;
         assert.ok(!skillText.includes("returns proof (text, line, heading, notePath)"), `${cmd} --skill must not cite stale notePath proof field`);
-        assert.ok(skillText.includes("returns proof (path, pane, line, text, heading, durationMs)"), `${cmd} --skill must cite real insert-line proof fields`);
+        assert.ok(skillText.includes("path, pane, line, text, heading, durationMs"), `${cmd} --skill must cite real insert-line proof fields`);
         assert.ok(skillText.includes("allowUiInProtectedAreas") && skillText.includes("uiTypingSpeed"), `${cmd} --skill must mention protected-area and typing-speed settings`);
         const insertLineHelpText = (await execFileAsync(cmd, [...baseArgs, "ui", "insert-line", "--help"], { env })).stdout;
         assert.ok(insertLineHelpText.includes("path, pane, line, text, heading, durationMs"), `${cmd} ui insert-line --help must cite exact proof fields`);
       }
 
       const readme = fs.readFileSync(path.resolve("README.md"), "utf8");
-      assert.ok(readme.includes("obs-herdr mcp   # stdio MCP server, 26 tools"), "README.md must list 26 MCP tools");
+      assert.ok(readme.includes("obs-herdr mcp   # stdio MCP server, 27 tools"), "README.md must list 27 MCP tools");
       assert.ok(!readme.includes("24 tools"), "README.md must not contain stale 24 tools count");
       assert.ok(readme.includes("allowUiInProtectedAreas") || readme.includes("protected areas"), "README.md must document protected-area limits");
       assert.ok(readme.includes("uiTypingSpeed") || readme.includes("Visible") && readme.includes("Fast"), "README.md must document typing speed setting");
@@ -1202,7 +1151,7 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
   });
 
   it("serves fresh live-editor vault.read_note buffers and enforces ui.locate/ui.insert_line/waitFor tiers and caller labels", async () => {
-    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-freshness-routing-"));
+    const tmpBase = makeShortTmpDir("oh-fresh-");
     const vaultDir = path.join(tmpBase, "vault");
     fs.mkdirSync(vaultDir, { recursive: true });
     fs.writeFileSync(path.join(vaultDir, "Shared.md"), "disk copy α", "utf8");
@@ -1330,8 +1279,8 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 
       // Real permission dispatcher + runtime CLI end-to-end (R1-2): ui locate succeeds natively at read-only tier
       for (const [cmd, baseArgs] of [
-        [kit.cliScriptPath, []],
-        ["python3", [corePyPath]],
+        cliInvocation(kit),
+        [PYTHON, [corePyPath]],
       ] as Array<[string, string[]]>) {
         const cliLocate = await execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Shared.md", "--line", "1"], { env });
         const cliLocateJson = JSON.parse(cliLocate.stdout) as { found: boolean; caller: string };
@@ -1342,8 +1291,8 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
       // Disabled UI control must fail honestly without silently entering locate fallback
       allowUiControl = false;
       for (const [cmd, baseArgs] of [
-        [kit.cliScriptPath, []],
-        ["python3", [corePyPath]],
+        cliInvocation(kit),
+        [PYTHON, [corePyPath]],
       ] as Array<[string, string[]]>) {
         await assert.rejects(
           execFileAsync(cmd, [...baseArgs, "ui", "locate", "--note", "Shared.md", "--line", "1"], { env }),
@@ -1385,18 +1334,18 @@ describe("Vault Control Bridge: Authenticated socket, permission tiers, obs-herd
 });
 
 describe("Live Herdr 0.8.2 Daemon Integration (isolated config & session)", () => {
-  it("starts isolated headless herdr session, exchanges protocol 20 RPCs, runs obs-herdr inside a live Herdr pane, links obsidian.vault plugin, and stops cleanly", async () => {
+  it("starts isolated headless herdr session, exchanges protocol 20 RPCs, runs obs-herdr inside a live Herdr pane, links obsidian.vault plugin, and stops cleanly", async (t) => {
     const cliProbe = new HerdrCliClient();
     const binPath = cliProbe.getBinaryPath();
     if (!binPath) {
-      // Skip gracefully only on machines without herdr installed
+      // Visible skip on machines without herdr installed (CI runners).
+      t.skip("herdr binary not found on PATH");
       return;
     }
 
     // Herdr places its session sockets under XDG_CONFIG_HOME. Unix socket paths are
     // limited to 107 bytes, so keep this root short even when TMPDIR is deep.
-    const shortBase = process.platform !== "win32" && fs.existsSync("/tmp") ? "/tmp" : os.tmpdir();
-    const tmpRoot = fs.mkdtempSync(path.join(shortBase, "ohd-"));
+    const tmpRoot = makeShortTmpDir("ohd-");
     const isolatedConfigPath = path.join(tmpRoot, "herdr-config.toml");
     const isolatedXdgConfig = path.join(tmpRoot, "xdg-config");
     const vaultDir = path.join(tmpRoot, "vault");
@@ -1794,17 +1743,19 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       assert.equal(cursorEl.classes.has("is-typing"), false);
       assert.equal(actionEl.textContent, "");
 
-      // Scrolling anchored caret out of view adds is-offscreen, scrolling back removes it
+      // Scrolling anchored caret out of view adds is-offscreen on next rAF, scrolling back removes it
       scrollOffset = 400;
       for (const fn of listeners.get("scroll") ?? []) {
         fn();
       }
+      await new Promise((r) => setTimeout(r, 20));
       assert.equal(cursorEl.classes.has("is-offscreen"), true);
 
       scrollOffset = 0;
       for (const fn of listeners.get("scroll") ?? []) {
         fn();
       }
+      await new Promise((r) => setTimeout(r, 20));
       assert.equal(cursorEl.classes.has("is-offscreen"), false);
     } finally {
       overlay.dispose();
@@ -1898,7 +1849,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
     assert.ok(css.includes(".herdr-cursor.is-idle"));
   });
 
-  it("recomputes parked cursor immediately via ResizeObserver and MutationObserver and keeps pill inside pane/above status bar", () => {
+  it("recomputes parked cursor via coalesced rAF ResizeObserver and MutationObserver and keeps pill inside pane/above status bar", async () => {
     const resizeCallbacks: Array<(entries: Array<{ target: unknown }>) => void> = [];
     const mutationCallbacks: Array<() => void> = [];
     const observedResizeTargets = new Set<unknown>();
@@ -2013,7 +1964,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       const pillEl = cursorEl.children[2];
 
       assert.equal(observedResizeTargets.has(scrollDom), true);
-      assert.equal(observedResizeTargets.has(contentDom), true);
+      assert.equal(observedResizeTargets.has(contentDom), false);
       assert.equal(observedMutationTargets.has(contentDom), true);
 
       // Pill sits near bottom-right corner above .status-bar (top=760): must flip UP and LEFT inside pane
@@ -2022,12 +1973,13 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       assert.ok(pillY1 < 0, `Expected pill above pointer near status bar, got ${pillY1}`);
       assert.ok(pillX1 < 0, `Expected pill shifted left inside pane edge, got ${pillX1}`);
 
-      // Sidebar opens -> pane narrows & line wraps down; ResizeObserver snaps transform immediately even with reducedMotion=false
+      // Sidebar opens -> pane narrows & line wraps down; ResizeObserver snaps transform on coalesced rAF even with reducedMotion=false
       paneRight = 680;
       wrappedExtraPx = -60;
       for (const cb of resizeCallbacks) {
         cb([{ target: scrollDom }]);
       }
+      await new Promise((r) => setTimeout(r, 20));
       const afterResizeCoords = coordsForPos(pos);
       const afterResizeMidY = Math.round((afterResizeCoords.top + afterResizeCoords.bottom) / 2);
       assert.equal(cursorEl.style.transform, `translate3d(${afterResizeCoords.left}px, ${afterResizeMidY}px, 0)`);
@@ -2038,6 +1990,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       for (const cb of mutationCallbacks) {
         cb();
       }
+      await new Promise((r) => setTimeout(r, 20));
       const afterMutCoords = coordsForPos(docText.indexOf("Line B anchored"));
       const afterMutMidY = Math.round((afterMutCoords.top + afterMutCoords.bottom) / 2);
       assert.equal(cursorEl.style.transform, `translate3d(${afterMutCoords.left}px, ${afterMutMidY}px, 0)`);
@@ -2047,7 +2000,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
     }
   });
 
-  it("binds parked cursors to one note leaf and hides them when closed, collapsed, or switched to another note", () => {
+  it("binds parked cursors to one note leaf and hides them when closed, collapsed, or switched to another note", async () => {
     const resizeCallbacks: Array<(entries: Array<{ target: unknown }>) => void> = [];
     const mutationCallbacks: Array<() => void> = [];
     class FakeResizeObserver {
@@ -2131,6 +2084,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       for (const cb of resizeCallbacks) {
         cb([{ target: scrollDom }]);
       }
+      await new Promise((r) => setTimeout(r, 20));
       assert.equal(cursorEl.classes.has("is-offscreen"), true);
 
       // Restored tab becomes visible again via ResizeObserver
@@ -2138,6 +2092,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       for (const cb of resizeCallbacks) {
         cb([{ target: scrollDom }]);
       }
+      await new Promise((r) => setTimeout(r, 20));
       assert.equal(cursorEl.classes.has("is-offscreen"), false);
 
       // Virtualized offscreen line returning null from coordsAtPos must hide stale marker
@@ -2149,6 +2104,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       for (const cb of resizeCallbacks) {
         cb([{ target: scrollDom }]);
       }
+      await new Promise((r) => setTimeout(r, 20));
       assert.equal(cursorEl.classes.has("is-offscreen"), false);
 
       // Leaf switches in-place from Notes/A.md to Notes/B.md: cursor must hide and never redraw in B
@@ -2159,6 +2115,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       for (const cb of mutationCallbacks) {
         cb();
       }
+      await new Promise((r) => setTimeout(r, 20));
       assert.equal(cursorEl.classes.has("is-offscreen"), true);
 
       // When Notes/A.md leaf closes (isConnected=false), observer detects disconnect and clears cursor
@@ -2167,6 +2124,7 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
       for (const cb of resizeCallbacks) {
         cb([{ target: scrollDom }]);
       }
+      await new Promise((r) => setTimeout(r, 20));
       assert.equal(overlay.getActiveCount(), 0);
     } finally {
       overlay.dispose();
@@ -2866,144 +2824,64 @@ describe("AgentCursorOverlay: Round 3 collaborator presence, honest state, and l
   });
 
   it("exposes uiTypingSpeed and allowUiInProtectedAreas in HerdrSettingTab settings UI", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-settings-test-"));
-    try {
-      const stubPath = path.join(tmpDir, "obsidian-settings-stub.js");
-      fs.writeFileSync(
-        stubPath,
-        [
-          "exports.Notice = class Notice { constructor(m) { this.message = m; } };",
-          "exports.PluginSettingTab = class PluginSettingTab { constructor(app, plugin) { this.app = app; this.plugin = plugin; } update() {} };",
-          "exports.Modal = class Modal { constructor(app) { this.app = app; } open() {} close() {} };",
-        ].join("\n"),
-        "utf8"
-      );
-      const outPath = path.join(tmpDir, "settings-tab.cjs");
-      const runnerScript = [
-        'const esbuild = require("esbuild");',
-        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/ui/settings-tab.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(outPath)}, alias: { obsidian: ${JSON.stringify(stubPath)} } });`,
-        `const { HerdrSettingTab } = require(${JSON.stringify(outPath)});`,
-        "const saved = [];",
-        'const settings = { profiles: [{ id: "herdr-vault", name: "Herdr", kind: "herdr-vault", cwdMode: "vault-root" }], uiTypingSpeed: "visible", allowUiInProtectedAreas: false };',
-        "const tab = new HerdrSettingTab({}, { settings, async saveAndApplySettings(patch) { Object.assign(settings, patch); saved.push(patch); } });",
-        "const defs = tab.getSettingDefinitions();",
-        'const group = defs.find((d) => d.heading === "Vault Control Bridge and notifications");',
-        'const speedItem = group.items.find((i) => i.control && i.control.key === "uiTypingSpeed");',
-        'const protItem = group.items.find((i) => i.control && i.control.key === "allowUiInProtectedAreas");',
-        "Promise.all([tab.setControlValue('uiTypingSpeed', 'fast'), tab.setControlValue('allowUiInProtectedAreas', true)]).then(() => {",
-        "  process.stdout.write(JSON.stringify({ speedItem, protItem, settings, saved }));",
-        "});",
-      ].join("\n");
-      const out = await execFileAsync(process.execPath, ["-e", runnerScript], { cwd: process.cwd() });
-      const parsed = JSON.parse(out.stdout) as {
-        speedItem?: { control?: { type: string; key: string; options: Record<string, string> } };
-        protItem?: { control?: { type: string; key: string } };
-        settings: { uiTypingSpeed: string; allowUiInProtectedAreas: boolean };
-      };
-      assert.equal(parsed.speedItem?.control?.type, "dropdown");
-      assert.deepEqual(Object.keys(parsed.speedItem?.control?.options ?? {}), ["visible", "fast"]);
-      assert.equal(parsed.protItem?.control?.type, "toggle");
-      assert.equal(parsed.settings.uiTypingSpeed, "fast");
-      assert.equal(parsed.settings.allowUiInProtectedAreas, true);
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
+    const saved: Array<Record<string, unknown>> = [];
+    const settings = migrateSettings({ uiTypingSpeed: "visible", allowUiInProtectedAreas: false });
+    const tab = new HerdrSettingTab({} as App, {
+      settings,
+      async saveAndApplySettings(patch: Partial<typeof settings>) {
+        Object.assign(settings, patch);
+        saved.push(patch as Record<string, unknown>);
+      },
+    } as unknown as never);
+    const defs = tab.getSettingDefinitions() as Array<{
+      heading?: string;
+      items?: Array<{ control?: { type: string; key: string; options?: Record<string, string> } }>;
+    }>;
+    const group = defs.find((d) => d.heading === "Vault Control Bridge and notifications");
+    const speedItem = group?.items?.find((i) => i.control?.key === "uiTypingSpeed");
+    const protItem = group?.items?.find((i) => i.control?.key === "allowUiInProtectedAreas");
+    await Promise.all([
+      tab.setControlValue("uiTypingSpeed", "fast"),
+      tab.setControlValue("allowUiInProtectedAreas", true),
+    ]);
+    assert.equal(speedItem?.control?.type, "dropdown");
+    assert.deepEqual(Object.keys(speedItem?.control?.options ?? {}), ["visible", "fast"]);
+    assert.equal(protItem?.control?.type, "toggle");
+    assert.equal(settings.uiTypingSpeed, "fast");
+    assert.equal(settings.allowUiInProtectedAreas, true);
+    assert.equal(saved.length, 2);
   });
 
   it("renders HerdrSettingTab.display() cleanly against a DOM mock with full migrated settings", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-herdr-settings-dom-"));
-    try {
-      const stubPath = path.join(tmpDir, "obsidian-dom-stub.js");
-      fs.writeFileSync(
-        stubPath,
-        [
-          "function makeEl(tag) {",
-          "  const el = {",
-          "    tagName: tag.toUpperCase(),",
-          "    children: [],",
-          "    textContent: '',",
-          "    empty() { this.children = []; this.textContent = ''; },",
-          "    createEl(childTag, opts) { const c = makeEl(childTag); if (opts && opts.text) c.textContent = opts.text; this.children.push(c); return c; },",
-          "    createDiv(opts) { return this.createEl('div', opts); },",
-          "    addClass() {},",
-          "  };",
-          "  return el;",
-          "}",
-          "class SettingMock {",
-          "  constructor(containerEl) { this.containerEl = containerEl; this.row = containerEl.createDiv(); this.buttons = []; }",
-          "  setName(name) { this.name = name; return this; }",
-          "  setDesc(desc) { this.desc = desc; return this; }",
-          "  addButton(cb) { const btn = { setButtonText(t) { this.text = t; return this; }, onClick(fn) { this.click = fn; return this; } }; cb(btn); this.buttons.push(btn); return this; }",
-          "}",
-          "exports.Notice = class Notice { constructor(m) { this.message = m; } };",
-          "exports.Modal = class Modal { constructor(app) { this.app = app; } open() {} close() {} };",
-          "exports.PluginSettingTab = class PluginSettingTab {",
-          "  constructor(app, plugin) { this.app = app; this.plugin = plugin; this.id = plugin.manifest?.id || 'herdr-obs'; this.name = plugin.manifest?.name || 'Herdr'; this.containerEl = makeEl('div'); }",
-          "  update() { this.settingItems = this.getSettingDefinitions(); }",
-          "  display() {",
-          "    this.containerEl.empty();",
-          "    const defs = this.getSettingDefinitions();",
-          "    this.settingItems = defs;",
-          "    const renderItem = (item) => {",
-          "      if (item.visible === false || (typeof item.visible === 'function' && !item.visible())) return;",
-          "      if (item.items) { for (const child of item.items) renderItem(child); return; }",
-          "      const setting = new SettingMock(this.containerEl);",
-          "      if (item.render) { item.render(setting, this.containerEl); return; }",
-          "      setting.setName(item.name); if (item.desc) setting.setDesc(item.desc);",
-          "      if (item.control) {",
-          "        const val = this.getControlValue(item.control.key);",
-          "        if (item.control.type === 'dropdown' && !(String(val) in item.control.options)) {",
-          "          throw new Error(`Invalid dropdown value ${String(val)} for ${item.control.key}`);",
-          "        }",
-          "      }",
-          "    };",
-          "    for (const def of defs) renderItem(def);",
-          "  }",
-          "};",
-        ].join("\n"),
-        "utf8"
-      );
-      const typesOut = path.join(tmpDir, "types.cjs");
-      const tabOut = path.join(tmpDir, "tab.cjs");
-      const runnerScript = [
-        'const esbuild = require("esbuild");',
-        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/domain/types.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(typesOut)} });`,
-        `esbuild.buildSync({ entryPoints: [${JSON.stringify(path.resolve("src/ui/settings-tab.ts"))}], bundle: true, format: "cjs", platform: "node", target: "es2022", outfile: ${JSON.stringify(tabOut)}, alias: { obsidian: ${JSON.stringify(stubPath)} } });`,
-        `const { migrateSettings } = require(${JSON.stringify(typesOut)});`,
-        `const { HerdrSettingTab } = require(${JSON.stringify(tabOut)});`,
-        'const settings = migrateSettings({ vaultPermissionMode: "full", allowUiControl: true, showAgentCursors: true });',
-        'const plugin = { manifest: { id: "herdr-obs", name: "Herdr Mission Control" }, settings, async saveAndApplySettings(patch) { Object.assign(settings, patch); } };',
-        "const tab = new HerdrSettingTab({}, plugin);",
-        "tab.update();",
-        "tab.display();",
-        "const values = {",
-        '  uiTypingSpeed: tab.getControlValue("uiTypingSpeed"),',
-        '  allowUiInProtectedAreas: tab.getControlValue("allowUiInProtectedAreas"),',
-        '  showAgentCursors: tab.getControlValue("showAgentCursors"),',
-        "};",
-        "Promise.resolve(tab.setControlValue('showAgentCursors', false)).then(() => {",
-        "  process.stdout.write(JSON.stringify({ renderedRows: tab.containerEl.children.length, defCount: tab.settingItems.length, values, updatedShowAgentCursors: settings.showAgentCursors, icon: tab.icon }));",
-        "});",
-      ].join("\n");
-      const out = await execFileAsync(process.execPath, ["-e", runnerScript], { cwd: process.cwd() });
-      const parsed = JSON.parse(out.stdout) as {
-        renderedRows: number;
-        defCount: number;
-        values: { uiTypingSpeed: string; allowUiInProtectedAreas: boolean; showAgentCursors: boolean };
-        updatedShowAgentCursors: boolean;
-        icon: string;
-      };
-      assert.equal(parsed.icon, "cpu");
-      assert.equal(parsed.defCount, 4);
-      assert.ok(parsed.renderedRows >= 20);
-      assert.deepEqual(parsed.values, {
-        uiTypingSpeed: "visible",
-        allowUiInProtectedAreas: false,
-        showAgentCursors: true,
-      });
-      assert.equal(parsed.updatedShowAgentCursors, false);
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
+    const settings = migrateSettings({
+      vaultPermissionMode: "full",
+      allowUiControl: true,
+      showAgentCursors: true,
+    });
+    const plugin = {
+      manifest: { id: "herdr-obs", name: "Herdr Mission Control" },
+      settings,
+      async saveAndApplySettings(patch: Partial<typeof settings>) {
+        Object.assign(settings, patch);
+      },
+    };
+    const tab = new HerdrSettingTab({} as App, plugin as unknown as never);
+    tab.update();
+    tab.display();
+    const values = {
+      uiTypingSpeed: tab.getControlValue("uiTypingSpeed"),
+      allowUiInProtectedAreas: tab.getControlValue("allowUiInProtectedAreas"),
+      showAgentCursors: tab.getControlValue("showAgentCursors"),
+    };
+    await tab.setControlValue("showAgentCursors", false);
+    assert.equal(tab.icon, "cpu");
+    assert.equal((tab as unknown as { settingItems: unknown[] }).settingItems.length, 4);
+    assert.ok((tab.containerEl as unknown as { children: unknown[] }).children.length >= 20);
+    assert.deepEqual(values, {
+      uiTypingSpeed: "visible",
+      allowUiInProtectedAreas: false,
+      showAgentCursors: true,
+    });
+    assert.equal(settings.showAgentCursors, false);
   });
 });

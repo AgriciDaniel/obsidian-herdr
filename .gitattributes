@@ -1,0 +1,7 @@
+# Keep LF line endings in the repo and in checkouts on every OS (Windows CI included),
+# so builds, hashes and tests do not depend on the platform.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

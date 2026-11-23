@@ -1,6 +1,7 @@
 import type { IBufferLine, ILink, ILinkProvider, Terminal } from "@xterm/xterm";
-import { type App, TFile } from "obsidian";
+import { type App, Notice, TFile } from "obsidian";
 import { resolveTerminalPathInsideVault } from "../domain/path-guard";
+import { confirmAction } from "../ui/modals";
 
 const WIKILINK_RE = /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|[^\]]+)?\]\]/g;
 const OBSIDIAN_URI_RE = /\bobsidian:\/\/[^\s"'<>)\]]+/g;
@@ -22,7 +23,11 @@ export function parseObsidianUriTarget(rawUri: string): ParsedObsidianUri | null
     if (action === "open") {
       const fileParam = parsed.searchParams.get("file");
       if (fileParam && fileParam.trim()) {
-        return { kind: "open-file", file: fileParam.trim(), cleanedUri };
+        return {
+          kind: "open-file",
+          file: fileParam.trim(),
+          cleanedUri,
+        };
       }
     }
     return { kind: "external", cleanedUri };
@@ -64,6 +69,23 @@ export class VaultTerminalLinkProvider implements ILinkProvider {
     }
 
     const links: ILink[] = [];
+    const occupied: Array<[number, number]> = [];
+    const overlaps = (start: number, end: number): boolean =>
+      occupied.some(([s, e]) => start <= e && end >= s);
+    const addLink = (startCol: number, endCol: number, linkText: string, activate: () => void) => {
+      if (overlaps(startCol, endCol)) {
+        return;
+      }
+      occupied.push([startCol, endCol]);
+      links.push({
+        text: linkText,
+        range: {
+          start: { x: startCol, y: bufferLineNumber },
+          end: { x: endCol, y: bufferLineNumber },
+        },
+        activate,
+      });
+    };
 
     WIKILINK_RE.lastIndex = 0;
     let wikiMatch = WIKILINK_RE.exec(text);
@@ -71,20 +93,18 @@ export class VaultTerminalLinkProvider implements ILinkProvider {
       const fullText = wikiMatch[0];
       const noteTarget = wikiMatch[1].trim();
       const heading = wikiMatch[2]?.trim();
-      const startCol = wikiMatch.index + 1;
-      const endCol = wikiMatch.index + fullText.length;
-      const linkStr = heading ? `${noteTarget}#${heading}` : noteTarget;
-
-      links.push({
-        text: fullText,
-        range: {
-          start: { x: startCol, y: bufferLineNumber },
-          end: { x: endCol, y: bufferLineNumber },
-        },
-        activate: () => {
-          void this.app.workspace.openLinkText(linkStr, "", false);
-        },
-      });
+      const resolvedFile =
+        noteTarget && !/^\s*-/.test(noteTarget)
+          ? this.app.metadataCache.getFirstLinkpathDest(noteTarget, "")
+          : null;
+      if (resolvedFile instanceof TFile) {
+        const startCol = wikiMatch.index + 1;
+        const endCol = wikiMatch.index + fullText.length;
+        const linkStr = heading ? `${noteTarget}#${heading}` : noteTarget;
+        addLink(startCol, endCol, fullText, () => {
+          void this.app.workspace.openLinkText(linkStr, "", true);
+        });
+      }
       wikiMatch = WIKILINK_RE.exec(text);
     }
 
@@ -95,19 +115,45 @@ export class VaultTerminalLinkProvider implements ILinkProvider {
       if (parsedUri) {
         const startCol = uriMatch.index + 1;
         const endCol = uriMatch.index + parsedUri.cleanedUri.length;
-        links.push({
-          text: parsedUri.cleanedUri,
-          range: {
-            start: { x: startCol, y: bufferLineNumber },
-            end: { x: endCol, y: bufferLineNumber },
-          },
-          activate: () => {
-            if (parsedUri.kind === "open-file") {
-              void this.app.workspace.openLinkText(parsedUri.file, "", false);
-            } else {
-              window.open(parsedUri.cleanedUri);
+        addLink(startCol, endCol, parsedUri.cleanedUri, () => {
+          if (parsedUri.kind === "open-file") {
+            const currentVault = this.app.vault.getName();
+            let targetVault: string | null = null;
+            try {
+              targetVault = new URL(parsedUri.cleanedUri).searchParams.get("vault")?.trim() || null;
+            } catch {
+              targetVault = null;
             }
-          },
+            if (targetVault && targetVault !== currentVault) {
+              void confirmAction(this.app, {
+                title: "Open URI in another vault?",
+                body: `Open '${parsedUri.cleanedUri}' (targets vault '${targetVault}')?`,
+                confirmText: "Open URI",
+              }).then((ok) => {
+                if (ok) {
+                  window.open(parsedUri.cleanedUri);
+                }
+              });
+              return;
+            }
+            const resolved = this.app.metadataCache.getFirstLinkpathDest(parsedUri.file, "");
+            if (resolved instanceof TFile) {
+              void this.openVaultFileAtLine(resolved);
+            } else {
+              new Notice(`Note '${parsedUri.file}' was not found in this vault.`);
+            }
+          } else {
+            void confirmAction(this.app, {
+              title: "Open Obsidian URI from terminal?",
+              body: `Terminal output linked to:\n\n${parsedUri.cleanedUri}`,
+              confirmText: "Open URI",
+              danger: true,
+            }).then((ok) => {
+              if (ok) {
+                window.open(parsedUri.cleanedUri);
+              }
+            });
+          }
         });
       }
       uriMatch = OBSIDIAN_URI_RE.exec(text);
@@ -131,15 +177,8 @@ export class VaultTerminalLinkProvider implements ILinkProvider {
             const startCol = pathMatch.index + 1;
             const endCol = pathMatch.index + candidate.length;
             const lineZero = resolved.line ? Math.max(0, resolved.line - 1) : undefined;
-            links.push({
-              text: candidate,
-              range: {
-                start: { x: startCol, y: bufferLineNumber },
-                end: { x: endCol, y: bufferLineNumber },
-              },
-              activate: () => {
-                void this.openVaultFileAtLine(abstractFile, lineZero);
-              },
+            addLink(startCol, endCol, candidate, () => {
+              void this.openVaultFileAtLine(abstractFile, lineZero);
             });
           }
         }
@@ -151,7 +190,7 @@ export class VaultTerminalLinkProvider implements ILinkProvider {
   }
 
   private async openVaultFileAtLine(file: TFile, lineZero?: number): Promise<void> {
-    const leaf = this.app.workspace.getLeaf(false);
+    const leaf = this.app.workspace.getLeaf("tab");
     await leaf.openFile(
       file,
       lineZero !== undefined ? { eState: { line: lineZero } } : undefined

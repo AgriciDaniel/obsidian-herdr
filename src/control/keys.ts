@@ -42,6 +42,39 @@ const NAMED_KEYS: Record<string, { keyCode: string; text: string | null }> = {
   F12: { keyCode: "F12", text: null },
 };
 
+const NAMED_KEY_ALIASES: Record<string, { keyCode: string; text: string | null }> = (() => {
+  const map: Record<string, { keyCode: string; text: string | null }> = {};
+  for (const [name, spec] of Object.entries(NAMED_KEYS)) {
+    map[name.toLowerCase()] = spec;
+  }
+  map.return = NAMED_KEYS.Enter;
+  map.esc = NAMED_KEYS.Escape;
+  map.del = NAMED_KEYS.Delete;
+  map.left = NAMED_KEYS.ArrowLeft;
+  map.right = NAMED_KEYS.ArrowRight;
+  map.up = NAMED_KEYS.ArrowUp;
+  map.down = NAMED_KEYS.ArrowDown;
+  map.pgup = NAMED_KEYS.PageUp;
+  map.pgdn = NAMED_KEYS.PageDown;
+  map.spacebar = NAMED_KEYS.Space;
+  return map;
+})();
+
+const DIGIT_SHIFTED: Record<string, string> = {
+  "0": ")",
+  "1": "!",
+  "2": "@",
+  "3": "#",
+  "4": "$",
+  "5": "%",
+  "6": "^",
+  "7": "&",
+  "8": "*",
+  "9": "(",
+};
+
+const SHIFTED_DIGIT_KEYS = new Set(Object.values(DIGIT_SHIFTED));
+
 const PUNCTUATION_SHIFTED: Record<string, string> = {
   "=": "+",
   "-": "_",
@@ -93,7 +126,7 @@ export function buildKeyPress(
   const ordered = (["shift", "control", "alt", "meta"] as const).filter((m) => mods.has(m));
   const producesText = !mods.has("control") && !mods.has("alt") && !mods.has("meta");
 
-  const named = NAMED_KEYS[key];
+  const named = NAMED_KEYS[key] ?? NAMED_KEY_ALIASES[key.toLowerCase()];
   if (named) {
     return { keyCode: named.keyCode, text: producesText ? named.text : null, modifiers: ordered };
   }
@@ -103,6 +136,10 @@ export function buildKeyPress(
     return { keyCode: upper, text: producesText ? ch : null, modifiers: ordered };
   }
   if (/^[0-9]$/.test(key)) {
+    const ch = mods.has("shift") ? DIGIT_SHIFTED[key] : key;
+    return { keyCode: key, text: producesText ? ch : null, modifiers: ordered };
+  }
+  if (SHIFTED_DIGIT_KEYS.has(key)) {
     return { keyCode: key, text: producesText ? key : null, modifiers: ordered };
   }
   if (Object.prototype.hasOwnProperty.call(PUNCTUATION_SHIFTED, key)) {

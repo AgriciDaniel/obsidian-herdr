@@ -118,7 +118,9 @@ function normalizeDataTransferFormat(format: string): string {
 function createDataTransferPolyfill(): DataTransferLike {
   const store = new Map<string, string>();
   const items: DataTransferLike["items"] = {
-    length: 0,
+    get length(): number {
+      return store.size;
+    },
     add: () => undefined,
     clear: () => {
       store.clear();
@@ -309,7 +311,12 @@ function dispatchDomEvent(
   return event.defaultPrevented;
 }
 
-function computeStepCount(from: DragPoint, to: DragPoint, explicitSteps?: number): number {
+/** Computes the bounded step count used for both preflight checks and drag dispatch. */
+export function computeDragStepCount(
+  from: DragPoint,
+  to: DragPoint,
+  explicitSteps?: number
+): number {
   if (typeof explicitSteps === "number" && Number.isFinite(explicitSteps)) {
     return Math.min(MAX_DRAG_STEPS, Math.max(1, Math.round(explicitSteps)));
   }
@@ -347,7 +354,7 @@ async function performHtml5Drag(
 ): Promise<PerformDragResult> {
   const { win, from, to, stepDelayMs = 16, dropSettleMs = 100 } = options;
   const sleepFn = options.sleep ?? ((ms: number) => defaultSleep(win, ms));
-  const targetEl =
+  let targetEl =
     options.toElement ??
     elementFromPointSafe(win, to) ??
     win.document.body ??
@@ -389,6 +396,14 @@ async function performHtml5Drag(
       lastPoint = step.css;
       if (stepDelayMs > 0) {
         await sleepFn(stepDelayMs);
+      }
+    }
+
+    // Re-resolve dynamic drop overlays mounted after dragstart when destination was not forced.
+    if (!options.toElement) {
+      const liveDropTarget = elementFromPointSafe(win, to);
+      if (liveDropTarget) {
+        targetEl = liveDropTarget;
       }
     }
 
@@ -437,6 +452,7 @@ async function performPointerDrag(
   const sleepFn = options.sleep ?? ((ms: number) => defaultSleep(win, ms));
 
   let lastWin = fromWin;
+  options.onBeforeStart?.(from);
   options.onStart?.(from);
   wc.sendInputEvent({ type: "mouseMove", ...fromWin });
   if (stepDelayMs > 0) {
@@ -445,6 +461,7 @@ async function performPointerDrag(
   }
   options.onBeforeStart?.(from);
 
+  let pressed = false;
   try {
     wc.sendInputEvent({
       type: "mouseDown",
@@ -453,6 +470,7 @@ async function performPointerDrag(
       clickCount: 1,
       modifiers: ["leftButtonDown"],
     });
+    pressed = true;
     if (stepDelayMs > 0) {
       // Allow pointerdown capture listeners to attach before moving off the start point.
       await sleepFn(stepDelayMs);
@@ -471,7 +489,13 @@ async function performPointerDrag(
       }
     }
   } finally {
-    wc.sendInputEvent({ type: "mouseUp", ...lastWin, button: "left", clickCount: 1 });
+    if (pressed) {
+      try {
+        wc.sendInputEvent({ type: "mouseUp", ...lastWin, button: "left", clickCount: 1 });
+      } catch {
+        // Ignore mouseUp cleanup errors when WebContents is unavailable.
+      }
+    }
   }
 
   options.onComplete?.(to, true);
@@ -496,7 +520,7 @@ async function performPointerDrag(
  * moves with leftButtonDown state for pointer-event surfaces (Canvas cards, handles).
  */
 export async function performDrag(options: PerformDragOptions): Promise<PerformDragResult> {
-  const steps = computeStepCount(options.from, options.to, options.steps);
+  const steps = computeDragStepCount(options.from, options.to, options.steps);
   const fromWin = options.toWindowPoint(options.from);
   const toWin = options.toWindowPoint(options.to);
   const stepPoints = buildSteps(options.from, options.to, fromWin, toWin, steps);

@@ -9,16 +9,28 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: npm ci --no-audit --no-fund
       - run: npm run check
       - run: npm run lint
       - run: npm run build
+      - run: python3 -m py_compile src/terminal/drivers/pty-bridge.py src/bridge/client/obs-herdr-core.py
+        if: runner.os != 'Windows'
+      - run: python -m py_compile src/terminal/drivers/pty-bridge.py src/bridge/client/obs-herdr-core.py
+        if: runner.os == 'Windows'
+      - run: node --check src/bridge/client/obs-herdr-core.mjs
       - run: npm test

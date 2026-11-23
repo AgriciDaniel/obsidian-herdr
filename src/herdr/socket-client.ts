@@ -59,7 +59,8 @@ const DEFAULT_SUBSCRIPTIONS = [
   { type: "layout.updated" },
 ];
 
-export const SUPPORTED_HERDR_PROTOCOLS: readonly number[] = [20];
+// 20: Herdr 0.8.x. 22: Herdr 0.9.4 and 0.9.5 (live-tested by tests/all.test.ts against 0.9.5).
+export const SUPPORTED_HERDR_PROTOCOLS: readonly number[] = [20, 22];
 
 /**
  * Checks Herdr client/server protocol compatibility and returns a user-facing warning
@@ -107,8 +108,12 @@ export function evaluateHerdrProtocol(info: {
  */
 export function injectEnvIntoLayoutNode(
   node: HerdrLayoutNode,
-  env: Record<string, string>
+  env: Record<string, string>,
+  depth = 0
 ): HerdrLayoutNode {
+  if (depth > 32) {
+    throw new Error("Layout tree exceeds maximum nesting depth (32).");
+  }
   if (!env || Object.keys(env).length === 0) {
     return node;
   }
@@ -123,8 +128,8 @@ export function injectEnvIntoLayoutNode(
   }
   return {
     ...node,
-    first: injectEnvIntoLayoutNode(node.first, env),
-    second: injectEnvIntoLayoutNode(node.second, env),
+    first: injectEnvIntoLayoutNode(node.first, env, depth + 1),
+    second: injectEnvIntoLayoutNode(node.second, env, depth + 1),
   };
 }
 
@@ -767,7 +772,14 @@ export class HerdrSocketClient {
             const msg = JSON.parse(line) as {
               event?: string;
               data?: Record<string, unknown>;
+              error?: { code?: string };
             };
+            if (msg.error && typeof msg.error === "object" && msg.error.code === "events_lost") {
+              // Herdr 0.9.2+ ends a subscription that fell behind with events_lost. Reconnect
+              // (the close handler does that), so the next snapshot catches up.
+              sock.destroy();
+              return;
+            }
             if (typeof msg.event === "string") {
               const ev: HerdrEventNotification = {
                 event: msg.event,

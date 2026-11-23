@@ -16,187 +16,62 @@ import {
   type UiMutationContext,
 } from "../control/ui-control";
 import { commitCanvasCardModel, findCanvasCardNode } from "../control/nested-editors";
-import { guardVaultRelativePath, VaultPathGuardError } from "../domain/path-guard";
-import { isDeepStrictEqual } from "node:util";
+import {
+  assertNoSymlinkEscape,
+  guardVaultRelativePath,
+  VaultPathGuardError,
+} from "../domain/path-guard";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type {
   VaultAuditEntry,
   VaultMutationSnapshot,
   VaultPermissionMode,
 } from "../domain/types";
+import {
+  BridgeRpcError,
+  FORBIDDEN_FRONTMATTER_KEYS,
+  UI_CONTROL_METHODS,
+  VALID_CANVAS_NODE_TYPES,
+  VALID_UPDATE_MODES,
+  WRITE_METHODS,
+  asStr,
+  editedTextRange,
+  fileContentsEqual,
+  insertUnderMarkdownHeading,
+  isCommandBlocked,
+  isExcludedFromScan,
+  isMethodPermitted,
+  isProtectedCommand,
+  parseCanvasDoc,
+  validateCanvasHttpUrl,
+  type CanvasDocument,
+  type CanvasNodeRecord,
+  type VaultTextChange,
+} from "./policy";
+import {
+  MutationLedger,
+  type FileUiSnapshotSession,
+  type SnapshotGuard,
+  type UiFileView,
+} from "./mutation-ledger";
 
-export class BridgeRpcError extends Error {
-  readonly code: string;
+export { BridgeRpcError, type VaultTextChange } from "./policy";
 
-  constructor(code: string, message: string) {
-    super(message);
-    this.name = "BridgeRpcError";
-    this.code = code;
-  }
-}
-
-export interface VaultTextChange {
-  before: string;
-  after: string;
-  from: number;
-  to: number;
-  insertLength: number;
-}
-
-function editedTextRange(before: string, after: string): VaultTextChange | undefined {
-  if (before === after) {
-    return undefined;
-  }
-  let from = 0;
-  const limit = Math.min(before.length, after.length);
-  while (from < limit && before.charCodeAt(from) === after.charCodeAt(from)) {
-    from++;
-  }
-  const splitsSurrogate = (text: string, pos: number): boolean =>
-    pos > 0 && pos < text.length && text.charCodeAt(pos - 1) >= 0xd800 &&
-    text.charCodeAt(pos - 1) <= 0xdbff && text.charCodeAt(pos) >= 0xdc00 && text.charCodeAt(pos) <= 0xdfff;
-  if (splitsSurrogate(before, from) || splitsSurrogate(after, from)) {
-    from--;
-  }
-  let suffix = 0;
-  while (
-    suffix < limit - from &&
-    before.charCodeAt(before.length - suffix - 1) === after.charCodeAt(after.length - suffix - 1)
-  ) {
-    suffix++;
-  }
-  if (splitsSurrogate(before, before.length - suffix) || splitsSurrogate(after, after.length - suffix)) {
-    suffix--;
-  }
-  return { before, after, from, to: before.length - suffix, insertLength: after.length - suffix - from };
-}
-
-function asStr(value: unknown, fallback = ""): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  return fallback;
-}
-
-const READ_METHODS = new Set<string>([
-  "bridge.ping",
-  "vault.info",
-  "vault.list_files",
-  "vault.read_note",
-  "vault.search",
-  "metadata.backlinks",
-  "metadata.graph_neighbors",
-  "metadata.tags_and_properties",
-  "workspace.get_state",
-  "editor.selection",
-  "commands.list",
-]);
-
-const WRITE_METHODS = new Set<string>([
-  "vault.create_note",
-  "vault.update_note",
-  "vault.patch_frontmatter",
-  "vault.rename_note",
-  "vault.trash_note",
-  "canvas.upsert_node",
-  "workspace.open_note",
-  "workspace.notice",
-  "editor.replace_selection",
-  "editor.insert_at_cursor",
-]);
-
-const FULL_METHODS = new Set<string>(["commands.execute"]);
-
-/** Seeing the window: any bridge tier, plus the separate UI control setting. */
-const UI_OBSERVE_METHODS = new Set<string>(["ui.screenshot", "ui.inspect", "ui.wait_for", "ui.locate", "ui.hover"]);
-
-/** Operating the window can do anything a person can, so it needs Full plus the UI control setting. */
-const UI_INPUT_METHODS = new Set<string>([
-  "ui.click",
-  "ui.select",
-  "ui.type",
-  "ui.press_key",
-  "ui.scroll",
-  "ui.drag",
-  "ui.batch",
-  "ui.insert_line",
-]);
-
-const BLOCKED_COMMAND_SUBSTRINGS = [
-  "app:delete-vault",
-  "plugin",
-  "safe-mode",
-];
-
-interface CanvasNodeRecord {
-  id: string;
-  type: "text" | "file" | "link" | "group";
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  text?: string;
-  file?: string;
-  url?: string;
-  label?: string;
-  color?: string;
-}
-
-interface CanvasEdgeRecord {
-  id: string;
-  fromNode: string;
-  toNode: string;
-  fromSide?: "top" | "right" | "bottom" | "left";
-  toSide?: "top" | "right" | "bottom" | "left";
-  label?: string;
-}
-
-interface CanvasDocument {
-  nodes: CanvasNodeRecord[];
-  edges: CanvasEdgeRecord[];
-}
-
-interface UiSnapshotSession {
-  context: UiMutationContext;
-  view: MarkdownView;
-  editor: MarkdownView["editor"];
-  cm: UiMutationContext["targetCm"];
-  path: string;
-  before: string;
-  revision: number;
-  conflicted: boolean;
-  depth: number;
-}
-
-interface SnapshotGuard {
-  revision: number;
-  postContent: string | null | undefined;
-  conflicted: boolean;
-  fileView?: WeakRef<UiFileView>;
-}
-
-interface FileUiSnapshotSession {
-  context: UiMutationContext;
-  path: string;
-  view: UiFileView | null;
-  viewPath: string | null;
-  before: string;
-  revision: number;
-  conflicted: boolean;
-  depth: number;
-}
-
-interface UiFileView {
-  file?: TFile | null;
-  getViewType?: () => string;
-  getViewData?: () => string;
-  setViewData?: (data: string, clear: boolean) => void;
-  save?: (clear?: boolean) => Promise<void>;
-  canvas?: { getData?: () => unknown; setData?: (data: unknown) => void; requestSave?: (history?: boolean) => void };
-  containerEl?: HTMLElement;
+export interface VaultOpsOptions {
+  app: App;
+  getPermissionMode: () => VaultPermissionMode;
+  getAllowHiddenReads: () => boolean;
+  uiControl?: UiControlService | null;
+  getAllowUiControl?: () => boolean;
+  getAllowUiInProtectedAreas?: () => boolean;
+  onAgentActivity?: (
+    caller: string,
+    targetPath: string | undefined,
+    action: string,
+    change?: VaultTextChange
+  ) => void;
 }
 
 interface CommandFileState {
@@ -213,29 +88,21 @@ export class VaultOpsService {
   private readonly getAllowUiControl: () => boolean;
   private readonly getAllowUiInProtectedAreas: () => boolean;
   private readonly onAgentActivity:
-    | ((caller: string, targetPath: string | undefined, action: string, change?: VaultTextChange) => void)
+    | ((
+        caller: string,
+        targetPath: string | undefined,
+        action: string,
+        change?: VaultTextChange
+      ) => void)
     | null;
-  private readonly auditEntries: VaultAuditEntry[] = [];
-  private readonly auditListeners = new Set<() => void>();
-  private readonly pathQueues = new Map<string, Promise<unknown>>();
-  private readonly pendingUiSnapshots = new Set<UiSnapshotSession>();
-  private readonly pendingFileSnapshots = new Set<FileUiSnapshotSession>();
-  private readonly noteRevisions = new Map<string, number>();
-  private readonly nativeWrites = new Map<string, number>();
-  private readonly snapshotGuards = new WeakMap<VaultMutationSnapshot, SnapshotGuard>();
-  private readonly destructiveUndoPaths = new Set<string>();
-  private readonly commandWrites = new Map<string, number>();
-  private auditSeq = 0;
+  private readonly ledger = new MutationLedger();
 
-  constructor(options: {
-    app: App;
-    getPermissionMode: () => VaultPermissionMode;
-    getAllowHiddenReads: () => boolean;
-    uiControl?: UiControlService | null;
-    getAllowUiControl?: () => boolean;
-    getAllowUiInProtectedAreas?: () => boolean;
-    onAgentActivity?: (caller: string, targetPath: string | undefined, action: string, change?: VaultTextChange) => void;
-  }) {
+  private renameConfigDepth = 0;
+  private renameConfigValue: boolean | null = null;
+  private renameConfigSaved: { hadKey: boolean; value: unknown } | null = null;
+  private renameConfigWaiters: Array<() => void> = [];
+
+  constructor(options: VaultOpsOptions) {
     this.app = options.app;
     this.getPermissionMode = options.getPermissionMode;
     this.getAllowHiddenReads = options.getAllowHiddenReads;
@@ -246,19 +113,15 @@ export class VaultOpsService {
   }
 
   onAuditUpdated(listener: () => void): () => void {
-    this.auditListeners.add(listener);
-    return () => {
-      this.auditListeners.delete(listener);
-    };
+    return this.ledger.onAuditUpdated(listener);
   }
 
   getAuditLog(): VaultAuditEntry[] {
-    return [...this.auditEntries];
+    return this.ledger.getAuditLog();
   }
 
   clearAuditLog(): void {
-    this.auditEntries.length = 0;
-    this.notifyAudit();
+    this.ledger.clearAuditLog();
   }
 
   getVaultBasePath(): string | null {
@@ -272,7 +135,8 @@ export class VaultOpsService {
   async dispatch(
     method: string,
     params: Record<string, unknown> = {},
-    caller = "herdr-agent"
+    caller = "herdr-agent",
+    isAbandoned?: () => boolean
   ): Promise<unknown> {
     const mode = this.getPermissionMode();
     const targetHint =
@@ -282,9 +146,8 @@ export class VaultOpsService {
           ? params.commandId
           : undefined;
 
-    const isUiMethod = UI_OBSERVE_METHODS.has(method) || UI_INPUT_METHODS.has(method);
-    if (isUiMethod && mode !== "off" && !this.getAllowUiControl()) {
-      this.recordAudit({
+    if (UI_CONTROL_METHODS.has(method) && mode !== "off" && !this.getAllowUiControl()) {
+      this.ledger.recordAudit({
         method,
         caller,
         allowed: false,
@@ -296,8 +159,8 @@ export class VaultOpsService {
       );
     }
 
-    if (!this.isMethodPermitted(method, mode)) {
-      this.recordAudit({
+    if (!isMethodPermitted(method, mode)) {
+      this.ledger.recordAudit({
         method,
         caller,
         targetPath: targetHint,
@@ -312,11 +175,11 @@ export class VaultOpsService {
 
     const finishNativeWrite = this.trackNativeWrite(method, params);
     try {
-      const result = await this.executeMethod(method, params, caller);
+      const result = await this.executeMethod(method, params, caller, isAbandoned);
       return result;
     } catch (err) {
       if (err instanceof VaultPathGuardError) {
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           targetPath: targetHint,
@@ -329,7 +192,7 @@ export class VaultOpsService {
         throw err;
       }
       if (err instanceof UiControlError) {
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           allowed: false,
@@ -347,7 +210,7 @@ export class VaultOpsService {
   }
 
   async undoMutation(auditId: string): Promise<string> {
-    const entry = this.auditEntries.find((item) => item.id === auditId);
+    const entry = this.ledger.getUndoEntry(auditId);
     if (!entry || !entry.snapshot) {
       throw new Error("No reversible snapshot is recorded for that audit item.");
     }
@@ -356,44 +219,50 @@ export class VaultOpsService {
     }
 
     const snap = entry.snapshot;
-    return this.withPathLock(snap.path, async () => {
+    const lockPaths =
+      snap.kind === "renamed" && snap.previousPath && snap.previousPath !== snap.path
+        ? [snap.path, snap.previousPath].sort()
+        : [snap.path];
+    const runUndo = async (): Promise<string> => {
       if (entry.undone) {
         throw new Error("This mutation has already been undone.");
       }
-      const guard = this.snapshotGuards.get(snap);
-      if (guard && (guard.conflicted || guard.revision !== this.noteRevision(snap.path) ||
-        this.hasPendingWrite(snap.path))) {
-        throw this.undoConflict(snap.path);
+      const guard = this.ledger.getSnapshotGuard(snap);
+      if (
+        guard &&
+        (guard.conflicted ||
+          guard.revision !== this.ledger.noteRevision(snap.path) ||
+          this.ledger.hasPendingWrite(snap.path))
+      ) {
+        throw this.ledger.undoConflict(snap.path);
       }
-      const finishNativeWrite = this.beginNativeWrite([snap.path]);
+      const finishNativeWrite = this.ledger.beginNativeWrite(lockPaths);
       try {
         if (snap.kind === "created") {
           const created = this.app.vault.getAbstractFileByPath(snap.path);
           if (!(created instanceof TFile) || !guard || typeof guard.postContent !== "string") {
-            throw this.undoConflict(snap.path);
+            throw this.ledger.undoConflict(snap.path);
           }
           const persisted = await this.app.vault.read(created);
-          this.assertUndoStillCurrent(snap.path, guard);
-          if (this.app.vault.getAbstractFileByPath(snap.path) !== created || persisted !== guard.postContent ||
-            this.liveSourceViews(snap.path).some((view) => view.editor.getValue() !== guard.postContent)) {
-            throw this.undoConflict(snap.path);
+          this.ledger.assertUndoStillCurrent(snap.path, guard);
+          if (
+            this.app.vault.getAbstractFileByPath(snap.path) !== created ||
+            persisted !== guard.postContent ||
+            this.liveSourceViews(snap.path).some((view) => view.editor.getValue() !== guard.postContent)
+          ) {
+            throw this.ledger.undoConflict(snap.path);
           }
           // Hold the write guard from final validation until the destructive API settles.
-          this.destructiveUndoPaths.add(snap.path);
-          try {
-            await this.trashFileVerified(created, snap.path);
-          } finally {
-            this.destructiveUndoPaths.delete(snap.path);
-          }
-          entry.undone = true;
-          this.notifyAudit();
+          await this.ledger.withDestructiveUndo(snap.path, () =>
+            this.trashFileVerified(created, snap.path)
+          );
+          this.ledger.markEntryUndone(entry);
           return `Moved created note '${snap.path}' to trash.`;
         }
 
         if (snap.kind === "modified" && typeof snap.previousContent === "string") {
           await this.restoreModifiedSnapshot(snap, guard);
-          entry.undone = true;
-          this.notifyAudit();
+          this.ledger.markEntryUndone(entry);
           return `Restored previous content of '${snap.path}'.`;
         }
 
@@ -402,95 +271,82 @@ export class VaultOpsService {
           if (!(current instanceof TFile)) {
             throw new Error(`Renamed note '${snap.path}' is no longer present.`);
           }
+          if (this.app.vault.getAbstractFileByPath(snap.previousPath)) {
+            throw this.ledger.undoConflict(snap.previousPath);
+          }
           await this.ensureParentFolders(snap.previousPath);
           await this.renameFileSafely(current, snap.previousPath, true);
-          entry.undone = true;
-          this.notifyAudit();
+          this.ledger.markEntryUndone(entry);
           return `Renamed '${snap.path}' back to '${snap.previousPath}'.`;
         }
 
         throw new Error("Unsupported snapshot kind.");
       } finally {
-        if (entry.undone) this.noteRevisions.set(snap.path, this.noteRevision(snap.path) + 1);
+        if (entry.undone) {
+          this.ledger.bumpRevisions(lockPaths);
+        }
         finishNativeWrite();
       }
-    });
-  }
-
-  private undoConflict(path: string): BridgeRpcError {
-    return new BridgeRpcError("undo_conflict", `Cannot undo '${path}': another change overlaps or follows this change.`);
-  }
-
-  private noteRevision(path: string): number {
-    return this.noteRevisions.get(path) ?? 0;
-  }
-
-  private hasPendingWrite(path: string): boolean {
-    return (this.commandWrites.get(path) ?? 0) > 0 || (this.nativeWrites.get(path) ?? 0) > 0 ||
-      this.activeUiSnapshots().some((session) => session.path === path);
-  }
-
-  private activeUiSnapshots(): Array<{ path: string; conflicted: boolean }> {
-    return [...this.pendingUiSnapshots, ...this.pendingFileSnapshots];
-  }
-
-  private beginNativeWrite(paths: string[]): () => void {
-    for (const path of paths) this.assertNoDestructiveUndo(path);
-    for (const path of paths) {
-      this.nativeWrites.set(path, (this.nativeWrites.get(path) ?? 0) + 1);
-      for (const session of this.activeUiSnapshots()) {
-        if (session.path === path) {
-          session.conflicted = true;
-        }
-      }
-    }
-    return () => {
-      for (const path of paths) {
-        const count = (this.nativeWrites.get(path) ?? 1) - 1;
-        if (count <= 0) this.nativeWrites.delete(path);
-        else this.nativeWrites.set(path, count);
-      }
     };
+    return this.ledger.withPathLock(lockPaths[0], () =>
+      lockPaths.length > 1 ? this.ledger.withPathLock(lockPaths[1], runUndo) : runUndo()
+    );
+  }
+
+  /**
+   * Page size for metadata results: everything (as in 0.2.x) unless the caller passes a
+   * limit, which is clamped to 1..500.
+   */
+  private optionalPageLimit(raw: unknown): number {
+    if (raw === undefined || raw === null || raw === "") {
+      return Number.POSITIVE_INFINITY;
+    }
+    return this.finiteInt(raw, 500, 1, 500);
+  }
+
+  private finiteInt(raw: unknown, fallback: number, min: number, max?: number): number {
+    const parsed = raw === undefined || raw === null || raw === "" ? fallback : Number(raw);
+    const base = Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+    const clampedMin = Math.max(min, base);
+    return max !== undefined ? Math.min(max, clampedMin) : clampedMin;
   }
 
   private trackNativeWrite(method: string, params: Record<string, unknown>): () => void {
     if (method === "commands.execute") {
-      this.assertNoDestructiveUndo();
+      this.ledger.assertNoDestructiveUndo();
       return () => undefined;
     }
     if (!WRITE_METHODS.has(method) || method.startsWith("workspace.")) {
       return () => undefined;
     }
+    const normalizeTracked = (raw: string): string => {
+      try {
+        return guardVaultRelativePath(raw, {
+          configDirName: this.app.vault.configDir,
+          allowHiddenRead: true,
+          isWrite: false,
+        });
+      } catch {
+        return normalizePath(raw.trim());
+      }
+    };
     const paths = new Set<string>();
     if (typeof params.path === "string") {
-      const path = method === "canvas.upsert_node" && !params.path.endsWith(".canvas")
-        ? `${params.path}.canvas` : params.path;
-      paths.add(normalizePath(path));
+      const trimmed = params.path.trim();
+      const path =
+        method === "canvas.upsert_node" && !trimmed.endsWith(".canvas")
+          ? `${trimmed}.canvas`
+          : trimmed;
+      paths.add(normalizeTracked(path));
     }
-    if (typeof params.newPath === "string") paths.add(normalizePath(params.newPath));
+    if (typeof params.newPath === "string") {
+      paths.add(normalizeTracked(params.newPath));
+    }
     if (method.startsWith("editor.")) {
       const path = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
       if (path) paths.add(path);
     }
-    return this.beginNativeWrite([...paths]);
-  }
-
-  private assertNoDestructiveUndo(path?: string): void {
-    if (path ? this.destructiveUndoPaths.has(path) : this.destructiveUndoPaths.size > 0) {
-      throw new BridgeRpcError("undo_in_progress", "A created-note Undo is in progress; retry the write afterward.");
-    }
-  }
-
-  private fileContentsEqual(path: string, a: string | null | undefined, b: string | null | undefined): boolean {
-    if (a === b) return true;
-    if (!path.endsWith(".canvas") || typeof a !== "string" || typeof b !== "string") return false;
-    try {
-      const left: unknown = JSON.parse(a);
-      const right: unknown = JSON.parse(b);
-      return isDeepStrictEqual(left, right);
-    } catch {
-      return false;
-    }
+    return this.ledger.beginNativeWrite([...paths]);
   }
 
   private viewFileData(view: unknown, path: string): string | undefined {
@@ -516,27 +372,34 @@ export class VaultOpsService {
   }
 
   private async trackCommandChanges(): Promise<() => Promise<void>> {
-    const paths = new Set<string>();
-    for (const entry of this.auditEntries) if (entry.snapshot) paths.add(entry.snapshot.path);
-    for (const session of this.activeUiSnapshots()) paths.add(session.path);
+    const paths = this.ledger.collectTrackedPaths();
     this.app.workspace.iterateAllLeaves((leaf) => {
       const file = (leaf.view as UiFileView).file;
       if (file instanceof TFile) paths.add(file.path);
     });
     const changed = new Set<string>();
     const refs: EventRef[] = [];
-    const observe = (file: { path: string }): void => { changed.add(file.path); };
+    const observe = (file: { path: string }): void => {
+      changed.add(file.path);
+    };
     if (typeof this.app.vault.on === "function") {
-      refs.push(this.app.vault.on("modify", observe), this.app.vault.on("create", observe),
-        this.app.vault.on("delete", observe), this.app.vault.on("rename", (file, oldPath) => {
-          changed.add(oldPath); changed.add(file.path);
-        }));
+      refs.push(
+        this.app.vault.on("modify", observe),
+        this.app.vault.on("create", observe),
+        this.app.vault.on("delete", observe),
+        this.app.vault.on("rename", (file, oldPath) => {
+          changed.add(oldPath);
+          changed.add(file.path);
+        })
+      );
     }
-    for (const path of paths) this.commandWrites.set(path, (this.commandWrites.get(path) ?? 0) + 1);
+    const finishCommandWrites = this.ledger.beginCommandWrites(paths);
     const before = new Map<string, CommandFileState | null>();
-    await Promise.all([...paths].map(async (path) => {
-      before.set(path, await this.commandFileState(path).catch(() => null));
-    }));
+    await Promise.all(
+      [...paths].map(async (path) => {
+        before.set(path, await this.commandFileState(path).catch(() => null));
+      })
+    );
     let completed = false;
     return async () => {
       if (completed) return;
@@ -545,22 +408,24 @@ export class VaultOpsService {
         for (const path of new Set([...paths, ...changed])) {
           const previous = before.get(path);
           const current = await this.commandFileState(path).catch(() => null);
-          const sameLogicalContent = previous && current &&
-            this.fileContentsEqual(path, previous.content, current.content);
-          const ownBufferFlushed = current && this.fileContentsEqual(path, current.disk, current.content);
-          if (!previous || !current || previous.file !== current.file || !sameLogicalContent ||
-            (!this.fileContentsEqual(path, previous.disk, current.disk) && !ownBufferFlushed)) {
-            this.noteRevisions.set(path, this.noteRevision(path) + 1);
-            for (const session of this.activeUiSnapshots()) if (session.path === path) session.conflicted = true;
+          const sameLogicalContent =
+            previous && current && fileContentsEqual(path, previous.content, current.content);
+          const ownBufferFlushed =
+            current && fileContentsEqual(path, current.disk, current.content);
+          if (
+            !previous ||
+            !current ||
+            previous.file !== current.file ||
+            !sameLogicalContent ||
+            (!fileContentsEqual(path, previous.disk, current.disk) && !ownBufferFlushed)
+          ) {
+            this.ledger.bumpRevision(path);
+            this.ledger.markUiSnapshotsConflicted(path);
           }
         }
       } finally {
         for (const ref of refs) this.app.vault.offref(ref);
-        for (const path of paths) {
-          const count = (this.commandWrites.get(path) ?? 1) - 1;
-          if (count <= 0) this.commandWrites.delete(path);
-          else this.commandWrites.set(path, count);
-        }
+        finishCommandWrites();
       }
     };
   }
@@ -568,55 +433,64 @@ export class VaultOpsService {
   private liveSourceViews(path: string): MarkdownView[] {
     const views: MarkdownView[] = [];
     this.app.workspace.iterateAllLeaves((leaf) => {
-      if (leaf.view instanceof MarkdownView && leaf.view.file?.path === path && leaf.view.getMode() === "source") {
+      if (
+        leaf.view instanceof MarkdownView &&
+        leaf.view.file?.path === path &&
+        leaf.view.getMode() === "source"
+      ) {
         views.push(leaf.view);
       }
     });
     return views;
   }
 
-  private assertUndoStillCurrent(path: string, guard: SnapshotGuard): void {
-    if (guard.revision !== this.noteRevision(path) || (this.commandWrites.get(path) ?? 0) > 0 ||
-      (this.nativeWrites.get(path) ?? 0) > 1 ||
-      this.activeUiSnapshots().some((session) => session.path === path)) {
-      throw this.undoConflict(path);
-    }
-  }
-
-  private async restoreModifiedSnapshot(snap: VaultMutationSnapshot, guard?: SnapshotGuard): Promise<void> {
+  private async restoreModifiedSnapshot(
+    snap: VaultMutationSnapshot,
+    guard?: SnapshotGuard
+  ): Promise<void> {
     const restored = snap.previousContent;
     if (typeof restored !== "string" || !guard || guard.postContent === undefined) {
-      throw this.undoConflict(snap.path);
+      throw this.ledger.undoConflict(snap.path);
     }
     const existing = this.app.vault.getAbstractFileByPath(snap.path);
     const fileView = guard.fileView?.deref();
-    if (existing instanceof TFile && fileView?.file?.path === snap.path &&
-      fileView.containerEl?.isConnected !== false && typeof guard.postContent === "string") {
+    if (
+      existing instanceof TFile &&
+      fileView?.file?.path === snap.path &&
+      fileView.containerEl?.isConnected !== false &&
+      typeof guard.postContent === "string"
+    ) {
       await this.restoreFileViewSnapshot(snap, guard, existing, fileView);
       return;
     }
     if (guard.postContent === null) {
-      if (existing) throw this.undoConflict(snap.path);
+      if (existing) throw this.ledger.undoConflict(snap.path);
       await this.ensureParentFolders(snap.path);
       await this.app.vault.create(snap.path, restored);
     } else {
-      if (!(existing instanceof TFile)) throw this.undoConflict(snap.path);
+      if (!(existing instanceof TFile)) throw this.ledger.undoConflict(snap.path);
       const live = this.liveSourceViews(snap.path);
       if (live.length > 0) {
         const persisted = await this.app.vault.read(existing);
-        this.assertUndoStillCurrent(snap.path, guard);
+        this.ledger.assertUndoStillCurrent(snap.path, guard);
         const currentLive = this.liveSourceViews(snap.path);
-        if ((persisted !== restored && persisted !== guard.postContent) || currentLive.length === 0 ||
-          currentLive.some((view) => view.editor.getValue() !== guard.postContent)) {
-          throw this.undoConflict(snap.path);
+        if (
+          (persisted !== restored && persisted !== guard.postContent) ||
+          currentLive.length === 0 ||
+          currentLive.some((view) => view.editor.getValue() !== guard.postContent)
+        ) {
+          throw this.ledger.undoConflict(snap.path);
         }
         // No await between validating the live buffers and replacing the owned change.
         for (const view of currentLive) view.editor.setValue(restored);
       } else {
         await this.app.vault.process(existing, (current) => {
-          this.assertUndoStillCurrent(snap.path, guard);
-          if (!this.fileContentsEqual(snap.path, current, guard.postContent) || this.liveSourceViews(snap.path).length > 0) {
-            throw this.undoConflict(snap.path);
+          this.ledger.assertUndoStillCurrent(snap.path, guard);
+          if (
+            !fileContentsEqual(snap.path, current, guard.postContent) ||
+            this.liveSourceViews(snap.path).length > 0
+          ) {
+            throw this.ledger.undoConflict(snap.path);
           }
           return restored;
         });
@@ -625,60 +499,52 @@ export class VaultOpsService {
   }
 
   private async restoreFileViewSnapshot(
-    snap: VaultMutationSnapshot, guard: SnapshotGuard, file: TFile, view: UiFileView
+    snap: VaultMutationSnapshot,
+    guard: SnapshotGuard,
+    file: TFile,
+    view: UiFileView
   ): Promise<void> {
     const restored = snap.previousContent;
-    if (typeof restored !== "string" || (!view.setViewData && !view.canvas?.setData)) throw this.undoConflict(snap.path);
+    if (typeof restored !== "string" || (!view.setViewData && !view.canvas?.setData)) {
+      throw this.ledger.undoConflict(snap.path);
+    }
     const persisted = await this.app.vault.read(file);
-    this.assertUndoStillCurrent(snap.path, guard);
-    if (this.app.vault.getAbstractFileByPath(snap.path) !== file || view.file?.path !== snap.path ||
-      !this.fileContentsEqual(snap.path, this.viewFileData(view, snap.path), guard.postContent) ||
-      (!this.fileContentsEqual(snap.path, persisted, guard.postContent) &&
-        !this.fileContentsEqual(snap.path, persisted, restored))) throw this.undoConflict(snap.path);
-    this.destructiveUndoPaths.add(snap.path);
-    try {
+    this.ledger.assertUndoStillCurrent(snap.path, guard);
+    if (
+      this.app.vault.getAbstractFileByPath(snap.path) !== file ||
+      view.file?.path !== snap.path ||
+      !fileContentsEqual(snap.path, this.viewFileData(view, snap.path), guard.postContent) ||
+      (!fileContentsEqual(snap.path, persisted, guard.postContent) &&
+        !fileContentsEqual(snap.path, persisted, restored))
+    ) {
+      throw this.ledger.undoConflict(snap.path);
+    }
+    await this.ledger.withDestructiveUndo(snap.path, async () => {
       await this.app.vault.process(file, (current) => {
-        this.assertUndoStillCurrent(snap.path, guard);
-        if (!this.fileContentsEqual(snap.path, current, persisted) || view.file?.path !== snap.path ||
-          !this.fileContentsEqual(snap.path, this.viewFileData(view, snap.path), guard.postContent)) {
-          throw this.undoConflict(snap.path);
+        this.ledger.assertUndoStillCurrent(snap.path, guard);
+        if (
+          !fileContentsEqual(snap.path, current, persisted) ||
+          view.file?.path !== snap.path ||
+          !fileContentsEqual(snap.path, this.viewFileData(view, snap.path), guard.postContent)
+        ) {
+          throw this.ledger.undoConflict(snap.path);
         }
         return restored;
       });
-      if (view.file?.path !== snap.path) throw this.undoConflict(snap.path);
+      if (view.file?.path !== snap.path) throw this.ledger.undoConflict(snap.path);
       const current = this.viewFileData(view, snap.path);
-      if (!this.fileContentsEqual(snap.path, current, restored)) {
-        if (!this.fileContentsEqual(snap.path, current, guard.postContent)) throw this.undoConflict(snap.path);
+      if (!fileContentsEqual(snap.path, current, restored)) {
+        if (!fileContentsEqual(snap.path, current, guard.postContent)) {
+          throw this.ledger.undoConflict(snap.path);
+        }
         if (snap.path.endsWith(".canvas") && view.canvas?.setData) {
           const data: unknown = JSON.parse(restored);
           view.canvas.setData(data);
-        } else if (view.setViewData) view.setViewData(restored, false);
+        } else if (view.setViewData) {
+          view.setViewData(restored, false);
+        }
       }
-    } finally {
-      this.destructiveUndoPaths.delete(snap.path);
-    }
-  }
-
-  private isMethodPermitted(method: string, mode: VaultPermissionMode): boolean {
-    if (mode === "off") {
-      return false;
-    }
-    if (READ_METHODS.has(method)) {
-      return true;
-    }
-    if (WRITE_METHODS.has(method)) {
-      return mode === "read-write" || mode === "full";
-    }
-    if (FULL_METHODS.has(method)) {
-      return mode === "full";
-    }
-    if (UI_OBSERVE_METHODS.has(method)) {
-      return true;
-    }
-    if (UI_INPUT_METHODS.has(method)) {
-      return mode === "full";
-    }
-    return false;
+    });
   }
 
   private async pointAtUiResult(
@@ -704,7 +570,12 @@ export class VaultOpsService {
     }
     if (method === "ui.screenshot") {
       const shot = await ui.screenshot(params);
-      this.recordAudit({ method, caller, allowed: true, summary: "Captured a screenshot of the Obsidian window." });
+      this.ledger.recordAudit({
+        method,
+        caller,
+        allowed: true,
+        summary: "Captured a screenshot of the Obsidian window.",
+      });
       return shot;
     }
     if (method === "ui.inspect") {
@@ -750,7 +621,7 @@ export class VaultOpsService {
       summary = `Executed ${stepCount} UI batch steps in the Obsidian window.`;
     }
 
-    this.recordAudit({
+    this.ledger.recordAudit({
       method,
       caller,
       allowed: true,
@@ -760,13 +631,23 @@ export class VaultOpsService {
   }
 
   /** Called by the UI service inside its input lock, with the actual target editor. */
-  captureUiMutation(context: UiMutationContext, targetView?: unknown): MutationCompleteCallback | Promise<MutationCompleteCallback> {
-    this.assertNoDestructiveUndo();
-    if (context.expectedFileOperation?.kind === "trash") return this.captureFileUiMutation(context, null, true);
+  captureUiMutation(
+    context: UiMutationContext,
+    targetView?: unknown
+  ): MutationCompleteCallback | Promise<MutationCompleteCallback> {
+    this.ledger.assertNoDestructiveUndo();
+    if (context.expectedFileOperation?.kind === "trash") {
+      return this.captureFileUiMutation(context, null, true);
+    }
     const supplied = context.targetView ?? targetView;
     if (supplied && !(supplied instanceof MarkdownView)) {
       if ((supplied as UiFileView).file) return this.captureFileUiMutation(context, supplied);
-      if (context.notePath) throw new BridgeRpcError("ui_snapshot_unavailable", "The original file view is no longer available.");
+      if (context.notePath) {
+        throw new BridgeRpcError(
+          "ui_snapshot_unavailable",
+          "The original file view is no longer available."
+        );
+      }
       return () => undefined;
     }
     const notePath = context.notePath;
@@ -775,9 +656,17 @@ export class VaultOpsService {
     }
     const suppliedView = context.targetView;
     if (suppliedView !== undefined && !(suppliedView instanceof MarkdownView)) {
-      throw new BridgeRpcError("ui_snapshot_unavailable", "The original Markdown view cannot be verified.");
+      throw new BridgeRpcError(
+        "ui_snapshot_unavailable",
+        "The original Markdown view cannot be verified."
+      );
     }
-    let view = suppliedView instanceof MarkdownView ? suppliedView : targetView instanceof MarkdownView ? targetView : null;
+    let view =
+      suppliedView instanceof MarkdownView
+        ? suppliedView
+        : targetView instanceof MarkdownView
+          ? targetView
+          : null;
     if (!view) {
       this.app.workspace.iterateAllLeaves((leaf) => {
         if (view) {
@@ -786,7 +675,8 @@ export class VaultOpsService {
         const candidate = leaf.view;
         const paneId = (leaf as unknown as { id?: string }).id;
         if (
-          candidate instanceof MarkdownView && candidate.file?.path === notePath &&
+          candidate instanceof MarkdownView &&
+          candidate.file?.path === notePath &&
           (!context.paneId || paneId === context.paneId)
         ) {
           view = candidate;
@@ -798,33 +688,43 @@ export class VaultOpsService {
       return () => undefined;
     }
     if (view.file?.path !== notePath) {
-      throw new BridgeRpcError("ui_snapshot_unavailable", `Cannot capture the target editor for '${notePath}'.`);
+      throw new BridgeRpcError(
+        "ui_snapshot_unavailable",
+        `Cannot capture the target editor for '${notePath}'.`
+      );
     }
     if (context.targetCm && (view.editor as unknown as { cm?: unknown }).cm !== context.targetCm) {
-      throw new BridgeRpcError("ui_snapshot_unavailable", `The original editor for '${notePath}' changed.`);
+      throw new BridgeRpcError(
+        "ui_snapshot_unavailable",
+        `The original editor for '${notePath}' changed.`
+      );
     }
     const editorView = view;
     // Only nested helpers for this caller and action share a change record.
-    let session = [...this.pendingUiSnapshots].find((pending) => pending.view === editorView &&
-      pending.path === notePath && pending.context.caller === context.caller &&
-      pending.context.action === context.action);
+    let session = this.ledger.findPendingUiSnapshot(
+      editorView,
+      notePath,
+      context.caller,
+      context.action
+    );
     if (session) {
       session.depth++;
     } else {
       session = {
-        context, view: editorView, editor: editorView.editor, cm: context.targetCm, path: notePath,
-        before: editorView.getMode() === "source" ? editorView.editor.getValue() : editorView.getViewData(),
-        revision: this.noteRevision(notePath),
-        conflicted: (this.nativeWrites.get(notePath) ?? 0) > 0,
+        context,
+        view: editorView,
+        editor: editorView.editor,
+        cm: context.targetCm,
+        path: notePath,
+        before:
+          editorView.getMode() === "source"
+            ? editorView.editor.getValue()
+            : editorView.getViewData(),
+        revision: this.ledger.noteRevision(notePath),
+        conflicted: this.ledger.getNativeWriteCount(notePath) > 0,
         depth: 1,
       };
-      for (const pending of this.activeUiSnapshots()) {
-        if (pending.path === notePath) {
-          pending.conflicted = true;
-          session.conflicted = true;
-        }
-      }
-      this.pendingUiSnapshots.add(session);
+      this.ledger.addPendingUiSnapshot(session);
     }
     const captured = session;
     let completed = false;
@@ -835,7 +735,9 @@ export class VaultOpsService {
       completed = true;
       if (--captured.depth > 0) return;
       try {
-        const sameEditor = editorView.file?.path === notePath && editorView.editor === captured.editor &&
+        const sameEditor =
+          editorView.file?.path === notePath &&
+          editorView.editor === captured.editor &&
           (!captured.cm || (editorView.editor as unknown as { cm?: unknown }).cm === captured.cm);
         let partialContent: string | undefined;
         if (completion?.abortedAfterNoteSwitch && completion.edits?.length) {
@@ -843,8 +745,14 @@ export class VaultOpsService {
           let inserted = 0;
           let valid = true;
           for (const edit of completion.edits) {
-            if (!Number.isInteger(edit.from) || !Number.isInteger(edit.to) ||
-              edit.from < 0 || edit.to < edit.from || edit.to > text.length || typeof edit.insert !== "string") {
+            if (
+              !Number.isInteger(edit.from) ||
+              !Number.isInteger(edit.to) ||
+              edit.from < 0 ||
+              edit.to < edit.from ||
+              edit.to > text.length ||
+              typeof edit.insert !== "string"
+            ) {
               valid = false;
               break;
             }
@@ -853,21 +761,29 @@ export class VaultOpsService {
           }
           if (valid && inserted === completion.insertedChars) partialContent = text;
         }
-        const unverifiedPartial = Boolean(completion?.abortedAfterNoteSwitch &&
-          (completion.insertedChars ?? 0) > 0 && partialContent === undefined);
+        const unverifiedPartial = Boolean(
+          completion?.abortedAfterNoteSwitch &&
+            (completion.insertedChars ?? 0) > 0 &&
+            partialContent === undefined
+        );
         let postContent: string | undefined;
         try {
-          postContent = unverifiedPartial ? undefined : partialContent ?? (sameEditor
-            ? editorView.getMode() === "source" ? captured.editor.getValue() : editorView.getViewData()
-            : await this.app.vault.read(this.requireFile(notePath)));
+          postContent = unverifiedPartial
+            ? undefined
+            : partialContent ??
+              (sameEditor
+                ? editorView.getMode() === "source"
+                  ? captured.editor.getValue()
+                  : editorView.getViewData()
+                : await this.app.vault.read(this.requireFile(notePath)));
           if (!sameEditor && partialContent === undefined) captured.conflicted = true;
         } catch {
           // Preserve the partial-operation audit without replacing its original failure.
           captured.conflicted = true;
         }
         if (postContent === captured.before && !unverifiedPartial) return;
-        this.pendingUiSnapshots.delete(captured);
-        this.recordAudit({
+        this.ledger.deletePendingUiSnapshot(captured);
+        this.ledger.recordAudit({
           method: `ui.${context.action}`,
           caller: context.caller,
           targetPath: notePath,
@@ -875,67 +791,109 @@ export class VaultOpsService {
           summary: `${completion?.ok === false ? "Partially changed" : "Changed"} '${notePath}' via ${context.action}${context.paneId ? ` in pane '${context.paneId}'` : ""}.${unverifiedPartial ? ` ${completion?.insertedChars ?? 0} characters reported; final content unverified.` : ""}`,
           snapshot: { kind: "modified", path: notePath, previousContent: captured.before },
           postContent,
-          snapshotConflicted: captured.conflicted || captured.revision !== this.noteRevision(notePath),
+          snapshotConflicted:
+            captured.conflicted || captured.revision !== this.ledger.noteRevision(notePath),
         });
       } finally {
-        this.pendingUiSnapshots.delete(captured);
+        this.ledger.deletePendingUiSnapshot(captured);
       }
     };
   }
 
   private async captureFileUiMutation(
-    context: UiMutationContext, view: UiFileView | null, trash = false
+    context: UiMutationContext,
+    view: UiFileView | null,
+    trash = false
   ): Promise<MutationCompleteCallback> {
     const viewPath = view?.file?.path ?? null;
     const isBases = viewPath?.endsWith(".base") || view?.getViewType?.() === "bases";
-    const path = this.safePath(trash ? context.expectedFileOperation?.path : context.targetFilePath ?? viewPath, true);
+    const path = this.safePath(
+      trash ? context.expectedFileOperation?.path : context.targetFilePath ?? viewPath,
+      true
+    );
     if (isBases && (!context.targetFilePath || path === viewPath || !path.endsWith(".md"))) {
-      throw new BridgeRpcError("ui_snapshot_unavailable", "Cannot verify the Bases row note for this edit.");
+      throw new BridgeRpcError(
+        "ui_snapshot_unavailable",
+        "Cannot verify the Bases row note for this edit."
+      );
     }
     if (view && context.notePath && viewPath !== context.notePath) {
-      throw new BridgeRpcError("ui_snapshot_unavailable", "The original file view changed before capture.");
+      throw new BridgeRpcError(
+        "ui_snapshot_unavailable",
+        "The original file view changed before capture."
+      );
     }
     const file = this.requireFile(path);
-    const revision = this.noteRevision(path);
-    const card = path === viewPath && path.endsWith(".canvas") &&
-      (context.action === "type" || context.action === "press_key") ? findCanvasCardNode(context.targetElement) : null;
+    const revision = this.ledger.noteRevision(path);
+    const card =
+      path === viewPath &&
+      path.endsWith(".canvas") &&
+      (context.action === "type" || context.action === "press_key")
+        ? findCanvasCardNode(context.targetElement)
+        : null;
     const flushCard = (): void => {
-      if (view && card && card.isConnected !== false && view.file?.path === viewPath &&
-        findCanvasCardNode(context.targetElement) === card) {
+      if (
+        view &&
+        card &&
+        card.isConnected !== false &&
+        view.file?.path === viewPath &&
+        findCanvasCardNode(context.targetElement) === card
+      ) {
         commitCanvasCardModel(view, context.targetElement, context.targetCm);
       }
     };
     // Keep pre-existing child-editor text in the preimage, even before its debounce saves.
     flushCard();
-    const before = this.viewFileData(view, path) ?? await this.app.vault.read(file);
-    if (this.app.vault.getAbstractFileByPath(path) !== file || view?.file?.path !== viewPath && view) {
-      throw new BridgeRpcError("ui_snapshot_unavailable", "The target file changed before capture.");
+    const before = this.viewFileData(view, path) ?? (await this.app.vault.read(file));
+    if (
+      this.app.vault.getAbstractFileByPath(path) !== file ||
+      (view?.file?.path !== viewPath && view)
+    ) {
+      throw new BridgeRpcError(
+        "ui_snapshot_unavailable",
+        "The target file changed before capture."
+      );
     }
-    this.assertNoDestructiveUndo();
-    const session: FileUiSnapshotSession = { context, path, view, viewPath, before, revision,
-      conflicted: revision !== this.noteRevision(path) || this.hasPendingWrite(path), depth: 1 };
-    for (const pending of this.activeUiSnapshots()) if (pending.path === path) pending.conflicted = true;
-    this.pendingFileSnapshots.add(session);
+    this.ledger.assertNoDestructiveUndo();
+    const session: FileUiSnapshotSession = {
+      context,
+      path,
+      view,
+      viewPath,
+      before,
+      revision,
+      conflicted:
+        revision !== this.ledger.noteRevision(path) || this.ledger.hasPendingWrite(path),
+      depth: 1,
+    };
+    this.ledger.addPendingFileSnapshot(session);
     let completed = false;
     return async (completion) => {
       if (completed) return;
       completed = true;
       try {
-        if (!session.conflicted && revision === this.noteRevision(path)) flushCard();
+        if (!session.conflicted && revision === this.ledger.noteRevision(path)) flushCard();
         let postContent: string | null = before;
         const deadline = Date.now() + (trash ? 1000 : 350);
         do {
           const current = this.app.vault.getAbstractFileByPath(path);
           if (!current) postContent = null;
-          else if (current === file) postContent = this.viewFileData(view, path) ?? await this.app.vault.read(file);
-          else { session.conflicted = true; break; }
+          else if (current === file) {
+            postContent = this.viewFileData(view, path) ?? (await this.app.vault.read(file));
+          } else {
+            session.conflicted = true;
+            break;
+          }
           if (trash ? postContent === null : postContent !== before) break;
           if (completion?.ok === false || (!trash && context.action === "click")) break;
           if (Date.now() >= deadline) break;
           await delay(20);
         } while (Date.now() < deadline);
         if (trash && completion?.ok !== false && postContent !== null) {
-          throw new BridgeRpcError("ui_effect_failed", `Deletion of '${path}' was not confirmed: the file is still present. Obsidian may have failed to move it to the configured trash.`);
+          throw new BridgeRpcError(
+            "ui_effect_failed",
+            `Deletion of '${path}' was not confirmed: the file is still present. Obsidian may have failed to move it to the configured trash.`
+          );
         }
         if (postContent === before) return;
         if (view && view.file?.path !== viewPath) session.conflicted = true;
@@ -943,55 +901,48 @@ export class VaultOpsService {
         if (view && path === viewPath && path.endsWith(".canvas") && postContent !== null) {
           try {
             // A live card model can lead the debounced TextFileView save.
-            if (session.conflicted || revision !== this.noteRevision(path)) {
+            if (session.conflicted || revision !== this.ledger.noteRevision(path)) {
               throw new Error("Another write overlaps this Canvas edit.");
             }
             view.canvas?.requestSave?.(false);
             if (view.save) await view.save(false);
             const persisted = await this.app.vault.read(file);
-            if (this.app.vault.getAbstractFileByPath(path) !== file || view.file?.path !== viewPath ||
-              !this.fileContentsEqual(path, this.viewFileData(view, path), postContent) ||
-              revision !== this.noteRevision(path)) {
+            if (
+              this.app.vault.getAbstractFileByPath(path) !== file ||
+              view.file?.path !== viewPath ||
+              !fileContentsEqual(path, this.viewFileData(view, path), postContent) ||
+              revision !== this.ledger.noteRevision(path)
+            ) {
               session.conflicted = true;
               throw new Error("The Canvas target changed while saving.");
             }
-            if (!this.fileContentsEqual(path, persisted, postContent)) {
+            if (!fileContentsEqual(path, persisted, postContent)) {
               throw new Error("The Canvas model has not been persisted.");
             }
           } catch {
-            effectError = new BridgeRpcError("ui_effect_failed", `The edit to '${path}' could not be verified as saved. Partial changes are retained in the audit log.`);
+            effectError = new BridgeRpcError(
+              "ui_effect_failed",
+              `The edit to '${path}' could not be verified as saved. Partial changes are retained in the audit log.`
+            );
           }
         }
-        this.pendingFileSnapshots.delete(session);
-        this.recordAudit({ method: `ui.${context.action}`, caller: context.caller, targetPath: path, allowed: true,
+        this.ledger.deletePendingFileSnapshot(session);
+        this.ledger.recordAudit({
+          method: `ui.${context.action}`,
+          caller: context.caller,
+          targetPath: path,
+          allowed: true,
           summary: `${trash ? "Deleted" : "Changed"} '${path}' via ${context.action}.`,
-          snapshot: { kind: "modified", path, previousContent: before }, postContent,
-          snapshotConflicted: session.conflicted || revision !== this.noteRevision(path),
-          fileView: view && viewPath === path ? view : undefined });
+          snapshot: { kind: "modified", path, previousContent: before },
+          postContent,
+          snapshotConflicted: session.conflicted || revision !== this.ledger.noteRevision(path),
+          fileView: view && viewPath === path ? view : undefined,
+        });
         if (effectError && completion?.ok !== false) throw effectError;
       } finally {
-        this.pendingFileSnapshots.delete(session);
+        this.ledger.deletePendingFileSnapshot(session);
       }
     };
-  }
-
-  private withPathLock<T>(pathKey: string, task: () => Promise<T>): Promise<T> {
-    const prev = this.pathQueues.get(pathKey) ?? Promise.resolve();
-    const run = prev.then(task, task);
-    const tail = run.then(
-      () => {
-        if (this.pathQueues.get(pathKey) === tail) {
-          this.pathQueues.delete(pathKey);
-        }
-      },
-      () => {
-        if (this.pathQueues.get(pathKey) === tail) {
-          this.pathQueues.delete(pathKey);
-        }
-      }
-    );
-    this.pathQueues.set(pathKey, tail);
-    return run;
   }
 
   private notifyActivity(
@@ -1002,9 +953,10 @@ export class VaultOpsService {
     afterContent?: string
   ): void {
     try {
-      const change = beforeContent !== undefined && afterContent !== undefined
-        ? editedTextRange(beforeContent, afterContent)
-        : undefined;
+      const change =
+        beforeContent !== undefined && afterContent !== undefined
+          ? editedTextRange(beforeContent, afterContent)
+          : undefined;
       this.onAgentActivity?.(caller, targetPath, action, change);
     } catch {
       // Visual cursor notifications must never fail a vault operation.
@@ -1017,37 +969,42 @@ export class VaultOpsService {
       allowHiddenRead: this.getAllowHiddenReads(),
       isWrite,
     });
-    return normalizePath(validated);
+    const normalized = normalizePath(validated);
+    const vaultBase = this.getVaultBasePath();
+    if (vaultBase) {
+      assertNoSymlinkEscape(vaultBase, normalized);
+    }
+    return normalized;
   }
 
-  private isExcludedFromScan(relPath: string, explicitFolderPrefix = ""): boolean {
-    const norm = relPath.replace(/\\/g, "/");
-    if (explicitFolderPrefix && norm.startsWith(explicitFolderPrefix)) {
-      return false;
-    }
-    const cfgDir = this.app.vault.configDir ? normalizePath(this.app.vault.configDir) : "";
-    if (cfgDir && (norm === cfgDir || norm.startsWith(`${cfgDir}/`))) {
-      return true;
-    }
-    if (/(?:^|\/)(?:\.git|node_modules)(?:\/|$)/.test(norm)) {
-      return true;
-    }
+  private isExcluded(relPath: string, explicitFolderPrefix = ""): boolean {
     const mc = this.app.metadataCache as unknown as {
       isUserIgnored?: (path: string) => boolean;
     };
-    if (typeof mc.isUserIgnored === "function" && mc.isUserIgnored(norm)) {
-      return true;
-    }
-    return false;
+    return isExcludedFromScan(relPath, {
+      configDir: this.app.vault.configDir,
+      allowHiddenReads: this.getAllowHiddenReads(),
+      explicitFolderPrefix,
+      isUserIgnored:
+        typeof mc.isUserIgnored === "function"
+          ? (normPath: string) => Boolean(mc.isUserIgnored?.(normPath))
+          : undefined,
+    });
   }
 
   private async executeMethod(
     method: string,
     params: Record<string, unknown>,
-    caller: string
+    caller: string,
+    isAbandoned?: () => boolean
   ): Promise<unknown> {
     if (method.startsWith("ui.")) {
-      return this.executeUiMethod(method, params, caller);
+      const ui = this.uiControl;
+      // UI actions wait in one queue; one whose agent has hung up must not run later
+      // (a late or duplicate click after the agent was told it failed).
+      return ui && isAbandoned
+        ? ui.runForRequest(isAbandoned, () => this.executeUiMethod(method, params, caller))
+        : this.executeUiMethod(method, params, caller);
     }
     switch (method) {
       case "bridge.ping":
@@ -1060,12 +1017,12 @@ export class VaultOpsService {
       case "vault.info": {
         const mdFiles = this.app.vault
           .getMarkdownFiles()
-          .filter((file) => !this.isExcludedFromScan(file.path));
+          .filter((file) => !this.isExcluded(file.path));
         const allFiles = this.app.vault
           .getFiles()
-          .filter((file) => !this.isExcludedFromScan(file.path));
+          .filter((file) => !this.isExcluded(file.path));
         const activeFile = this.app.workspace.getActiveFile();
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           allowed: true,
@@ -1088,10 +1045,13 @@ export class VaultOpsService {
       }
 
       case "vault.list_files": {
-        const folderPrefix =
-          typeof params.folder === "string" && params.folder.trim()
-            ? normalizePath(params.folder.trim().replace(/^\/+|\/+$/g, "")) + "/"
-            : "";
+        let folderPrefix = "";
+        if (typeof params.folder === "string" && params.folder.trim()) {
+          const cleanedFolder = params.folder.trim().replace(/^\/+|\/+$/g, "");
+          if (cleanedFolder && cleanedFolder !== ".") {
+            folderPrefix = `${this.safePath(cleanedFolder, false)}/`;
+          }
+        }
         const extFilter =
           typeof params.extension === "string" && params.extension.trim()
             ? params.extension.trim().replace(/^\./, "").toLowerCase()
@@ -1100,9 +1060,10 @@ export class VaultOpsService {
           typeof params.tag === "string" && params.tag.trim()
             ? params.tag.trim().replace(/^#/, "").toLowerCase()
             : "";
-        const limit = Math.min(1000, Math.max(1, Number(params.limit || 250)));
+        const limit = this.finiteInt(params.limit, 250, 1, 1000);
+        const offset = this.finiteInt(params.offset, 0, 0);
 
-        const matched: Array<{
+        const allMatched: Array<{
           path: string;
           basename: string;
           extension: string;
@@ -1111,7 +1072,7 @@ export class VaultOpsService {
         }> = [];
 
         for (const file of this.app.vault.getFiles()) {
-          if (this.isExcludedFromScan(file.path, folderPrefix)) {
+          if (this.isExcluded(file.path, folderPrefix)) {
             continue;
           }
           if (folderPrefix && !file.path.startsWith(folderPrefix)) {
@@ -1135,26 +1096,32 @@ export class VaultOpsService {
               continue;
             }
           }
-          matched.push({
+          allMatched.push({
             path: file.path,
             basename: file.basename,
             extension: file.extension,
             size: file.stat.size,
             mtime: file.stat.mtime,
           });
-          if (matched.length >= limit) {
-            break;
-          }
         }
 
-        this.recordAudit({
+        const total = allMatched.length;
+        const matched = allMatched.slice(offset, offset + limit);
+
+        this.ledger.recordAudit({
           method,
           caller,
           targetPath: folderPrefix || "/",
           allowed: true,
-          summary: `Listed ${matched.length} vault files.`,
+          summary: `Listed ${matched.length}/${total} vault files.`,
         });
-        return { files: matched, count: matched.length };
+        return {
+          files: matched,
+          count: matched.length,
+          total,
+          offset,
+          truncated: offset + matched.length < total,
+        };
       }
 
       case "vault.read_note": {
@@ -1164,17 +1131,49 @@ export class VaultOpsService {
         const buffers: Array<{ view: MarkdownView; content: string }> = [];
         this.app.workspace.iterateAllLeaves((leaf) => {
           const view = leaf.view;
-          if (view instanceof MarkdownView && view.file?.path === relPath && view.getMode() === "source") {
+          if (
+            view instanceof MarkdownView &&
+            view.file?.path === relPath &&
+            view.getMode() === "source"
+          ) {
             buffers.push({ view, content: view.editor.getValue() });
           }
         });
         // Prefer the focused split if several editors display this note.
         const live = buffers.find((buffer) => buffer.view === activeView) ?? buffers[0];
-        const content = live ? live.content : await this.app.vault.cachedRead(file);
-        const cache = this.app.metadataCache.getFileCache(file);
-        const backlinks = this.collectBacklinksForPath(file.path);
+        const fullContent = live ? live.content : await this.app.vault.cachedRead(file);
+        const offsetLine = this.finiteInt(params.offsetLine, 0, 0);
+        // Absent, null or empty limits mean "no limit": by default the whole
+        // note is returned, because agents often read, edit and write back.
+        const optionalLimit = (raw: unknown, min: number): number | null => {
+          if (raw === undefined || raw === null || raw === "") {
+            return null;
+          }
+          const parsed = Number(raw);
+          return Number.isFinite(parsed) ? Math.max(min, Math.floor(parsed)) : null;
+        };
+        const maxLines = optionalLimit(params.maxLines, 1);
+        const maxChars = optionalLimit(params.maxChars, 256);
 
-        this.recordAudit({
+        let content = fullContent;
+        let truncated = false;
+        if (offsetLine > 0 || maxLines !== null) {
+          // Split after each newline so CRLF and LF endings survive the slice.
+          const lines = fullContent.split(/(?<=\n)/);
+          const endLine = maxLines !== null ? offsetLine + maxLines : lines.length;
+          content = lines.slice(offsetLine, endLine).join("");
+          truncated = endLine < lines.length || offsetLine > 0;
+        }
+        if (maxChars !== null && content.length > maxChars) {
+          content = content.slice(0, maxChars);
+          truncated = true;
+        }
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        const allBacklinks = this.collectBacklinksForPath(file.path);
+        const backlinks = allBacklinks;
+
+        this.ledger.recordAudit({
           method,
           caller,
           targetPath: file.path,
@@ -1185,11 +1184,12 @@ export class VaultOpsService {
         return {
           path: file.path,
           basename: file.basename,
-          size: Buffer.byteLength(content, "utf8"),
+          size: Buffer.byteLength(fullContent, "utf8"),
           mtime: file.stat.mtime,
           content,
+          truncated,
           source: live ? "editor" : "vault",
-          conflictingBuffers: buffers.some((buffer) => buffer.content !== content),
+          conflictingBuffers: buffers.some((buffer) => buffer.content !== fullContent),
           metadataSource: "cache",
           frontmatter: cache?.frontmatter ?? null,
           headings: (cache?.headings || []).map((h) => ({
@@ -1204,6 +1204,7 @@ export class VaultOpsService {
             line: l.position.start.line + 1,
           })),
           backlinks,
+          backlinksTotal: allBacklinks.length,
         };
       }
 
@@ -1213,87 +1214,167 @@ export class VaultOpsService {
           throw new BridgeRpcError("invalid_params", "Search 'query' must be non-empty.");
         }
         const needle = query.toLowerCase();
-        const maxResults = Math.min(100, Math.max(1, Number(params.limit || 25)));
+        const maxResults = this.finiteInt(params.limit, 25, 1, 100);
         const hits: Array<{
           path: string;
           score: number;
           matches: Array<{ line: number; snippet: string }>;
         }> = [];
 
-        for (const file of this.app.vault.getMarkdownFiles()) {
-          if (this.isExcludedFromScan(file.path)) {
-            continue;
+        const vaultBase = this.getVaultBasePath();
+        // Folder results are memoized per search, so a large vault costs one
+        // check per folder plus one per file instead of a full walk per file.
+        const folderOk = new Map<string, boolean>();
+        const pathOk = (relPath: string): boolean => {
+          try {
+            assertNoSymlinkEscape(vaultBase ?? "", relPath);
+            return true;
+          } catch {
+            return false;
           }
-          let score = 0;
-          if (file.basename.toLowerCase().includes(needle)) {
-            score += 30;
-          } else if (file.path.toLowerCase().includes(needle)) {
-            score += 15;
+        };
+        const folderChainOk = (folder: string): boolean => {
+          if (!folder) {
+            return true;
           }
-
-          const content = await this.app.vault.cachedRead(file);
-          const lines = content.split(/\r?\n/);
-          const lineMatches: Array<{ line: number; snippet: string }> = [];
-          for (let i = 0; i < lines.length; i += 1) {
-            if (lines[i].toLowerCase().includes(needle)) {
-              score += 5;
-              if (lineMatches.length < 4) {
-                lineMatches.push({
-                  line: i + 1,
-                  snippet: lines[i].trim().slice(0, 200),
-                });
+          const cached = folderOk.get(folder);
+          if (cached !== undefined) {
+            return cached;
+          }
+          const slash = folder.lastIndexOf("/");
+          const parent = slash === -1 ? "" : folder.slice(0, slash);
+          const ok = folderChainOk(parent) && pathOk(folder);
+          folderOk.set(folder, ok);
+          return ok;
+        };
+        const mdFiles = this.app.vault
+          .getMarkdownFiles()
+          .filter((file) => {
+            if (this.isExcluded(file.path)) {
+              return false;
+            }
+            if (vaultBase) {
+              const slash = file.path.lastIndexOf("/");
+              const folder = slash === -1 ? "" : file.path.slice(0, slash);
+              if (!folderChainOk(folder)) {
+                return false;
+              }
+              // The folders are verified, so only the file itself can still be
+              // a symlink: one lstat, and the full check only for symlinks.
+              let isLink = false;
+              try {
+                isLink = fs.lstatSync(path.join(vaultBase, file.path)).isSymbolicLink();
+              } catch {
+                isLink = false;
+              }
+              if (isLink && !pathOk(file.path)) {
+                return false;
               }
             }
-          }
+            return true;
+          });
 
-          if (score > 0) {
-            hits.push({ path: file.path, score, matches: lineMatches });
-          }
+        const CONCURRENCY = 16;
+        for (let offset = 0; offset < mdFiles.length; offset += CONCURRENCY) {
+          const batch = mdFiles.slice(offset, offset + CONCURRENCY);
+          await Promise.all(
+            batch.map(async (file) => {
+              let score = 0;
+              if (file.basename.toLowerCase().includes(needle)) {
+                score += 30;
+              } else if (file.path.toLowerCase().includes(needle)) {
+                score += 15;
+              }
+
+              const content = await this.app.vault.cachedRead(file);
+              const lineMatches: Array<{ line: number; snippet: string }> = [];
+              if (content.toLowerCase().includes(needle)) {
+                const lines = content.split(/\r?\n/);
+                for (let i = 0; i < lines.length; i += 1) {
+                  if (lines[i].toLowerCase().includes(needle)) {
+                    score += 5;
+                    if (lineMatches.length < 4) {
+                      lineMatches.push({
+                        line: i + 1,
+                        snippet: lines[i].trim().slice(0, 200),
+                      });
+                    }
+                  }
+                }
+              }
+
+              if (score > 0) {
+                hits.push({ path: file.path, score, matches: lineMatches });
+              }
+            })
+          );
         }
 
         hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+        const totalMatches = hits.length;
         const topHits = hits.slice(0, maxResults);
 
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           allowed: true,
-          summary: `Searched vault for '${query.slice(0, 48)}' (${topHits.length} results).`,
+          summary: `Searched vault for '${query.slice(0, 48)}' (${topHits.length}/${totalMatches} results).`,
         });
 
-        return { query, count: topHits.length, results: topHits };
+        return {
+          query,
+          count: topHits.length,
+          totalMatches,
+          truncated: totalMatches > topHits.length,
+          results: topHits,
+        };
       }
 
       case "metadata.backlinks": {
         const relPath = this.safePath(params.path, false);
-        const backlinks = this.collectBacklinksForPath(relPath);
-        this.recordAudit({
+        const allBacklinks = this.collectBacklinksForPath(relPath);
+        const limit = this.optionalPageLimit(params.limit);
+        const offset = this.finiteInt(params.offset, 0, 0);
+        const backlinks = allBacklinks.slice(offset, offset + limit);
+        this.ledger.recordAudit({
           method,
           caller,
           targetPath: relPath,
           allowed: true,
-          summary: `Queried ${backlinks.length} backlinks for '${relPath}'.`,
+          summary: `Queried ${backlinks.length}/${allBacklinks.length} backlinks for '${relPath}'.`,
         });
-        return { path: relPath, count: backlinks.length, backlinks };
+        return {
+          path: relPath,
+          count: backlinks.length,
+          total: allBacklinks.length,
+          offset,
+          truncated: offset + backlinks.length < allBacklinks.length,
+          backlinks,
+        };
       }
 
       case "metadata.graph_neighbors": {
         const relPath = this.safePath(params.path, false);
+        const limit = this.optionalPageLimit(params.limit);
         const resolved = this.app.metadataCache.resolvedLinks[relPath] || {};
         const unresolved = this.app.metadataCache.unresolvedLinks[relPath] || {};
-        const outgoing = Object.entries(resolved)
-          .filter(([target]) => !this.isExcludedFromScan(target))
+        const allOutgoing = Object.entries(resolved)
+          .filter(([target]) => !this.isExcluded(target))
           .map(([target, count]) => ({
             path: target,
             count,
           }));
-        const unresolvedList = Object.entries(unresolved).map(([target, count]) => ({
+        const allUnresolved = Object.entries(unresolved).map(([target, count]) => ({
           link: target,
           count,
         }));
-        const incoming = this.collectBacklinksForPath(relPath);
+        const allIncoming = this.collectBacklinksForPath(relPath);
 
-        this.recordAudit({
+        const outgoing = allOutgoing.slice(0, limit);
+        const incoming = allIncoming.slice(0, limit);
+        const unresolvedList = allUnresolved.slice(0, limit);
+
+        this.ledger.recordAudit({
           method,
           caller,
           targetPath: relPath,
@@ -1306,16 +1387,24 @@ export class VaultOpsService {
           outgoing,
           incoming,
           unresolved: unresolvedList,
-          isOrphan: outgoing.length === 0 && incoming.length === 0,
+          outgoingTotal: allOutgoing.length,
+          incomingTotal: allIncoming.length,
+          unresolvedTotal: allUnresolved.length,
+          truncated:
+            allOutgoing.length > outgoing.length ||
+            allIncoming.length > incoming.length ||
+            allUnresolved.length > unresolvedList.length,
+          isOrphan: allOutgoing.length === 0 && allIncoming.length === 0,
         };
       }
 
       case "metadata.tags_and_properties": {
+        const limit = this.optionalPageLimit(params.limit);
         const tagCounts = new Map<string, number>();
         const propertyCounts = new Map<string, number>();
 
         for (const file of this.app.vault.getMarkdownFiles()) {
-          if (this.isExcludedFromScan(file.path)) {
+          if (this.isExcluded(file.path)) {
             continue;
           }
           const cache = this.app.metadataCache.getFileCache(file);
@@ -1331,27 +1420,35 @@ export class VaultOpsService {
           }
         }
 
-        const tags = Array.from(tagCounts.entries())
+        const allTags = Array.from(tagCounts.entries())
           .map(([tag, count]) => ({ tag, count }))
           .sort((a, b) => b.count - a.count);
-        const properties = Array.from(propertyCounts.entries())
+        const allProperties = Array.from(propertyCounts.entries())
           .map(([name, count]) => ({ name, count }))
           .sort((a, b) => b.count - a.count);
+        const tags = allTags.slice(0, limit);
+        const properties = allProperties.slice(0, limit);
 
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           allowed: true,
-          summary: `Aggregated ${tags.length} tags and ${properties.length} properties.`,
+          summary: `Aggregated ${allTags.length} tags and ${allProperties.length} properties.`,
         });
-        return { tags, properties };
+        return {
+          tags,
+          properties,
+          tagsTotal: allTags.length,
+          propertiesTotal: allProperties.length,
+          truncated: allTags.length > tags.length || allProperties.length > properties.length,
+        };
       }
 
       case "vault.create_note": {
         const relPath = this.safePath(params.path, true);
         const content = asStr(params.content);
         const overwrite = Boolean(params.overwrite);
-        return this.withPathLock(relPath, async () => {
+        return this.ledger.withPathLock(relPath, async () => {
           const existing = this.app.vault.getAbstractFileByPath(relPath);
 
           if (existing instanceof TFolder) {
@@ -1370,7 +1467,7 @@ export class VaultOpsService {
               prev = current;
               return content;
             });
-            this.recordAudit({
+            this.ledger.recordAudit({
               method,
               caller,
               targetPath: relPath,
@@ -1385,12 +1482,12 @@ export class VaultOpsService {
             });
             this.notifyActivity(caller, relPath, "write", prev, content);
             await this.pointAtUiResult(caller, { notePath: relPath, prefer: "file-tree" }, "create");
-            return { path: relPath, created: false, updated: true, bytes: content.length };
+            return { path: relPath, created: false, updated: true, bytes: Buffer.byteLength(content, "utf8") };
           }
 
           await this.ensureParentFolders(relPath);
           const created = await this.app.vault.create(relPath, content);
-          this.recordAudit({
+          this.ledger.recordAudit({
             method,
             caller,
             targetPath: created.path,
@@ -1403,19 +1500,40 @@ export class VaultOpsService {
             postContent: content,
           });
           this.notifyActivity(caller, created.path, "create", "", content);
-          await this.pointAtUiResult(caller, { notePath: created.path, prefer: "file-tree" }, "create");
-          return { path: created.path, created: true, updated: false, bytes: content.length };
+          await this.pointAtUiResult(
+            caller,
+            { notePath: created.path, prefer: "file-tree" },
+            "create"
+          );
+          return {
+            path: created.path,
+            created: true,
+            updated: false,
+            bytes: Buffer.byteLength(content, "utf8"),
+          };
         });
       }
 
       case "vault.update_note": {
         const relPath = this.safePath(params.path, true);
-        const mode = asStr(params.mode, "append");
+        const mode = asStr(params.mode, "append").trim();
+        if (!VALID_UPDATE_MODES.has(mode)) {
+          throw new BridgeRpcError(
+            "invalid_params",
+            `Unsupported update mode '${mode}'. Use append, prepend, replace, under_heading, or search_replace.`
+          );
+        }
         const text = asStr(params.content);
         const heading = typeof params.heading === "string" ? params.heading.trim() : "";
+        if (mode === "under_heading" && !heading) {
+          throw new BridgeRpcError(
+            "invalid_params",
+            "Mode 'under_heading' requires a non-empty 'heading' parameter."
+          );
+        }
         const search = typeof params.search === "string" ? params.search : "";
 
-        return this.withPathLock(relPath, async () => {
+        return this.ledger.withPathLock(relPath, async () => {
           const file = this.requireFile(relPath);
           let previousContent = await this.app.vault.read(file);
 
@@ -1434,12 +1552,12 @@ export class VaultOpsService {
                   `Target substring was not found in '${relPath}'.`
                 );
               }
-              return current.replace(search, text);
+              return current.replace(search, () => text);
             }
-            if (mode === "under_heading" && heading) {
+            if (mode === "under_heading") {
               return insertUnderMarkdownHeading(current, heading, text);
             }
-            // Default: append
+            // append
             if (!current) {
               return text;
             }
@@ -1447,7 +1565,7 @@ export class VaultOpsService {
             return `${current}${sep}${text}${text.endsWith("\n") ? "" : "\n"}`;
           });
 
-          this.recordAudit({
+          this.ledger.recordAudit({
             method,
             caller,
             targetPath: file.path,
@@ -1468,15 +1586,27 @@ export class VaultOpsService {
 
       case "vault.patch_frontmatter": {
         const relPath = this.safePath(params.path, true);
+        if (
+          params.set !== undefined &&
+          (params.set === null || typeof params.set !== "object" || Array.isArray(params.set))
+        ) {
+          throw new BridgeRpcError(
+            "invalid_params",
+            "Frontmatter 'set' parameter must be a plain JSON object."
+          );
+        }
         const setObj =
           params.set && typeof params.set === "object"
             ? (params.set as Record<string, unknown>)
             : {};
-        const unsetKeys = Array.isArray(params.unset)
-          ? params.unset.map((k) => String(k))
-          : [];
+        const unsetKeys = Array.isArray(params.unset) ? params.unset.map((k) => String(k)) : [];
+        for (const k of [...Object.keys(setObj), ...unsetKeys]) {
+          if (!k.trim() || FORBIDDEN_FRONTMATTER_KEYS.has(k)) {
+            throw new BridgeRpcError("invalid_params", `Invalid frontmatter key '${k}'.`);
+          }
+        }
 
-        return this.withPathLock(relPath, async () => {
+        return this.ledger.withPathLock(relPath, async () => {
           const file = this.requireFile(relPath);
           const previousContent = await this.app.vault.read(file);
 
@@ -1495,7 +1625,7 @@ export class VaultOpsService {
           } catch {
             // Keep the successful write; without a verified postimage Undo must refuse.
           }
-          this.recordAudit({
+          this.ledger.recordAudit({
             method,
             caller,
             targetPath: file.path,
@@ -1534,7 +1664,7 @@ export class VaultOpsService {
           await this.ensureParentFolders(toPath);
           await this.renameFileSafely(file, toPath, updateLinks);
 
-          this.recordAudit({
+          this.ledger.recordAudit({
             method,
             caller,
             targetPath: toPath,
@@ -1553,19 +1683,19 @@ export class VaultOpsService {
 
           return { previousPath: fromPath, path: toPath };
         };
-        return this.withPathLock(firstLock, () =>
-          firstLock === secondLock ? doRename() : this.withPathLock(secondLock, doRename)
+        return this.ledger.withPathLock(firstLock, () =>
+          firstLock === secondLock ? doRename() : this.ledger.withPathLock(secondLock, doRename)
         );
       }
 
       case "vault.trash_note": {
         const relPath = this.safePath(params.path, true);
-        return this.withPathLock(relPath, async () => {
+        return this.ledger.withPathLock(relPath, async () => {
           const file = this.requireFile(relPath);
           const previousContent = await this.app.vault.read(file);
           const trashMethod = await this.trashFileVerified(file, relPath);
 
-          this.recordAudit({
+          this.ledger.recordAudit({
             method,
             caller,
             targetPath: relPath,
@@ -1588,13 +1718,31 @@ export class VaultOpsService {
       }
 
       case "canvas.upsert_node": {
-        const rawPath = asStr(params.path);
+        const rawPath = asStr(params.path).trim();
         const canvasPath = this.safePath(
           rawPath.endsWith(".canvas") ? rawPath : `${rawPath}.canvas`,
           true
         );
         const nodeId = asStr(params.id) || `node-${Date.now()}`;
-        const nodeType = (params.nodeType as CanvasNodeRecord["type"]) || "text";
+        const rawNodeType =
+          typeof params.nodeType === "string" && params.nodeType.trim()
+            ? params.nodeType.trim()
+            : "text";
+        if (!VALID_CANVAS_NODE_TYPES.has(rawNodeType as CanvasNodeRecord["type"])) {
+          throw new BridgeRpcError(
+            "invalid_params",
+            `Invalid canvas nodeType '${rawNodeType}'. Use text, file, link, or group.`
+          );
+        }
+        const nodeType = rawNodeType as CanvasNodeRecord["type"];
+        const safeFileRef =
+          typeof params.file === "string" && params.file.trim()
+            ? this.safePath(params.file, false)
+            : undefined;
+        const validatedUrl =
+          typeof params.url === "string" && params.url.trim()
+            ? validateCanvasHttpUrl(params.url)
+            : undefined;
         const newNode: CanvasNodeRecord = {
           id: nodeId,
           type: nodeType,
@@ -1603,13 +1751,20 @@ export class VaultOpsService {
           width: Number.isFinite(Number(params.width)) ? Number(params.width) : 320,
           height: Number.isFinite(Number(params.height)) ? Number(params.height) : 180,
           ...(typeof params.text === "string" ? { text: params.text } : {}),
-          ...(typeof params.file === "string" ? { file: params.file } : {}),
-          ...(typeof params.url === "string" ? { url: params.url } : {}),
+          ...(safeFileRef ? { file: safeFileRef } : {}),
+          ...(validatedUrl ? { url: validatedUrl } : {}),
+          ...(typeof params.label === "string" ? { label: params.label } : {}),
           ...(typeof params.color === "string" ? { color: params.color } : {}),
         };
 
-        return this.withPathLock(canvasPath, async () => {
+        return this.ledger.withPathLock(canvasPath, async () => {
           const existing = this.app.vault.getAbstractFileByPath(canvasPath);
+          if (existing instanceof TFolder) {
+            throw new BridgeRpcError(
+              "is_folder",
+              `Path '${canvasPath}' is a folder, not a canvas file.`
+            );
+          }
           if (existing instanceof TFile) {
             let prevText = await this.app.vault.read(existing);
             const updatedText = await this.app.vault.process(existing, (raw) => {
@@ -1623,7 +1778,7 @@ export class VaultOpsService {
               }
               return JSON.stringify(doc, null, 2) + "\n";
             });
-            this.recordAudit({
+            this.ledger.recordAudit({
               method,
               caller,
               targetPath: canvasPath,
@@ -1635,15 +1790,16 @@ export class VaultOpsService {
           } else {
             await this.ensureParentFolders(canvasPath);
             const doc: CanvasDocument = { nodes: [newNode], edges: [] };
-            await this.app.vault.create(canvasPath, JSON.stringify(doc, null, 2) + "\n");
-            this.recordAudit({
+            const serialized = JSON.stringify(doc, null, 2) + "\n";
+            await this.app.vault.create(canvasPath, serialized);
+            this.ledger.recordAudit({
               method,
               caller,
               targetPath: canvasPath,
               allowed: true,
               summary: `Created Canvas '${canvasPath}' with node '${nodeId}'.`,
               snapshot: { kind: "created", path: canvasPath },
-              postContent: JSON.stringify(doc, null, 2) + "\n",
+              postContent: serialized,
             });
           }
           this.notifyActivity(caller, canvasPath, "canvas");
@@ -1655,7 +1811,12 @@ export class VaultOpsService {
       case "workspace.get_state": {
         const activeFile = this.app.workspace.getActiveFile();
         const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-        const selection = mdView ? mdView.editor.getSelection() : "";
+        const rawSelection = mdView ? mdView.editor.getSelection() : "";
+        const MAX_SELECTION_CHARS = 4000;
+        const selection =
+          rawSelection.length > MAX_SELECTION_CHARS
+            ? rawSelection.slice(0, MAX_SELECTION_CHARS)
+            : rawSelection;
         const cursor = mdView ? mdView.editor.getCursor() : null;
         const openMarkdownPaths: string[] = [];
         this.app.workspace.iterateAllLeaves((leaf) => {
@@ -1664,7 +1825,7 @@ export class VaultOpsService {
           }
         });
 
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           allowed: true,
@@ -1675,10 +1836,11 @@ export class VaultOpsService {
           activeFile: activeFile ? activeFile.path : null,
           cursor: cursor ? { line: cursor.line + 1, ch: cursor.ch } : null,
           selection,
+          selectionLength: rawSelection.length,
+          selectionTruncated: rawSelection.length > MAX_SELECTION_CHARS,
           openNotes: Array.from(new Set(openMarkdownPaths)),
           darkTheme:
-            typeof document !== "undefined" &&
-            document.body.classList.contains("theme-dark"),
+            typeof document !== "undefined" && document.body.classList.contains("theme-dark"),
         };
       }
 
@@ -1704,7 +1866,7 @@ export class VaultOpsService {
         );
         await this.app.workspace.revealLeaf(leaf);
 
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           targetPath: file.path,
@@ -1731,7 +1893,7 @@ export class VaultOpsService {
           throw new BridgeRpcError("invalid_params", "Notice 'message' cannot be empty.");
         }
         new Notice(`Herdr: ${message}`, 5000);
-        this.recordAudit({
+        this.ledger.recordAudit({
           method,
           caller,
           allowed: true,
@@ -1746,10 +1908,18 @@ export class VaultOpsService {
           return { hasActiveEditor: false, file: null, selection: "", cursor: null };
         }
         const cursor = mdView.editor.getCursor();
+        const rawSelection = mdView.editor.getSelection();
+        const MAX_SELECTION_CHARS = 4000;
+        const selection =
+          rawSelection.length > MAX_SELECTION_CHARS
+            ? rawSelection.slice(0, MAX_SELECTION_CHARS)
+            : rawSelection;
         return {
           hasActiveEditor: true,
           file: mdView.file ? mdView.file.path : null,
-          selection: mdView.editor.getSelection(),
+          selection,
+          selectionLength: rawSelection.length,
+          selectionTruncated: rawSelection.length > MAX_SELECTION_CHARS,
           cursor: { line: cursor.line + 1, ch: cursor.ch },
         };
       }
@@ -1759,18 +1929,40 @@ export class VaultOpsService {
         if (!mdView) {
           throw new BridgeRpcError("no_active_editor", "No Markdown editor is currently focused.");
         }
+        if (typeof mdView.getMode === "function" && mdView.getMode() !== "source") {
+          throw new BridgeRpcError(
+            "editor_not_editable",
+            "Active Markdown view is in Reading mode; switch to Editing mode first."
+          );
+        }
         const replacement = asStr(params.text);
-        const previousContent = mdView.editor.getValue();
-        mdView.editor.replaceSelection(replacement);
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: mdView.file?.path,
-          allowed: true,
-          summary: `Replaced active editor selection (${replacement.length} chars).`,
-        });
-        this.notifyActivity(caller, mdView.file?.path, "edit", previousContent, mdView.editor.getValue());
-        return { updated: true, file: mdView.file?.path ?? null };
+        const runReplace = (): { updated: boolean; file: string | null } => {
+          const previousContent = mdView.editor.getValue();
+          mdView.editor.replaceSelection(replacement);
+          const updatedContent = mdView.editor.getValue();
+          this.ledger.recordAudit({
+            method,
+            caller,
+            targetPath: mdView.file?.path,
+            allowed: true,
+            summary: `Replaced active editor selection (${replacement.length} chars).`,
+            ...(mdView.file?.path
+              ? {
+                  snapshot: {
+                    kind: "modified" as const,
+                    path: mdView.file.path,
+                    previousContent,
+                  },
+                  postContent: updatedContent,
+                }
+              : {}),
+          });
+          this.notifyActivity(caller, mdView.file?.path, "edit", previousContent, updatedContent);
+          return { updated: true, file: mdView.file?.path ?? null };
+        };
+        return mdView.file?.path
+          ? await this.ledger.withPathLock(mdView.file.path, () => Promise.resolve(runReplace()))
+          : runReplace();
       }
 
       case "editor.insert_at_cursor": {
@@ -1778,30 +1970,65 @@ export class VaultOpsService {
         if (!mdView) {
           throw new BridgeRpcError("no_active_editor", "No Markdown editor is currently focused.");
         }
+        if (typeof mdView.getMode === "function" && mdView.getMode() !== "source") {
+          throw new BridgeRpcError(
+            "editor_not_editable",
+            "Active Markdown view is in Reading mode; switch to Editing mode first."
+          );
+        }
         const text = asStr(params.text);
-        const previousContent = mdView.editor.getValue();
-        const cursor = mdView.editor.getCursor();
-        mdView.editor.replaceRange(text, cursor);
-        this.recordAudit({
-          method,
-          caller,
-          targetPath: mdView.file?.path,
-          allowed: true,
-          summary: `Inserted ${text.length} chars at line ${cursor.line + 1}.`,
-        });
-        this.notifyActivity(caller, mdView.file?.path, "edit", previousContent, mdView.editor.getValue());
-        return { inserted: true, file: mdView.file?.path ?? null, line: cursor.line + 1 };
+        const runInsert = (): { inserted: boolean; file: string | null; line: number } => {
+          const previousContent = mdView.editor.getValue();
+          const cursor = mdView.editor.getCursor();
+          mdView.editor.replaceRange(text, cursor);
+          const updatedContent = mdView.editor.getValue();
+          this.ledger.recordAudit({
+            method,
+            caller,
+            targetPath: mdView.file?.path,
+            allowed: true,
+            summary: `Inserted ${text.length} chars at line ${cursor.line + 1}.`,
+            ...(mdView.file?.path
+              ? {
+                  snapshot: {
+                    kind: "modified" as const,
+                    path: mdView.file.path,
+                    previousContent,
+                  },
+                  postContent: updatedContent,
+                }
+              : {}),
+          });
+          this.notifyActivity(caller, mdView.file?.path, "edit", previousContent, updatedContent);
+          return { inserted: true, file: mdView.file?.path ?? null, line: cursor.line + 1 };
+        };
+        return mdView.file?.path
+          ? await this.ledger.withPathLock(mdView.file.path, () => Promise.resolve(runInsert()))
+          : runInsert();
       }
 
       case "commands.list": {
         const cmds = this.getCommandRegistry();
         const filter =
           typeof params.query === "string" ? params.query.trim().toLowerCase() : "";
-        const items = Object.values(cmds)
-          .filter((c) => !filter || c.id.toLowerCase().includes(filter) || c.name.toLowerCase().includes(filter))
-          .slice(0, 200)
+        const limit = this.finiteInt(params.limit, 200, 1, 200);
+        const offset = this.finiteInt(params.offset, 0, 0);
+        const allItems = Object.values(cmds)
+          .filter(
+            (c) =>
+              !filter ||
+              c.id.toLowerCase().includes(filter) ||
+              c.name.toLowerCase().includes(filter)
+          )
           .map((c) => ({ id: c.id, name: c.name }));
-        return { count: items.length, commands: items };
+        const items = allItems.slice(offset, offset + limit);
+        return {
+          count: items.length,
+          total: allItems.length,
+          offset,
+          truncated: offset + items.length < allItems.length,
+          commands: items,
+        };
       }
 
       case "commands.execute": {
@@ -1809,12 +2036,13 @@ export class VaultOpsService {
         if (!commandId) {
           throw new BridgeRpcError("invalid_params", "Provide a non-empty 'commandId'.");
         }
-        const lower = commandId.toLowerCase();
-        if (["app:quit", "app:exit", "app:close-window", "workspace:close-window", "app:open-settings"].includes(lower) &&
-          !this.getAllowUiInProtectedAreas()) {
-          throw new BridgeRpcError("ui_protected_area", "Settings, application quit and window controls are protected.");
+        if (isProtectedCommand(commandId) && !this.getAllowUiInProtectedAreas()) {
+          throw new BridgeRpcError(
+            "ui_protected_area",
+            "Settings, reload, vault switch, application quit and window controls are protected."
+          );
         }
-        if (BLOCKED_COMMAND_SUBSTRINGS.some((sub) => lower.includes(sub))) {
+        if (isCommandBlocked(commandId)) {
           throw new BridgeRpcError(
             "command_blocked",
             `Command '${commandId}' is restricted by safety policy.`
@@ -1822,17 +2050,25 @@ export class VaultOpsService {
         }
         const complete = await this.trackCommandChanges();
         try {
-          this.assertNoDestructiveUndo();
+          this.ledger.assertNoDestructiveUndo();
           const executed = this.executeCommandById(commandId);
           if (!executed) {
             throw new BridgeRpcError("command_not_found", `Command '${commandId}' was not found.`);
           }
-          this.recordAudit({ method, caller, targetPath: commandId, allowed: true,
-            summary: `Executed Obsidian command '${commandId}'.` });
+          this.ledger.recordAudit({
+            method,
+            caller,
+            targetPath: commandId,
+            allowed: true,
+            summary: `Executed Obsidian command '${commandId}'.`,
+          });
           const commandName = this.getCommandRegistry()[commandId]?.name?.trim() || commandId;
           const activePath = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
-          await this.pointAtUiResult(caller,
-            { ...(activePath ? { notePath: activePath } : {}), prefer: "modal" }, `command: ${commandName}`);
+          await this.pointAtUiResult(
+            caller,
+            { ...(activePath ? { notePath: activePath } : {}), prefer: "modal" },
+            `command: ${commandName}`
+          );
           return { executed: true, commandId };
         } finally {
           await complete();
@@ -1862,13 +2098,17 @@ export class VaultOpsService {
       current = current ? `${current}/${parts[i]}` : parts[i];
       const existing = this.app.vault.getAbstractFileByPath(current);
       if (!existing) {
-        await this.app.vault.createFolder(current);
+        try {
+          await this.app.vault.createFolder(current);
+        } catch (err) {
+          // Concurrent create_note calls targeting the same new folder can race here.
+          if (!(this.app.vault.getAbstractFileByPath(current) instanceof TFolder)) {
+            throw err;
+          }
+        }
       }
     }
   }
-
-  private renameConfigDepth = 0;
-  private renameConfigSaved: { hadKey: boolean; value: unknown } | null = null;
 
   private async trashFileVerified(file: TFile, relPath: string): Promise<"system" | "local"> {
     let systemErr: unknown = null;
@@ -1928,6 +2168,11 @@ export class VaultOpsService {
         ? vaultWithConfig.config
         : null;
     if (cfg) {
+      while (this.renameConfigDepth > 0 && this.renameConfigValue !== updateLinks) {
+        await new Promise<void>((resolve) => {
+          this.renameConfigWaiters.push(resolve);
+        });
+      }
       if (this.renameConfigDepth === 0) {
         this.renameConfigSaved = {
           hadKey: Object.prototype.hasOwnProperty.call(cfg, "alwaysUpdateLinks"),
@@ -1935,6 +2180,7 @@ export class VaultOpsService {
         };
       }
       this.renameConfigDepth += 1;
+      this.renameConfigValue = updateLinks;
       cfg.alwaysUpdateLinks = updateLinks;
     }
     try {
@@ -1942,23 +2188,32 @@ export class VaultOpsService {
     } finally {
       if (cfg) {
         this.renameConfigDepth = Math.max(0, this.renameConfigDepth - 1);
-        if (this.renameConfigDepth === 0 && this.renameConfigSaved) {
-          if (this.renameConfigSaved.hadKey) {
-            cfg.alwaysUpdateLinks = this.renameConfigSaved.value;
-          } else {
-            delete cfg.alwaysUpdateLinks;
+        if (this.renameConfigDepth === 0) {
+          this.renameConfigValue = null;
+          if (this.renameConfigSaved) {
+            if (this.renameConfigSaved.hadKey) {
+              cfg.alwaysUpdateLinks = this.renameConfigSaved.value;
+            } else {
+              delete cfg.alwaysUpdateLinks;
+            }
+            this.renameConfigSaved = null;
           }
-          this.renameConfigSaved = null;
+          const waiters = this.renameConfigWaiters.splice(0);
+          for (const wake of waiters) {
+            wake();
+          }
         }
       }
     }
   }
 
-  private collectBacklinksForPath(targetPath: string): Array<{ sourcePath: string; count: number }> {
+  private collectBacklinksForPath(
+    targetPath: string
+  ): Array<{ sourcePath: string; count: number }> {
     const resolvedMap = this.app.metadataCache.resolvedLinks;
     const out: Array<{ sourcePath: string; count: number }> = [];
     for (const [sourcePath, targets] of Object.entries(resolvedMap)) {
-      if (this.isExcludedFromScan(sourcePath)) {
+      if (this.isExcluded(sourcePath)) {
         continue;
       }
       const count = targets[targetPath];
@@ -1986,105 +2241,4 @@ export class VaultOpsService {
     }
     return false;
   }
-
-  private recordAudit(entry: {
-    method: string;
-    caller: string;
-    targetPath?: string;
-    allowed: boolean;
-    summary: string;
-    snapshot?: VaultMutationSnapshot;
-    postContent?: string | null;
-    snapshotConflicted?: boolean;
-    fileView?: UiFileView;
-  }): void {
-    if (entry.snapshot) {
-      const path = entry.snapshot.path;
-      const revision = this.noteRevision(path) + 1;
-      this.noteRevisions.set(path, revision);
-      this.snapshotGuards.set(entry.snapshot, {
-        revision,
-        postContent: entry.postContent,
-        fileView: entry.fileView ? new WeakRef(entry.fileView) : undefined,
-        conflicted: Boolean(entry.snapshotConflicted) ||
-          (this.nativeWrites.get(path) ?? 0) > 1 ||
-          this.activeUiSnapshots().some((pending) => pending.path === path),
-      });
-      for (const pending of this.activeUiSnapshots()) {
-        if (pending.path === path) pending.conflicted = true;
-      }
-    } else if (entry.allowed && entry.targetPath && WRITE_METHODS.has(entry.method) &&
-      !entry.method.startsWith("workspace.")) {
-      this.noteRevisions.set(entry.targetPath, this.noteRevision(entry.targetPath) + 1);
-      for (const pending of this.activeUiSnapshots()) {
-        if (pending.path === entry.targetPath) pending.conflicted = true;
-      }
-    }
-    this.auditEntries.unshift({
-      id: `audit_${Date.now()}_${(this.auditSeq += 1)}`,
-      timestamp: Date.now(),
-      method: entry.method,
-      caller: entry.caller,
-      targetPath: entry.targetPath,
-      allowed: entry.allowed,
-      summary: entry.summary,
-      snapshot: entry.snapshot,
-    });
-    if (this.auditEntries.length > 200) {
-      this.auditEntries.length = 200;
-    }
-    this.notifyAudit();
-  }
-
-  private notifyAudit(): void {
-    for (const listener of this.auditListeners) {
-      listener();
-    }
-  }
-}
-
-function insertUnderMarkdownHeading(doc: string, headingText: string, insertion: string): string {
-  const lines = doc.split(/\r?\n/);
-  const normalizedTarget = headingText.replace(/^#+\s*/, "").trim().toLowerCase();
-  let targetIdx = -1;
-  let targetLevel = 0;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const m = /^(#{1,6})\s+(.+?)\s*$/.exec(lines[i]);
-    if (m && m[2].trim().toLowerCase() === normalizedTarget) {
-      targetIdx = i;
-      targetLevel = m[1].length;
-      break;
-    }
-  }
-
-  if (targetIdx === -1) {
-    const headerLine = headingText.startsWith("#") ? headingText : `## ${headingText}`;
-    const sep = doc.endsWith("\n") || !doc ? "" : "\n";
-    return `${doc}${sep}\n${headerLine}\n\n${insertion}\n`;
-  }
-
-  let insertAt = lines.length;
-  for (let j = targetIdx + 1; j < lines.length; j += 1) {
-    const m = /^(#{1,6})\s+/.exec(lines[j]);
-    if (m && m[1].length <= targetLevel) {
-      insertAt = j;
-      break;
-    }
-  }
-
-  const before = lines.slice(0, insertAt);
-  const after = lines.slice(insertAt);
-  return [...before, insertion, ...after].join("\n");
-}
-
-function parseCanvasDoc(raw: string): CanvasDocument {
-  if (!raw.trim()) {
-    return { nodes: [], edges: [] };
-  }
-  const parsed = JSON.parse(raw) as Partial<CanvasDocument>;
-  return {
-    nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
-    edges: Array.isArray(parsed.edges) ? parsed.edges : [],
-  };
 }
